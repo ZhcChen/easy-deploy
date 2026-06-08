@@ -1,0 +1,116 @@
+﻿{% extends "layout.html" %}
+
+{% block title %}部署任务 - {{ product_name }}{% endblock %}
+
+{% block content %}
+<section class="panel filter-panel" aria-labelledby="task-filter-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="task-filter-title">任务筛选</h2>
+      <p>当前条件命中 {{ filtered_count }} 条，列表最多展示最近 100 条。{{ queue_summary }}</p>
+    </div>
+  </div>
+  <form class="filter-form tasks-filter-form" method="get" action="/tasks">
+    <label>
+      状态
+      <select name="status">
+        {% for option in status_filters %}
+          <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}{% if option.count > 0 %} · {{ option.count }}{% endif %}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      应用
+      <select name="app_id">
+        <option value=""{% if selected_app_id == "" %} selected{% endif %}>全部应用</option>
+        {% for app in app_filters %}
+          <option value="{{ app.id }}"{% if app.selected %} selected{% endif %}>{{ app.name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      阶段
+      <select name="phase">
+        {% for option in phase_filters %}
+          <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      类型
+      <select name="task_kind">
+        {% for option in kind_filters %}
+          <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      关键字
+      <input name="q" value="{{ query }}" placeholder="任务、命令、摘要">
+    </label>
+    <div class="filter-actions">
+      <button class="primary-button compact-button" type="submit">筛选</button>
+      <a class="ghost-button compact-button" href="/tasks">重置</a>
+    </div>
+  </form>
+</section>
+
+<section class="panel panel-large" aria-labelledby="tasks-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="tasks-title">最近任务</h2>
+      <p>按更新时间倒序展示，任务详情保留完整执行日志。</p>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>任务</th>
+          <th>应用</th>
+          <th>状态</th>
+          <th>队列</th>
+          <th>命令</th>
+          <th>摘要</th>
+          <th>时间</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% if tasks.len() == 0 %}
+          <tr>
+            <td colspan="7">
+              <div class="empty-state">
+                <strong>没有匹配的任务</strong>
+                <span>调整筛选条件后再查看。</span>
+              </div>
+            </td>
+          </tr>
+        {% else %}
+          {% for task in tasks %}
+            <tr>
+              <td>
+                <strong><a class="text-link" href="/tasks/{{ task.id }}">#{{ task.id }} {{ task.title }}</a></strong>
+                <span>{{ task.task_kind_label }} · {{ task.created_by }}</span>
+              </td>
+              <td>{{ task.app_name }}</td>
+              <td>
+                <span class="badge tone-{{ task.status_tone }}">{{ task.status }}</span>
+                <span class="badge tone-{{ task.phase_tone }}">{{ task.phase }}</span>
+                <span>退出码 {{ task.exit_code }}</span>
+              </td>
+              <td><span class="badge tone-{{ task.queue_tone }}">{{ task.queue_state }}</span></td>
+              <td>{{ task.command }}</td>
+              <td>{{ task.summary }}</td>
+              <td>
+                <strong>{{ task.created_at }}</strong>
+                <span>{{ task.updated_at }}</span>
+              </td>
+            </tr>
+          {% endfor %}
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
+

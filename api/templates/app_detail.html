@@ -1,0 +1,777 @@
+﻿{% extends "layout.html" %}
+
+{% block title %}{{ name }} - {{ product_name }}{% endblock %}
+
+{% block topbar_actions %}
+<a class="ghost-button" href="/apps">返回应用</a>
+          
+{% endblock %}
+
+{% block content %}
+<section class="summary-grid" aria-label="应用概览">
+  <article class="summary-card tone-neutral">
+    <span>部署类型</span>
+    <strong>{{ app_type }}</strong>
+    <p>{{ deploy_strategy_label }}</p>
+  </article>
+  <article class="summary-card tone-neutral">
+    <span>目标节点</span>
+    <strong>{{ target_count }}</strong>
+    <p>{{ targets }}</p>
+  </article>
+  <article class="summary-card tone-neutral">
+    <span>应用标识</span>
+    <strong>{{ app_key }}</strong>
+    <p>#{{ id }}</p>
+  </article>
+  <article class="summary-card tone-{{ status_tone }}">
+    <span>应用状态</span>
+    <strong>{{ status }}</strong>
+    <p>{{ updated_at }} 更新，创建于 {{ created_at }}</p>
+  </article>
+</section>
+
+{% if let Some(message) = notice %}
+  <section class="panel next-step-panel" aria-labelledby="app-next-step-title">
+    <div>
+      <span class="badge tone-success">已创建</span>
+      <h2 id="app-next-step-title">{{ message }}</h2>
+      {% if is_binary_app %}
+        <p>先确认制品版本、路径和 systemd unit，再进入确认页提交首次重启任务。</p>
+      {% else %}
+        <p>先检查 compose.yaml、目标节点和健康检查，再进入确认页提交首次部署任务。</p>
+      {% endif %}
+    </div>
+    <div class="next-step-actions">
+      {% if is_binary_app %}
+        <a class="primary-button compact-button" href="/apps/{{ id }}/binary/restart/confirm">确认并重启</a>
+        <a class="ghost-button compact-button" href="#binary-config-title">二进制配置</a>
+      {% else %}
+        <a class="primary-button compact-button" href="/apps/{{ id }}/compose/up/confirm">确认并部署</a>
+        <a class="ghost-button compact-button" href="#health-check-title">健康检查</a>
+      {% endif %}
+    </div>
+  </section>
+{% endif %}
+
+<section class="main-grid">
+  <section class="panel panel-large" aria-labelledby="config-title">
+    <div class="panel-header">
+      <div>
+        <h2 id="config-title">运行配置</h2>
+        <p>{{ name }} · {% if description == "" %}暂无描述{% else %}{{ description }}{% endif %}</p>
+      </div>
+    </div>
+    <form class="panel-form config-form" method="post" action="/apps/{{ id }}/config">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="health_check_kind" value="{{ health_check_kind }}">
+      <input type="hidden" name="health_endpoint" value="{{ health_endpoint }}">
+      <input type="hidden" name="health_timeout_secs" value="{{ health_timeout_secs }}">
+      <input type="hidden" name="health_expected_status" value="{{ health_expected_status }}">
+      <input type="hidden" name="binary_artifact_version" value="{{ binary_artifact_version }}">
+      <input type="hidden" name="binary_artifact_path" value="{{ binary_artifact_path }}">
+      <input type="hidden" name="binary_exec_args" value="{{ binary_exec_args }}">
+      <input type="hidden" name="binary_service_user" value="{{ binary_service_user }}">
+      <input type="hidden" name="binary_unit_name" value="{{ binary_unit_name }}">
+      <input type="hidden" name="binary_release_strategy" value="{{ binary_release_strategy }}">
+      <input type="hidden" name="binary_active_slot" value="{{ binary_active_slot }}">
+      <input type="hidden" name="binary_base_port" value="{{ binary_base_port }}">
+      <input type="hidden" name="binary_standby_port" value="{{ binary_standby_port }}">
+      {% if binary_proxy_enabled %}
+        <input type="hidden" name="binary_proxy_enabled" value="true">
+      {% endif %}
+      <input type="hidden" name="binary_proxy_kind" value="{{ binary_proxy_kind }}">
+      <input type="hidden" name="binary_proxy_domain" value="{{ binary_proxy_domain }}">
+      <input type="hidden" name="binary_proxy_config_path" value="{{ binary_proxy_config_path }}">
+      <label>
+        compose.yaml
+        <textarea name="compose_content" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ compose_content }}</textarea>
+      </label>
+      <label>
+        .env
+        <textarea name="env_content" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ env_content }}</textarea>
+      </label>
+      {% if can_manage %}
+        <button class="primary-button compact-button" type="submit">保存配置</button>
+      {% endif %}
+    </form>
+  </section>
+
+  <aside class="side-stack">
+    <section class="panel" aria-labelledby="app-basic-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="app-basic-title">基础信息</h2>
+          <p>应用名称、部署目录和目标节点会同步写入 app.yaml。</p>
+        </div>
+      </div>
+      {% if can_manage %}
+        <form class="panel-form" method="post" action="/apps/{{ id }}/metadata">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label>
+            应用名称
+            <input name="name" value="{{ name }}" required>
+          </label>
+          <label>
+            描述
+            <input name="description" value="{{ description }}">
+          </label>
+          <label>
+            部署目录
+            <input name="work_dir" value="{{ work_dir }}" required>
+          </label>
+          <label>
+            部署策略
+            <select name="deploy_strategy">
+              <option value="rolling_stop_on_failure"{% if deploy_strategy == "rolling_stop_on_failure" %} selected{% endif %}>滚动部署，失败停止</option>
+              <option value="rolling_continue"{% if deploy_strategy == "rolling_continue" %} selected{% endif %}>逐节点继续，最终汇总失败</option>
+            </select>
+          </label>
+          <div class="form-group-label">目标节点</div>
+          <div class="checkbox-list">
+            {% for node in target_choices %}
+              <label>
+                <input type="checkbox" name="target_node_ids" value="{{ node.id }}"{% if node.checked %} checked{% endif %}>
+                {{ node.label }}
+                <span>{{ node.detail }}</span>
+              </label>
+            {% endfor %}
+          </div>
+          <button class="primary-button compact-button" type="submit">保存基础信息</button>
+        </form>
+      {% else %}
+        <div class="detail-list">
+          <div>
+            <span>应用名称</span>
+            <strong>{{ name }}</strong>
+          </div>
+          <div>
+            <span>部署目录</span>
+            <strong>{{ work_dir }}</strong>
+          </div>
+          <div>
+            <span>部署策略</span>
+            <strong>{{ deploy_strategy_label }}</strong>
+          </div>
+          <div>
+            <span>目标节点</span>
+            <strong>{{ targets }}</strong>
+          </div>
+        </div>
+      {% endif %}
+    </section>
+
+    {% if is_binary_app %}
+    <section class="panel" aria-labelledby="binary-config-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="binary-config-title">二进制配置</h2>
+          <p>登记已有制品路径，使用 systemd 管理应用进程。</p>
+        </div>
+      </div>
+      {% if can_upload_artifact %}
+        <form class="panel-form" method="post" action="/apps/{{ id }}/config">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <textarea name="compose_content" hidden>{{ compose_content }}</textarea>
+          <input type="hidden" name="health_check_kind" value="{{ health_check_kind }}">
+          <input type="hidden" name="health_endpoint" value="{{ health_endpoint }}">
+          <input type="hidden" name="health_timeout_secs" value="{{ health_timeout_secs }}">
+          <input type="hidden" name="health_expected_status" value="{{ health_expected_status }}">
+          <label>
+            制品版本
+            <input name="binary_artifact_version" value="{{ binary_artifact_version }}" placeholder="v1.0.0">
+          </label>
+          <label>
+            制品路径
+            <input name="binary_artifact_path" value="{{ binary_artifact_path }}" placeholder="/opt/easy-deploy/artifacts/orders-api">
+          </label>
+          <label>
+            启动参数
+            <input name="binary_exec_args" value="{{ binary_exec_args }}" placeholder="--port 8080">
+          </label>
+          <label>
+            运行用户
+            <input name="binary_service_user" value="{{ binary_service_user }}">
+          </label>
+          <label>
+            systemd unit
+            <input name="binary_unit_name" value="{{ binary_unit_name }}" placeholder="easy-deploy-orders-api.service">
+          </label>
+          <label>
+            发布策略
+            <select name="binary_release_strategy">
+              <option value="restart"{% if binary_release_strategy == "restart" %} selected{% endif %}>systemd restart</option>
+              <option value="blue_green"{% if binary_release_strategy == "blue_green" %} selected{% endif %}>Blue/Green 预案</option>
+            </select>
+          </label>
+          <label>
+            当前流量槽位
+            <select name="binary_active_slot">
+              <option value="blue"{% if binary_active_slot == "blue" %} selected{% endif %}>blue</option>
+              <option value="green"{% if binary_active_slot == "green" %} selected{% endif %}>green</option>
+            </select>
+          </label>
+          <label>
+            主槽端口
+            <input name="binary_base_port" type="number" min="0" max="65535" value="{{ binary_base_port }}" placeholder="8080">
+          </label>
+          <label>
+            备用槽端口
+            <input name="binary_standby_port" type="number" min="0" max="65535" value="{{ binary_standby_port }}" placeholder="18080">
+          </label>
+          <label class="checkbox-field">
+            <input name="binary_proxy_enabled" type="checkbox" value="true"{% if binary_proxy_enabled %} checked{% endif %}>
+            <span>启用反向代理切流</span>
+          </label>
+          <label>
+            代理类型
+            <select name="binary_proxy_kind">
+              <option value="none"{% if binary_proxy_kind == "none" %} selected{% endif %}>不切流</option>
+              <option value="caddy"{% if binary_proxy_kind == "caddy" %} selected{% endif %}>Caddy</option>
+              <option value="nginx"{% if binary_proxy_kind == "nginx" %} selected{% endif %}>Nginx</option>
+            </select>
+          </label>
+          <label>
+            访问域名
+            <input name="binary_proxy_domain" value="{{ binary_proxy_domain }}" placeholder="worker.example.com">
+          </label>
+          <label>
+            代理配置路径
+            <input name="binary_proxy_config_path" value="{{ binary_proxy_config_path }}" placeholder="/etc/caddy/Caddyfile.d/worker.caddy">
+          </label>
+          <label>
+            环境变量
+            <textarea name="env_content" spellcheck="false">{{ env_content }}</textarea>
+          </label>
+          <button class="primary-button compact-button" type="submit">保存二进制配置</button>
+        </form>
+      {% else %}
+        <div class="detail-list">
+          <div>
+            <span>制品版本</span>
+            <strong>{{ binary_artifact_version }}</strong>
+          </div>
+          <div>
+            <span>systemd unit</span>
+            <strong>{{ binary_unit_name }}</strong>
+          </div>
+          <div>
+            <span>发布策略</span>
+            <strong>{{ binary_release_strategy_label }}</strong>
+          </div>
+          <div>
+            <span>反向代理</span>
+            <strong>{{ binary_proxy_kind_label }}</strong>
+          </div>
+        </div>
+      {% endif %}
+    </section>
+    {% endif %}
+
+    {% if is_binary_app %}
+    <section class="panel" aria-labelledby="binary-low-downtime-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="binary-low-downtime-title">低停机更新</h2>
+          <p>Blue/Green 会先启动备用槽并完成健康检查，启用代理后再 validate/reload 切流。</p>
+        </div>
+        <span class="badge tone-neutral">{{ binary_release_strategy_label }}</span>
+      </div>
+      <div class="detail-list">
+        <div>
+          <span>当前槽位</span>
+          <strong>{{ binary_active_slot }}</strong>
+        </div>
+        <div>
+          <span>备用槽位</span>
+          <strong>{{ binary_standby_slot }}</strong>
+        </div>
+        <div>
+          <span>主槽端口</span>
+          <strong>{{ binary_base_port }}</strong>
+        </div>
+        <div>
+          <span>备用槽端口</span>
+          <strong>{{ binary_standby_port }}</strong>
+        </div>
+        <div>
+          <span>反向代理</span>
+          <strong>{{ binary_proxy_kind_label }}</strong>
+        </div>
+        <div>
+          <span>代理配置</span>
+          <strong>{{ binary_proxy_config_path }}</strong>
+        </div>
+      </div>
+      {% if binary_release_strategy == "blue_green" %}
+        <div class="empty-state">
+          <strong>Blue/Green 已启用</strong>
+          {% if binary_proxy_enabled %}
+            <span>健康检查通过后会生成 {{ binary_proxy_kind_label }} 配置指向备用槽，validate 成功后 reload 并记录新槽位。</span>
+          {% else %}
+            <span>当前未启用反向代理切流；成功后只记录新槽位，不会自动 reload Caddy/Nginx。</span>
+          {% endif %}
+        </div>
+      {% else %}
+        <div class="empty-state">
+          <strong>当前使用 restart 策略</strong>
+          <span>切换为 Blue/Green 后，可以配置 Caddy/Nginx 反向代理切流。</span>
+        </div>
+      {% endif %}
+    </section>
+    {% endif %}
+
+    {% if is_binary_app %}
+    <section class="panel" aria-labelledby="binary-upload-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="binary-upload-title">上传新版本</h2>
+          <p>上传 binary 或 tar.gz，成功后自动切换为当前发布版本。</p>
+        </div>
+      </div>
+      {% if can_upload_artifact %}
+        <form class="panel-form" method="post" action="/apps/{{ id }}/binary/upload" enctype="multipart/form-data">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label>
+            发布版本
+            <input name="artifact_version" placeholder="v1.1.0" required>
+          </label>
+          <label>
+            制品文件
+            <input name="artifact_file" type="file" required>
+          </label>
+          <label>
+            入口文件
+            <input name="entry_file" placeholder="tar.gz 填 bin/server，单文件可留空">
+          </label>
+          <button class="primary-button compact-button" type="submit">上传并设为当前版本</button>
+        </form>
+      {% else %}
+        <div class="empty-state">
+          <strong>只读权限</strong>
+          <span>当前账号不能上传制品。</span>
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="panel" aria-labelledby="binary-releases-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="binary-releases-title">发布版本</h2>
+          <p>已登记和上传的二进制版本；旧版本可回滚并自动创建重启任务。</p>
+        </div>
+      </div>
+      {% if binary_releases.len() == 0 %}
+        <div class="empty-state">
+          <strong>暂无发布版本</strong>
+          <span>保存二进制配置或上传制品后会出现在这里。</span>
+        </div>
+      {% else %}
+        <div class="detail-list">
+          {% for release in binary_releases %}
+            <div>
+              <span>{{ release.version }}</span>
+              <strong>
+                <span class="badge tone-{{ release.status_tone }}">{{ release.status }}</span>
+                <span>{{ release.artifact_kind }} · {{ release.size }} · sha256 {{ release.sha256 }}</span>
+                <span>入口 {{ release.entry_file }}</span>
+                <span>{{ release.artifact_path }}</span>
+                <span>{{ release.created_at }}</span>
+                {% if release.can_rollback %}
+                  <form class="inline-actions" method="post" action="/apps/{{ id }}/binary/releases/{{ release.id }}/activate">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button class="text-button" type="submit">回滚到此版本</button>
+                  </form>
+                {% endif %}
+              </strong>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </section>
+    {% endif %}
+
+    {% if is_binary_app %}
+    <section class="panel" aria-labelledby="binary-runtime-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="binary-runtime-title">二进制运行文件</h2>
+          <p>保存配置时生成，后续上传、回滚和多节点同步都以这些文件为准。</p>
+        </div>
+      </div>
+      <div class="detail-list">
+        <div>
+          <span>unit 文件</span>
+          <strong>{{ binary_unit_path }}</strong>
+        </div>
+        <div>
+          <span>env 文件</span>
+          <strong>{{ binary_env_path }}</strong>
+        </div>
+        <div>
+          <span>blue unit</span>
+          <strong>{{ binary_blue_unit_path }}</strong>
+        </div>
+        <div>
+          <span>blue env</span>
+          <strong>{{ binary_blue_env_path }}</strong>
+        </div>
+        <div>
+          <span>green unit</span>
+          <strong>{{ binary_green_unit_path }}</strong>
+        </div>
+        <div>
+          <span>green env</span>
+          <strong>{{ binary_green_env_path }}</strong>
+        </div>
+        <div>
+          <span>release 元数据</span>
+          <strong>{{ binary_release_path }}</strong>
+        </div>
+        <div>
+          <span>当前版本指针</span>
+          <strong>{{ binary_current_path }}</strong>
+        </div>
+      </div>
+      <pre class="code-block">{{ binary_unit_content }}</pre>
+      <pre class="code-block">{{ binary_env_content }}</pre>
+      <pre class="code-block">{{ binary_blue_unit_content }}</pre>
+      <pre class="code-block">{{ binary_blue_env_content }}</pre>
+      <pre class="code-block">{{ binary_green_unit_content }}</pre>
+      <pre class="code-block">{{ binary_green_env_content }}</pre>
+      <pre class="code-block">{{ binary_release_content }}</pre>
+      <pre class="code-block">{{ binary_current_content }}</pre>
+    </section>
+    {% endif %}
+
+    <section class="panel" aria-labelledby="runtime-states-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="runtime-states-title">运行状态</h2>
+          <p>按目标节点展示应用运行态、版本和日志入口。</p>
+        </div>
+      </div>
+      {% if runtime_states.len() == 0 %}
+        <div class="empty-state">
+          <strong>暂无运行状态</strong>
+          <span>应用绑定目标节点后会显示运行态。</span>
+        </div>
+      {% else %}
+        <div class="detail-list">
+          {% for runtime in runtime_states %}
+            <div>
+              <span>
+                <a class="text-link" href="{{ runtime.node_detail_href }}">{{ runtime.node_name }}</a>
+              </span>
+              <strong>
+                <span class="badge tone-{{ runtime.status_tone }}">{{ runtime.status }}</span>
+                <span>{{ runtime.node_key }} · {{ runtime.service_count }} 个运行项 · {{ runtime.active_version }}</span>
+                <span>{{ runtime.message }}</span>
+                <span class="inline-actions runtime-actions">
+                  <a class="text-link" href="{{ runtime.node_detail_href }}">节点详情</a>
+                  {% if runtime.has_task_href %}
+                    <a class="text-link" href="{{ runtime.task_href }}">最近任务</a>
+                  {% endif %}
+                  {% if can_logs && runtime.has_log_links %}
+                    {% for log_link in runtime.log_links %}
+                      <a class="text-link" href="{{ log_link.href }}">{{ log_link.name }} 日志</a>
+                    {% endfor %}
+                  {% endif %}
+                </span>
+                <span>最后部署 {{ runtime.last_deploy_at }} · 更新 {{ runtime.updated_at }}</span>
+              </strong>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="panel" aria-labelledby="deploy-diff-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="deploy-diff-title">部署前差异</h2>
+          <p>{{ deploy_diff.baseline }}</p>
+        </div>
+        <span class="badge tone-{{ deploy_diff.status_tone }}">{{ deploy_diff.status }}</span>
+      </div>
+      {% if deploy_diff.rows.len() == 0 %}
+        <div class="empty-state">
+          <strong>{{ deploy_diff.empty_title }}</strong>
+          <span>{{ deploy_diff.empty_message }}</span>
+        </div>
+      {% else %}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>配置项</th>
+                <th>当前配置</th>
+                <th>上次部署</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in deploy_diff.rows %}
+                <tr>
+                  <td><strong>{{ row.label }}</strong></td>
+                  <td>{{ row.current_summary }}</td>
+                  <td>{{ row.baseline_summary }}</td>
+                  <td><span class="badge tone-{{ row.status_tone }}">{{ row.status }}</span></td>
+                </tr>
+                {% if row.has_detail %}
+                  <tr class="diff-preview-row">
+                    <td colspan="4">
+                      <div class="diff-preview-grid">
+                        <div>
+                          <span>当前配置片段</span>
+                          <pre class="code-block diff-preview-block">{{ row.current_preview }}</pre>
+                        </div>
+                        <div>
+                          <span>上次部署片段</span>
+                          <pre class="code-block diff-preview-block">{{ row.baseline_preview }}</pre>
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                {% endif %}
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="panel" aria-labelledby="deploy-history-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="deploy-history-title">部署历史</h2>
+          <p>最近 10 次部署、停止和重启结果。</p>
+        </div>
+      </div>
+      {% if deployment_runs.len() == 0 %}
+        <div class="empty-state">
+          <strong>暂无部署记录</strong>
+          <span>执行部署、停止或重启后会在这里显示结果。</span>
+        </div>
+      {% else %}
+        <div class="detail-list">
+          {% for run in deployment_runs %}
+            <div>
+              <span>{{ run.action }}</span>
+              <strong>
+                {% match run.task_id %}
+                  {% when Some with (task_id) %}
+                    <a class="text-link" href="/tasks/{{ task_id }}">{{ run.title }}</a>
+                  {% when None %}
+                    {{ run.title }}
+                {% endmatch %}
+                <span class="badge tone-{{ run.status_tone }}">{{ run.status }}</span>
+                <span>{{ run.message }}</span>
+                <span>{{ run.started_at }} - {{ run.finished_at }}</span>
+              </strong>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="panel" aria-labelledby="config-snapshots-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="config-snapshots-title">配置快照</h2>
+          <p>最近 10 次初始配置、手动保存和恢复记录。</p>
+        </div>
+      </div>
+      {% if config_snapshots.len() == 0 %}
+        <div class="empty-state">
+          <strong>暂无配置快照</strong>
+          <span>创建应用或保存配置后会生成快照。</span>
+        </div>
+      {% else %}
+        <div class="detail-list">
+          {% for snapshot in config_snapshots %}
+            <div>
+              <span>{{ snapshot.kind }}</span>
+              <strong>
+                <span>{{ snapshot.created_at }}</span>
+                <span>Compose: {{ snapshot.compose_summary }}</span>
+                <span>Env: {{ snapshot.env_summary }}</span>
+                {% if snapshot.can_restore %}
+                  <form class="inline-actions" method="post" action="/apps/{{ id }}/snapshots/{{ snapshot.id }}/restore">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button class="text-button" type="submit">恢复</button>
+                  </form>
+                {% endif %}
+              </strong>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="panel" aria-labelledby="health-check-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="health-check-title">健康检查</h2>
+          <p>部署和重启成功后执行，失败会把任务标记为失败。</p>
+        </div>
+        <span class="badge tone-neutral">{{ health_check_label }}</span>
+      </div>
+      {% if can_manage %}
+        <form class="panel-form" method="post" action="/apps/{{ id }}/config">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <textarea name="compose_content" hidden>{{ compose_content }}</textarea>
+          <textarea name="env_content" hidden>{{ env_content }}</textarea>
+          <input type="hidden" name="binary_artifact_version" value="{{ binary_artifact_version }}">
+          <input type="hidden" name="binary_artifact_path" value="{{ binary_artifact_path }}">
+          <input type="hidden" name="binary_exec_args" value="{{ binary_exec_args }}">
+          <input type="hidden" name="binary_service_user" value="{{ binary_service_user }}">
+          <input type="hidden" name="binary_unit_name" value="{{ binary_unit_name }}">
+          <input type="hidden" name="binary_release_strategy" value="{{ binary_release_strategy }}">
+          <input type="hidden" name="binary_active_slot" value="{{ binary_active_slot }}">
+          <input type="hidden" name="binary_base_port" value="{{ binary_base_port }}">
+          <input type="hidden" name="binary_standby_port" value="{{ binary_standby_port }}">
+          {% if binary_proxy_enabled %}
+            <input type="hidden" name="binary_proxy_enabled" value="true">
+          {% endif %}
+          <input type="hidden" name="binary_proxy_kind" value="{{ binary_proxy_kind }}">
+          <input type="hidden" name="binary_proxy_domain" value="{{ binary_proxy_domain }}">
+          <input type="hidden" name="binary_proxy_config_path" value="{{ binary_proxy_config_path }}">
+          <label>
+            检查方式
+            <select name="health_check_kind">
+              <option value="none"{% if health_check_kind == "none" %} selected{% endif %}>不检查</option>
+              <option value="http"{% if health_check_kind == "http" %} selected{% endif %}>HTTP GET</option>
+              <option value="tcp"{% if health_check_kind == "tcp" %} selected{% endif %}>TCP 连接</option>
+              <option value="compose_running"{% if health_check_kind == "compose_running" %} selected{% endif %}>容器运行状态</option>
+              <option value="systemd_active"{% if health_check_kind == "systemd_active" %} selected{% endif %}>systemd active</option>
+            </select>
+          </label>
+          <label>
+            检查地址
+            <input name="health_endpoint" value="{{ health_endpoint }}" placeholder="http://127.0.0.1:8080/healthz 或 127.0.0.1:8080">
+          </label>
+          <label>
+            超时时间（秒）
+            <input name="health_timeout_secs" type="number" min="1" max="60" value="{{ health_timeout_secs }}">
+          </label>
+          <label>
+            HTTP 期望状态码
+            <input name="health_expected_status" type="number" min="100" max="599" value="{{ health_expected_status }}">
+          </label>
+          <button class="primary-button compact-button" type="submit">保存健康检查</button>
+        </form>
+      {% else %}
+        <div class="detail-list">
+          <div>
+            <span>检查方式</span>
+            <strong>{{ health_check_label }}</strong>
+          </div>
+          <div>
+            <span>检查地址</span>
+            <strong>{{ health_endpoint }}</strong>
+          </div>
+        </div>
+      {% endif %}
+    </section>
+
+    {% if is_binary_app %}
+    <section class="panel" aria-labelledby="binary-actions-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="binary-actions-title">systemd 操作</h2>
+          <p>二进制应用通过 systemctl restart/stop 进入任务系统。</p>
+        </div>
+      </div>
+      {% if can_deploy %}
+        <div class="panel-form">
+          <a class="primary-button compact-button" href="/apps/{{ id }}/binary/restart/confirm">重启二进制</a>
+          <a class="ghost-button compact-button" href="/apps/{{ id }}/binary/stop/confirm">停止二进制</a>
+        </div>
+      {% else %}
+        <div class="panel-form">
+          <span class="label">只读权限</span>
+        </div>
+      {% endif %}
+    </section>
+    {% endif %}
+
+    <section class="panel" aria-labelledby="compose-actions-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="compose-actions-title">Compose 操作</h2>
+          <p>提供配置校验、最近日志和部署任务入口。</p>
+        </div>
+      </div>
+      {% if can_deploy || can_logs %}
+        <div class="panel-form">
+          {% if can_deploy %}
+            <a class="primary-button compact-button" href="/apps/{{ id }}/compose/up/confirm">部署</a>
+            <a class="ghost-button compact-button" href="/apps/{{ id }}/compose/restart/confirm">重启</a>
+            <a class="ghost-button compact-button" href="/apps/{{ id }}/compose/down/confirm">停止</a>
+            <form method="post" action="/apps/{{ id }}/compose/config">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="primary-button compact-button" type="submit">校验配置</button>
+            </form>
+          {% endif %}
+          {% if can_logs %}
+            <form method="post" action="/apps/{{ id }}/compose/logs">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="ghost-button compact-button" type="submit">最近日志</button>
+            </form>
+          {% endif %}
+        </div>
+      {% else %}
+        <div class="panel-form">
+          <span class="label">只读权限</span>
+        </div>
+      {% endif %}
+    </section>
+
+    {% match compose_result %}
+      {% when Some with (result) %}
+        <section class="panel" aria-labelledby="compose-result-title">
+          <div class="panel-header">
+            <div>
+              <h2 id="compose-result-title">执行结果</h2>
+              <p>{{ result.command }} · 退出码 {{ result.status_code }}</p>
+            </div>
+            <span class="badge tone-{{ result.status_tone }}">{{ result.status }}</span>
+          </div>
+          <pre class="code-block">{{ result.output }}</pre>
+        </section>
+      {% when None %}
+    {% endmatch %}
+
+    <section class="panel" aria-labelledby="paths-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="paths-title">目录</h2>
+          <p>区分平台配置目录和目标机器部署目录。</p>
+        </div>
+      </div>
+      <div class="detail-list">
+        <div>
+          <span>部署目录</span>
+          <strong>{{ work_dir }}</strong>
+        </div>
+        <div>
+          <span>配置目录</span>
+          <strong>{{ runtime_root }}</strong>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="metadata-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="metadata-title">app.yaml</h2>
+          <p>平台生成的应用元数据。</p>
+        </div>
+      </div>
+      <pre class="code-block">{{ metadata_content }}</pre>
+    </section>
+  </aside>
+</section>
+{% endblock %}
+

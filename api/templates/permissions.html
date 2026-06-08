@@ -1,0 +1,157 @@
+﻿{% extends "layout.html" %}
+
+{% block title %}权限管理 - {{ product_name }}{% endblock %}
+
+{% block content %}
+<section class="summary-grid" aria-label="权限概览">
+  {% for item in summary_items %}
+    <article class="summary-card tone-{{ item.tone }}">
+      <span>{{ item.label }}</span>
+      <strong>{{ item.value }}</strong>
+      <p>{{ item.detail }}</p>
+    </article>
+  {% endfor %}
+</section>
+
+<section class="panel filter-panel" aria-labelledby="permission-filter-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="permission-filter-title">权限筛选</h2>
+      <p>当前条件命中 {{ filtered_count }} 个权限项。</p>
+    </div>
+  </div>
+  <form class="filter-form permission-filter-form" method="get" action="/admin/permissions">
+    <label>
+      模块
+      <select name="module">
+        {% for option in module_filters %}
+          <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      类型
+      <select name="resource_type">
+        {% for option in type_filters %}
+          <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      关键字
+      <input name="q" value="{{ query }}" placeholder="权限名称、编码、说明">
+    </label>
+    <div class="filter-actions">
+      <button class="primary-button compact-button" type="submit">筛选</button>
+      <a class="ghost-button compact-button" href="/admin/permissions">重置</a>
+    </div>
+  </form>
+</section>
+
+<section class="main-grid">
+  <section class="panel panel-large" aria-labelledby="permission-list-title">
+    <div class="panel-header">
+      <div>
+        <h2 id="permission-list-title">权限清单</h2>
+        <p>权限编码是服务端鉴权依据，页面隐藏只作为交互优化。</p>
+      </div>
+      <div class="panel-actions">
+        <a class="ghost-button" href="/admin/roles">角色管理</a>
+        <a class="ghost-button" href="/admin/accounts">账号管理</a>
+      </div>
+    </div>
+    {% if permission_groups.len() == 0 %}
+      <div class="empty-state padded-empty">
+        <strong>没有匹配的权限</strong>
+        <span>调整模块、类型或关键字后再查看。</span>
+      </div>
+    {% else %}
+      <div class="permission-directory">
+        {% for group in permission_groups %}
+          <section class="permission-module" aria-labelledby="permission-module-{{ group.id }}">
+            <div class="permission-module-header">
+              <div>
+                <h3 id="permission-module-{{ group.id }}">{{ group.module }}</h3>
+                <span>{{ group.permissions.len() }} 个权限项</span>
+              </div>
+            </div>
+            <div class="permission-list">
+              {% for permission in group.permissions %}
+                <article class="permission-row">
+                  <div>
+                    <strong>{{ permission.name }}</strong>
+                    <span>{{ permission.key }}</span>
+                    <p>{{ permission.description }}</p>
+                  </div>
+                  <span class="badge tone-{{ permission.resource_tone }}">{{ permission.resource_type }}</span>
+                </article>
+              {% endfor %}
+            </div>
+          </section>
+        {% endfor %}
+      </div>
+    {% endif %}
+  </section>
+
+  <aside class="side-stack">
+    <section class="panel" aria-labelledby="permission-policy-title">
+      <div class="panel-header compact">
+        <h2 id="permission-policy-title">授权策略</h2>
+      </div>
+      <div class="detail-list compact-detail-list">
+        <div>
+          <span>来源</span>
+          <strong>权限注册表由服务端版本同步</strong>
+        </div>
+        <div>
+          <span>分配</span>
+          <strong>在角色管理中勾选权限集合</strong>
+        </div>
+        <div>
+          <span>校验</span>
+          <strong>页面和提交动作都在服务端校验</strong>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="permission-type-title">
+      <div class="panel-header compact">
+        <h2 id="permission-type-title">权限类型</h2>
+      </div>
+      <div class="permission-list">
+        <article class="permission-row">
+          <div>
+            <strong>页面权限</strong>
+            <span>page</span>
+            <p>控制菜单入口、页面访问和详情查看。</p>
+          </div>
+          <span class="badge tone-neutral">page</span>
+        </article>
+        <article class="permission-row">
+          <div>
+            <strong>操作权限</strong>
+            <span>action</span>
+            <p>控制创建、更新、部署、回滚、安装和强制下线等动作。</p>
+          </div>
+          <span class="badge tone-active">action</span>
+        </article>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="permission-module-title">
+      <div class="panel-header compact">
+        <h2 id="permission-module-title">模块目录</h2>
+      </div>
+      <div class="detail-list compact-detail-list">
+        {% for group in permission_groups %}
+          <div>
+            <span>{{ group.module }}</span>
+            <strong>{{ group.permissions.len() }} 个权限</strong>
+          </div>
+        {% endfor %}
+      </div>
+    </section>
+  </aside>
+</section>
+{% endblock %}
+

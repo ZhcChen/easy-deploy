@@ -1,0 +1,174 @@
+﻿{% extends "layout.html" %}
+
+{% block title %}运行项 - {{ product_name }}{% endblock %}
+
+{% block content %}
+<section class="summary-grid" aria-label="运行项概览">
+  <article class="summary-card tone-neutral">
+    <span>运行项总数</span>
+    <strong>{{ service_count }}</strong>
+    <p>来自当前应用配置</p>
+  </article>
+  <article class="summary-card tone-neutral">
+    <span>Compose 运行项</span>
+    <strong>{{ compose_count }}</strong>
+    <p>解析 compose.yaml</p>
+  </article>
+  <article class="summary-card tone-neutral">
+    <span>二进制运行项</span>
+    <strong>{{ binary_count }}</strong>
+    <p>systemd 管理</p>
+  </article>
+</section>
+
+<section class="panel" aria-labelledby="services-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="services-title">运行项列表</h2>
+      <p>这里是兼容入口；日常操作建议进入应用详情查看运行状态和日志。</p>
+    </div>
+  </div>
+  <form class="filter-form services-filter-form" method="get" action="/services">
+    <label>
+      类型
+      <select name="kind">
+        <option value=""{% if selected_kind == "" %} selected{% endif %}>全部类型</option>
+        <option value="compose"{% if selected_kind == "compose" %} selected{% endif %}>Compose</option>
+        <option value="binary"{% if selected_kind == "binary" %} selected{% endif %}>二进制</option>
+      </select>
+    </label>
+    <label>
+      运行状态
+      <select name="status">
+        <option value=""{% if selected_status == "" %} selected{% endif %}>全部状态</option>
+        <option value="healthy"{% if selected_status == "healthy" %} selected{% endif %}>健康</option>
+        <option value="unhealthy"{% if selected_status == "unhealthy" %} selected{% endif %}>异常</option>
+        <option value="deploying"{% if selected_status == "deploying" %} selected{% endif %}>部署中</option>
+        <option value="stopped"{% if selected_status == "stopped" %} selected{% endif %}>已停止</option>
+        <option value="unknown"{% if selected_status == "unknown" %} selected{% endif %}>未知</option>
+      </select>
+    </label>
+    <label>
+      关键词
+      <input name="q" value="{{ query }}" placeholder="运行项、应用、镜像、端口或节点">
+    </label>
+    <div class="filter-actions">
+      <button class="primary-button compact-button" type="submit">筛选</button>
+      <a class="ghost-button compact-button" href="/services">重置</a>
+    </div>
+  </form>
+  {% if services.len() == 0 %}
+    <div class="empty-state">
+      <strong>暂无运行项</strong>
+      <span>创建 Compose 应用后，这里会自动展示 compose.yaml 中的运行项。</span>
+    </div>
+  {% else %}
+    <div class="table-wrap">
+      <table class="services-table">
+        <thead>
+          <tr>
+            <th>运行项</th>
+            <th>应用</th>
+            <th>运行方式</th>
+            <th>镜像 / 运行时</th>
+            <th>端口</th>
+            <th>实例</th>
+            <th>健康检查</th>
+            <th>运行状态</th>
+            <th>目标节点</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for service in services %}
+            <tr>
+              <td>
+                <strong>{{ service.service_name }}</strong>
+                <span>{{ service.updated_at }}</span>
+              </td>
+              <td>
+                <strong><a class="text-link" href="/apps/{{ service.app_id }}">{{ service.app_name }}</a></strong>
+                <span>{{ service.app_key }}</span>
+              </td>
+              <td>{{ service.service_kind }}</td>
+              <td>{{ service.image }}</td>
+              <td>{{ service.ports }}</td>
+              <td>{{ service.replicas }}</td>
+              <td>
+                <span class="badge tone-{{ service.health_status_tone }}">{{ service.health_status }}</span>
+                <strong>{{ service.health_check }}</strong>
+                <span>{{ service.health_check_detail }}</span>
+                <span>{{ service.health_summary }}：{{ service.last_health_message }}</span>
+                <span>最近检查 {{ service.last_health_at }}</span>
+                <span>{{ service.health_action_hint }}</span>
+              </td>
+              <td>
+                <span class="badge tone-{{ service.runtime_status_tone }}">{{ service.runtime_status }}</span>
+                <span>{{ service.runtime_summary }}</span>
+                <span>版本 {{ service.active_version }}</span>
+                <span>应用 {{ service.app_status }}</span>
+              </td>
+              <td>
+                {% if service.node_links.len() == 0 %}
+                  <strong>{{ service.targets }}</strong>
+                {% else %}
+                  <div class="service-node-stack">
+                    {% for node in service.node_links %}
+                      <div class="service-node-card">
+                        <span class="badge tone-{{ node.runtime_status_tone }}">{{ node.runtime_status }}</span>
+                        <strong>{{ node.name }}</strong>
+                        <span>{{ node.node_key }} · {{ node.runtime_summary }}</span>
+                        <span>最近检查 {{ node.last_health_at }}</span>
+                        <span>{{ node.message }}</span>
+                        <span class="service-node-actions">
+                          {% if can_logs %}
+                            <a class="text-link" href="{{ node.href }}">查看日志</a>
+                          {% endif %}
+                            <a class="text-link" href="{{ node.node_href }}">节点详情</a>
+                            {% if node.has_task_href %}
+                              {% if can_retry && node.can_retry_task %}
+                                <form method="post" action="/tasks/{{ node.task_id }}/retry">
+                                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                                  <input type="hidden" name="return_to" value="{{ node.task_return_to }}">
+                                  <button class="text-button" type="submit">{{ node.task_action_label }}</button>
+                                </form>
+                              {% else %}
+                                <a class="text-link" href="{{ node.task_href }}">{{ node.task_action_label }}</a>
+                              {% endif %}
+                            {% endif %}
+                        </span>
+                        {% if node.has_task_href %}
+                          <span>
+                            最近任务
+                            <span class="badge tone-{{ node.task_status_tone }}">{{ node.task_status }}</span>
+                          </span>
+                        {% endif %}
+                      </div>
+                    {% endfor %}
+                  </div>
+                {% endif %}
+              </td>
+              <td>
+                {% if can_logs %}
+                  {% if service.node_links.len() == 0 %}
+                    <a class="text-link" href="/services/{{ service.app_id }}/{{ service.service_name }}/logs">日志</a>
+                  {% else %}
+                    <div class="link-stack">
+                      {% for node in service.node_links %}
+                        <a class="text-link" href="{{ node.href }}">{{ node.name }}日志</a>
+                      {% endfor %}
+                    </div>
+                  {% endif %}
+                {% else %}
+                  <span class="label">无日志权限</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</section>
+{% endblock %}
+

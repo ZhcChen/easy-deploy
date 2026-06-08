@@ -1,0 +1,73 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }} - {{ product_name }}</title>
+    <link rel="icon" href="/favicon.svg?v={{ asset_version }}" type="image/svg+xml">
+    <style>{{ css|safe }}</style>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="主导航">
+        <div class="brand">
+          <img class="brand-logo" src="/assets/logo.svg?v={{ asset_version }}" alt="" width="42" height="42">
+          <div>
+            <strong>{{ product_name }}</strong>
+            <span>部署控制台</span>
+          </div>
+        </div>
+
+        <nav class="nav-list" aria-label="后台导航">
+          {% for section in nav_sections %}
+            <div class="nav-section">
+              <div class="nav-section-label">{{ section.label }}</div>
+              {% for item in section.items %}
+                <a class="nav-link{% if item.active %} is-active{% endif %}" href="{{ item.href }}"{% if item.active %} aria-current="page"{% endif %}>
+                  <span class="nav-icon nav-icon-{{ item.icon }}" aria-hidden="true"></span>
+                  <span>{{ item.label }}</span>
+                </a>
+              {% endfor %}
+            </div>
+          {% endfor %}
+        </nav>
+
+        <div class="sidebar-footer">
+          <span class="label">版本</span>
+          <strong>{{ release_version }}</strong>
+        </div>
+      </aside>
+
+      <div class="workspace">
+        <header class="topbar">
+          <div class="topbar-shortcuts" aria-label="页面快捷操作"></div>
+          <details class="account-menu">
+            <summary class="account-trigger">
+              <span class="account-avatar" aria-hidden="true"></span>
+              <span>{{ current_user }}</span>
+            </summary>
+            <div class="account-dropdown">
+              <a href="/profile">个人中心</a>
+              <form method="post" action="/logout">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button type="submit">退出登录</button>
+              </form>
+            </div>
+          </details>
+        </header>
+
+        <main class="content">
+          <section class="summary-grid">
+            {% for card in cards %}
+              <article class="summary-card tone-neutral">
+                <span>{{ card.title }}</span>
+                <strong>{{ card.value }}</strong>
+                <p>{{ card.detail }}</p>
+              </article>
+            {% endfor %}
+          </section>
+        </main>
+      </div>
+    </div>
+  </body>
+</html>

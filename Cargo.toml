@@ -1,0 +1,33 @@
+[workspace]
+members = ["api", "e2e"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+askama = "0.14"
+axum = "0.8"
+argon2 = "0.5"
+async-trait = "0.1"
+base64 = "0.22"
+clap = "4.5"
+fs2 = "0.4"
+flate2 = "1"
+reqwest = { version = "0.12", default-features = false }
+tar = "0.4"
+url = "2"
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = "1"
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+sqlx = "0.8"
+tempfile = "3"
+tokio = "1"
+tower = "0.5"
+tower-http = "0.6"
+tracing = "0.1"
+tracing-subscriber = "0.3"

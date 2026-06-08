@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    {% block head_extra %}{% endblock %}
+    <title>{% block title %}{{ product_name }}{% endblock %}</title>
+    <link rel="icon" href="/favicon.svg?v={{ asset_version }}" type="image/svg+xml">
+    <style>{{ css|safe }}</style>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="{{ product_name }} 首页">
+          <img class="brand-logo" src="/assets/logo.svg?v={{ asset_version }}" alt="" width="38" height="38">
+          <span class="brand-copy">
+            <strong>{{ product_name }}</strong>
+            <span>部署控制台</span>
+          </span>
+        </a>
+
+        <div class="topbar-shortcuts" aria-label="页面快捷操作">
+          {% block topbar_actions %}{% endblock %}
+        </div>
+
+        <div class="account-menu">
+          <button class="account-trigger" type="button" aria-haspopup="true">
+            <span class="account-avatar" aria-hidden="true">A</span>
+            <span class="account-name">{{ current_user }}</span>
+            <span class="account-caret" aria-hidden="true"></span>
+          </button>
+          <div class="account-dropdown" role="menu">
+            <a href="/profile" role="menuitem">个人中心</a>
+            <form method="post" action="/logout" role="none">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit" role="menuitem">退出登录</button>
+            </form>
+          </div>
+        </div>
+      </header>
+
+      <div class="app-body">
+        <aside class="sidebar" aria-label="主导航">
+          <nav class="nav-list" aria-label="后台导航">
+            {% for section in nav_sections %}
+              <div class="nav-section">
+                <div class="nav-section-label">{{ section.label }}</div>
+                {% for item in section.items %}
+                  <a class="nav-link{% if item.active %} is-active{% endif %}" href="{{ item.href }}"{% if item.active %} aria-current="page"{% endif %}>
+                    <span class="nav-icon nav-icon-{{ item.icon }}" aria-hidden="true"></span>
+                    <span>{{ item.label }}</span>
+                  </a>
+                {% endfor %}
+              </div>
+            {% endfor %}
+          </nav>
+
+          <div class="sidebar-footer">
+            <span class="label">版本</span>
+            <strong>{{ release_version }}</strong>
+          </div>
+        </aside>
+
+        <div class="workspace">
+        <main class="content">
+          {% block content %}{% endblock %}
+        </main>
+        </div>
+      </div>
+    </div>
+    {% block before_scripts %}{% endblock %}
+    <script src="/assets/app.js?v={{ asset_version }}"></script>
+    {% block scripts %}{% endblock %}
+  </body>
+</html>

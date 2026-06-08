@@ -1,0 +1,93 @@
+﻿{% extends "layout.html" %}
+
+{% block title %}审计日志 - {{ product_name }}{% endblock %}
+
+{% block content %}
+<section class="panel filter-panel" aria-labelledby="audit-filter-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="audit-filter-title">日志筛选</h2>
+      <p>当前条件命中 {{ filtered_count }} 条，列表最多展示最近 100 条。</p>
+    </div>
+  </div>
+  <form class="filter-form" method="get" action="/audit">
+    <label>
+      动作
+      <select name="action">
+        <option value=""{% if selected_action == "" %} selected{% endif %}>全部动作</option>
+        {% for option in action_filters %}
+          <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      目标
+      <select name="target_type">
+        <option value=""{% if selected_target_type == "" %} selected{% endif %}>全部目标</option>
+        {% for option in target_filters %}
+          <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      操作者
+      <input name="actor" value="{{ actor }}" placeholder="admin">
+    </label>
+    <label>
+      关键字
+      <input name="q" value="{{ query }}" placeholder="说明、目标 ID、动作">
+    </label>
+    <div class="filter-actions">
+      <button class="primary-button compact-button" type="submit">筛选</button>
+      <a class="ghost-button compact-button" href="/audit">重置</a>
+    </div>
+  </form>
+</section>
+
+<section class="panel" aria-labelledby="audit-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="audit-title">最近操作</h2>
+      <p>按发生时间倒序展示，保留操作人、动作、目标和说明。</p>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>时间</th>
+          <th>操作者</th>
+          <th>动作</th>
+          <th>目标</th>
+          <th>说明</th>
+          <th>IP</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% if logs.len() == 0 %}
+          <tr>
+            <td colspan="6">
+              <div class="empty-state">
+                <strong>没有匹配的审计日志</strong>
+                <span>调整筛选条件后再查看。</span>
+              </div>
+            </td>
+          </tr>
+        {% else %}
+          {% for log in logs %}
+            <tr>
+              <td>{{ log.created_at }}</td>
+              <td>{{ log.actor }}</td>
+              <td>{{ log.action }}</td>
+              <td>{{ log.target }}</td>
+              <td>{{ log.message }}</td>
+              <td>{{ log.ip }}</td>
+            </tr>
+          {% endfor %}
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
+

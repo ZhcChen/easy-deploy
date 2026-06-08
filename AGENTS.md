@@ -1,56 +1,97 @@
-# CE 项目提示词模板
+# easy-deploy 项目协作规则
 
-> 说明：这是 **Compound Engineering (CE)** 在 Codex CLI 下的项目级 `AGENTS.md` 模板。
-> 当某个项目希望以 CE 作为主要 AI 工作架构时，将本文件复制到该项目根目录并重命名为 `AGENTS.md`。
-> 如果项目已经有自己的 `AGENTS.md`，请将其中与 CE 相关的规则合并进去，而不是盲目覆盖。
+## 语言规范
+- 所有文档、讨论、任务总结与提交说明默认使用简体中文。
+- 框架、库、协议、命令、配置键等固定术语可保留英文。
 
-## 工作模式
-- 本项目默认启用 **Compound Engineering (CE)** 作为主要 AI 工作架构。
-- 在没有用户明确要求切换流程的情况下，优先使用 CE 的工作流，避免混入其他并行流程。
-- **同一项任务默认只采用一套主工作流。** 若当前任务已明确选择 CE，就不要再混入其他设计/计划/执行流程。
-- 若用户明确指定使用其他流程、已有项目规范与 CE 冲突，或当前任务只是一次小型查询/解释，则以用户指令和项目现有规范为准。
+## 项目定位
+- 本项目是一个使用 Rust 开发的简单易用部署平台。
+- 主模块为 `api`，负责 Web 后台、认证授权、部署编排与页面渲染。
+- `e2e` 模块用于验收测试和端到端 smoke。
+- 当前后台服务默认端口为 `9066`。
+- UI 优先使用 HTML + CSS + htmx 思路，尽量保持低依赖；除非用户明确要求，不引入重型前端框架。
 
-## CE 默认工作流
-按任务类型优先采用以下顺序：
+## CE 工作流
+- 本项目默认启用 Compound Engineering 作为主要 AI 工作架构。
+- 需求不清或范围未定时，优先先澄清或产出 `docs/brainstorms/`。
+- 需求清晰但涉及跨模块设计时，优先产出或续写 `docs/plans/`。
+- 进入执行阶段后，按计划实现、验证、复盘。
+- 解决方案或可复用经验沉淀到 `docs/solutions/`。
+- 已有计划文档时优先复用和续写，不要重复生成平行文档。
 
-1. **需求不清、范围未定、要先讨论方向**
-   - 优先使用 `ce:brainstorm`
-   - 产出写入 `docs/brainstorms/`
-
-2. **需求已清晰，需要技术方案或拆解实施计划**
-   - 优先使用 `ce:plan`
-   - 产出写入 `docs/plans/`
-
-3. **进入执行阶段，需要按计划落地**
-   - 优先使用 `ce:work`
-   - 若明确需要实验性的外部委派模式，可使用 `ce:work-beta`
-
-4. **代码改动完成，需要审查质量、风险与规范**
-   - 优先使用 `ce:review`
-
-5. **问题解决后，需要沉淀经验与复用知识**
-   - 优先使用 `ce:compound`
-   - 历史知识漂移或过期时使用 `ce:compound-refresh`
-   - 产出写入 `docs/solutions/`
-
-## 产物约定
+## 目录与产物约定
 - 需求/产品定义：`docs/brainstorms/`
 - 技术计划：`docs/plans/`
 - 解决方案/经验沉淀：`docs/solutions/`
 - CE 运行期中间产物：`.context/compound-engineering/`
+- 临时截图、浏览器调试产物、一次性导出、排障草稿等非正式交付物统一放入 `tmp/` 或其子目录。
+- 所有文档路径引用使用仓库相对路径，不使用绝对路径。
 
-除非项目已有明确不同约定，否则遵守以上目录布局。
+## 开发与验证
+- Rust 代码提交前优先运行与改动范围匹配的验证：
+  - 格式检查：`cargo fmt --all --check`
+  - 编译检查：`cargo check --workspace`
+  - 后端单测：`cargo test -p api`
+  - E2E smoke：`cargo test -p e2e --test smoke -- --nocapture`
+  - 风险较高或提交前收口时：`cargo clippy --workspace --all-targets -- -D warnings`
+- 如果因环境、外部依赖或耗时原因无法完成完整验证，必须在最终回复中说明边界和已完成的验证。
+- 不提交明显编译失败、测试失败或半成品状态，除非用户明确要求保存现场；这种提交必须在 commit message 中标记 `WIP` 或阻塞点。
 
-## 执行规则
-- 在 CE 工作流中，优先保证：**先澄清，再规划，再执行，再审查，再沉淀**。
-- 对于跨文件、跨模块、带有不确定性的任务，不要跳过 `ce:brainstorm` 或 `ce:plan` 直接编码，除非用户明确要求。
-- 所有文档中的路径引用都使用**仓库相对路径**，不要使用绝对路径。
-- 当任务已经有现成计划文件或 brainstorm 文档时，优先复用和续写，不要重复生成平行文档。
-- 若项目中同时存在人工规范、项目 `AGENTS.md`、其他 AI 说明文件，则遵循：
-  1. 用户明确指令
-  2. 当前项目根目录下的规范文件
-  3. CE 工作流约定
-  4. 全局默认行为
+## SQL 迁移规范
+- SQLite 主库 migration 统一放在 `api/migrations/`。
+- 当前历史迁移使用 `NNNN_name.sql` 风格，后续继续追加递增编号，不改成时间戳格式。
+- 新迁移通过 `cargo run -p api -- migrate create <snake_case_name>` 创建。
+- 发布或提交前优先执行 `cargo run -p api -- migrate status` 和 `cargo run -p api -- migrate guard`。
+- 历史 migration 禁止修改、删除、重命名；结构问题用新的补丁 migration 修复。
+- 大批量 backfill、外部依赖修复、长时间数据修复不放进常规 migration，后续做成独立维护命令或任务。
+- 详细规则见 `docs/runbooks/api-migrations.md`。
+
+## Git 提交规范
+- 提交说明默认使用简体中文，优先概括业务目的和改动范围。
+- 默认采用类似 qfy-sc 的 Conventional Commit 风格：
+  - `feat:` 新能力或用户可见能力
+  - `fix:` 修复缺陷、断言失败、行为回归
+  - `docs:` 文档、计划、规则
+  - `test:` 测试或验收覆盖
+  - `chore:` 工程维护、依赖、配置
+  - `refactor:` 不改变行为的结构调整
+- 示例：
+  - `feat: 初始化部署平台基础能力`
+  - `fix: 修复 e2e 会话与审计断言`
+  - `docs: 同步项目协作与提交规则`
+- 一次任务包含多个相对独立功能点时，按功能边界、风险边界或可验证阶段拆分多个 commit；不要把无关改动混在同一个 commit。
+- 提交前必须查看 `git status` 和待提交 diff，只提交本次任务相关文件。
+- 工作区存在用户或其他任务留下的无关改动时，保留不动，不得顺手混入。
+- 用户明确要求“提交”“整理提交”时，视为授权创建 commit；是否推送按用户当次要求或远端状态执行。
+
+## 浏览器与 E2E
+- 浏览器是较重工具；源码、日志、HTTP 请求或现有测试足以完成任务时，不额外打开浏览器。
+- 普通页面操作、截图、冒烟验证优先使用 `agent-browser`。
+- DOM、Network、Console、Performance 深度排查优先使用 Chrome DevTools MCP。
+- 正式 E2E / 回归脚本优先使用项目内测试。
+- 同一任务默认复用已有浏览器 session/page，任务结束后清理临时页面或 session。
+
+## 终端输出格式
+- 默认不要使用 Markdown 表格。
+- 需要展示表格数据时，优先使用适合终端阅读的 Unicode 线框表格。
+- 小型表格也可以使用对齐良好的纯文本列；除非用户明确要求 Markdown，否则避免 Markdown table。
+
+## Context7 使用准则
+- 需要官方库或框架资料时，优先使用 Context7 MCP 服务。
+- 调用文档查询前先解析准确的 `/org/project[/version]` 标识；用户已提供完整 ID 时可直接使用。
+- 名称歧义时说明筛选理由；不确定需求时先确认。
+- 使用 Context7 文档撰写答案时，确保内容与原文一致并注明来源。
+
+## Chrome DevTools MCP 使用准则
+- 需排查浏览器端行为、排版或网络问题时，优先调用 Chrome DevTools MCP。
+- 调试前明确目标页面和期望采集的数据，如 DOM、Network、Console。
+- 获取结果后整理关键观察，避免遗漏上下文。
+
+## 执行优先级
+1. 用户明确指令
+2. 当前项目根目录下的规范文件
+3. CE 工作流约定
+4. 全局默认行为
 
 <!-- BEGIN COMPOUND CODEX TOOL MAP -->
 ## Compound Codex Tool Mapping (Claude Compatibility)
@@ -68,8 +109,9 @@ Tool mapping:
 - LS: use ls via shell_command
 - WebFetch/WebSearch: use curl or Context7 for library docs
 - AskUserQuestion/Question: present choices as a numbered list in chat and wait for a reply number. For multi-select (multiSelect: true), accept comma-separated numbers. Never skip or auto-configure — always wait for the user's response before proceeding.
-- Task/Subagent/Parallel: run sequentially in main thread; use multi_tool_use.parallel for tool calls
-- TodoWrite/TodoRead: use file-based todos in todos/ with todo-create skill
+- Task (subagent dispatch) / Subagent / Parallel: run sequentially in main thread; use multi_tool_use.parallel for tool calls
+- TaskCreate/TaskUpdate/TaskList/TaskGet/TaskStop/TaskOutput (Claude Code task-tracking, current): use update_plan (Codex's task-tracking primitive)
+- TodoWrite/TodoRead (Claude Code task-tracking, legacy — deprecated, replaced by Task* tools): use update_plan
 - Skill: open the referenced SKILL.md and follow it
 - ExitPlanMode: ignore
 <!-- END COMPOUND CODEX TOOL MAP -->

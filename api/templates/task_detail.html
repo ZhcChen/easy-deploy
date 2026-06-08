@@ -1,0 +1,264 @@
+﻿{% extends "layout.html" %}
+
+{% block head_extra %}
+{% if task.is_live %}
+  <meta http-equiv="refresh" content="3">
+{% endif %}
+{% endblock %}
+
+{% block title %}#{{ task.id }} {{ task.title }} - {{ product_name }}{% endblock %}
+
+{% block topbar_actions %}
+<a class="ghost-button" href="/tasks">返回任务</a>
+          
+{% endblock %}
+
+{% block content %}
+<section class="main-grid">
+  <section class="panel panel-large" aria-labelledby="task-logs-title">
+    <section class="task-execution-guide tone-{{ execution_guide.tone }}" aria-labelledby="task-execution-guide-title">
+      <div>
+        <span>执行指引</span>
+        <strong id="task-execution-guide-title">{{ execution_guide.title }}</strong>
+        <p>{{ execution_guide.detail }}</p>
+      </div>
+      <div class="task-guide-grid">
+        <div>
+          <span>节点结果</span>
+          <strong>{{ execution_guide.node_summary }}</strong>
+        </div>
+        <div>
+          <span>日志定位</span>
+          <strong>{{ execution_guide.log_hint }}</strong>
+        </div>
+        <div>
+          <span>下一步</span>
+          <strong>{{ execution_guide.next_step }}</strong>
+        </div>
+      </div>
+    </section>
+    <div class="panel-header">
+      <div>
+        <h2 id="task-logs-title">任务日志</h2>
+        <p>{{ task.app_name }} · {{ task.task_kind_label }} · {{ task.created_by }}</p>
+      </div>
+      <div class="panel-actions">
+        {% if task.is_live %}
+          <span class="live-refresh-indicator" title="页面会每 3 秒自动刷新一次，直到任务结束。">自动刷新中</span>
+        {% endif %}
+        <span class="badge tone-{{ task.status_tone }}">{{ task.status }}</span>
+        <span class="badge tone-{{ task.phase_tone }}">{{ task.phase }}</span>
+        <span class="badge tone-{{ task.queue_tone }}">{{ task.queue_state }}</span>
+        {% if return_action.has_return %}
+          <span class="return-action-hint">{{ return_action.hint }}</span>
+          <a class="ghost-button" href="{{ return_action.path }}">{{ return_action.back_label }}</a>
+          {% if can_check_node %}
+            {% if let Some(node_id) = install_check_node_id %}
+              <form method="post" action="/nodes/check">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="node_id" value="{{ node_id }}">
+                <input type="hidden" name="return_to" value="{{ return_action.path }}">
+                <button class="primary-button" type="submit">{{ return_action.check_label }}</button>
+              </form>
+            {% endif %}
+          {% endif %}
+        {% endif %}
+        {% if can_retry && task.is_failed && task.is_retryable_task %}
+          <form method="post" action="/tasks/{{ task.id }}/retry">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            {% if return_action.has_return %}
+              <input type="hidden" name="return_to" value="{{ return_action.path }}">
+            {% endif %}
+            <button class="primary-button" type="submit">重试</button>
+          </form>
+        {% endif %}
+        {% if can_cancel && task.is_queued %}
+          <form method="post" action="/tasks/{{ task.id }}/cancel">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="ghost-button" type="submit">取消</button>
+          </form>
+        {% endif %}
+      </div>
+    </div>
+    <div class="task-log-list">
+      {% for log in logs %}
+        <article class="task-log-entry">
+          <div class="task-log-meta">
+            <span class="badge tone-{{ log.stream_tone }}">{{ log.stream }}</span>
+            <span>#{{ log.id }} · {{ log.created_at }}</span>
+          </div>
+          <pre class="code-block">{{ log.content }}</pre>
+        </article>
+      {% endfor %}
+      {% if logs.len() == 0 %}
+        <div class="empty-state">
+          <strong>暂无日志</strong>
+          <span>任务进入执行阶段后会写入日志。</span>
+        </div>
+      {% endif %}
+    </div>
+  </section>
+
+  <aside class="side-stack">
+    <section class="panel" aria-labelledby="task-node-results-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="task-node-results-title">节点结果</h2>
+          <p>每个目标节点的执行状态、命令数量和结果摘要。</p>
+        </div>
+      </div>
+      <div class="node-result-list">
+        {% for node in node_results %}
+          <article class="node-result-row">
+            <div>
+              <strong>{{ node.node_name }}</strong>
+              <span>{{ node.node_key }} · {{ node.node_type }} · {{ node.command_count }} 条命令</span>
+            </div>
+            <span class="badge tone-{{ node.status_tone }}">{{ node.status }}</span>
+            <p>{{ node.message }}</p>
+            {% if node.has_action %}
+              <div class="node-result-actions">
+                <span>{{ node.action_hint }}</span>
+                {% if node.action_kind == "install" %}
+                  {% if can_install_nodes %}
+                    <form method="post" action="/nodes/install">
+                      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                      <input type="hidden" name="node_id" value="{{ node.node_id }}">
+                      <input type="hidden" name="component" value="{{ node.action_component }}">
+                      <input type="hidden" name="return_to" value="/tasks/{{ task.id }}">
+                      <button class="ghost-button compact-button" type="submit">{{ node.action_label }}</button>
+                    </form>
+                  {% else %}
+                    <a class="ghost-button compact-button" href="/nodes/{{ node.node_id }}">{{ node.action_label }}</a>
+                  {% endif %}
+                {% else if node.action_kind == "check" %}
+                  {% if can_check_node %}
+                    <form method="post" action="/nodes/check">
+                      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                      <input type="hidden" name="node_id" value="{{ node.node_id }}">
+                      <input type="hidden" name="return_to" value="/tasks/{{ task.id }}">
+                      <button class="ghost-button compact-button" type="submit">{{ node.action_label }}</button>
+                    </form>
+                  {% else %}
+                    <a class="ghost-button compact-button" href="/nodes/{{ node.node_id }}">{{ node.action_label }}</a>
+                  {% endif %}
+                {% else %}
+                  <a class="ghost-button compact-button" href="/nodes/{{ node.node_id }}">{{ node.action_label }}</a>
+                {% endif %}
+              </div>
+            {% endif %}
+            <small>{{ node.finished_at }}</small>
+          </article>
+        {% endfor %}
+        {% if node_results.len() == 0 %}
+          <div class="empty-state">
+            <strong>暂无节点结果</strong>
+            <span>任务执行到目标节点后会记录每个节点的结果。</span>
+          </div>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="task-summary-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="task-summary-title">执行摘要</h2>
+          <p>任务最终状态和命令返回信息。</p>
+        </div>
+      </div>
+      <div class="detail-list">
+        <div>
+          <span>状态</span>
+          <strong>{{ task.status }}</strong>
+        </div>
+        <div>
+          <span>阶段</span>
+          <strong>{{ task.phase }}</strong>
+        </div>
+        <div>
+          <span>当前阶段</span>
+          <strong>{{ task.phase_detail }}</strong>
+        </div>
+        <div>
+          <span>队列</span>
+          <strong>{{ task.queue_state }}</strong>
+        </div>
+        <div>
+          <span>退出码</span>
+          <strong>{{ task.exit_code }}</strong>
+        </div>
+        <div>
+          <span>摘要</span>
+          <strong>{{ task.summary }}</strong>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="task-phase-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="task-phase-title">阶段进度</h2>
+          <p>从入队到收尾的执行路径。</p>
+        </div>
+      </div>
+      <div class="phase-step-list">
+        {% for phase in phases %}
+          <div class="phase-step phase-step-{{ phase.tone }}">
+            <span class="phase-dot" aria-hidden="true"></span>
+            <div>
+              <strong>{{ phase.label }}</strong>
+              <span>{{ phase.state }}</span>
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="task-command-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="task-command-title">命令</h2>
+          <p>后台 worker 实际执行的部署命令。</p>
+        </div>
+      </div>
+      <pre class="code-block">{{ task.command }}</pre>
+    </section>
+
+    <section class="panel" aria-labelledby="task-meta-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="task-meta-title">元信息</h2>
+          <p>关联对象和时间线。</p>
+        </div>
+      </div>
+      <div class="detail-list">
+        <div>
+          <span>应用</span>
+          <strong>{{ task.app_name }}</strong>
+        </div>
+        <div>
+          <span>节点</span>
+          <strong>{{ task.node_name }}</strong>
+        </div>
+        <div>
+          <span>创建时间</span>
+          <strong>{{ task.created_at }}</strong>
+        </div>
+        <div>
+          <span>开始时间</span>
+          <strong>{{ task.started_at }}</strong>
+        </div>
+        <div>
+          <span>结束时间</span>
+          <strong>{{ task.finished_at }}</strong>
+        </div>
+        <div>
+          <span>更新时间</span>
+          <strong>{{ task.updated_at }}</strong>
+        </div>
+      </div>
+    </section>
+  </aside>
+</section>
+{% endblock %}
+

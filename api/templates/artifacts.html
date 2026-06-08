@@ -1,0 +1,106 @@
+﻿{% extends "layout.html" %}
+
+{% block title %}制品管理 - {{ product_name }}{% endblock %}
+
+{% block content %}
+<section class="summary-grid" aria-label="制品概览">
+  {% for item in summary_items %}
+    <article class="summary-card tone-{{ item.tone }}">
+      <span>{{ item.label }}</span>
+      <strong>{{ item.value }}</strong>
+      <p>{{ item.detail }}</p>
+    </article>
+  {% endfor %}
+</section>
+
+<section class="panel panel-large" aria-labelledby="artifacts-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="artifacts-title">最近制品</h2>
+      <p>展示最近 100 条二进制制品；上传制品默认保留最近 {{ uploaded_binary_releases_to_keep }} 个版本。</p>
+    </div>
+  </div>
+  <form class="filter-form artifacts-filter-form" method="get" action="/artifacts">
+    <label>
+      状态
+      <select name="status">
+        <option value=""{% if selected_status == "" %} selected{% endif %}>全部状态</option>
+        <option value="active"{% if selected_status == "active" %} selected{% endif %}>当前</option>
+        <option value="registered"{% if selected_status == "registered" %} selected{% endif %}>已登记</option>
+        <option value="disabled"{% if selected_status == "disabled" %} selected{% endif %}>已停用</option>
+      </select>
+    </label>
+    <label>
+      类型
+      <select name="kind">
+        <option value=""{% if selected_kind == "" %} selected{% endif %}>全部类型</option>
+        <option value="binary"{% if selected_kind == "binary" %} selected{% endif %}>Binary</option>
+        <option value="tar_gz"{% if selected_kind == "tar_gz" %} selected{% endif %}>tar.gz</option>
+      </select>
+    </label>
+    <label>
+      来源
+      <select name="source">
+        <option value=""{% if selected_source == "" %} selected{% endif %}>全部来源</option>
+        <option value="upload"{% if selected_source == "upload" %} selected{% endif %}>上传</option>
+        <option value="initial"{% if selected_source == "initial" %} selected{% endif %}>初始化</option>
+      </select>
+    </label>
+    <label>
+      关键词
+      <input name="q" value="{{ query }}" placeholder="应用、版本、路径、入口或 sha256">
+    </label>
+    <div class="filter-actions">
+      <button class="primary-button compact-button" type="submit">筛选</button>
+      <a class="ghost-button compact-button" href="/artifacts">重置</a>
+    </div>
+  </form>
+  {% if artifacts.len() == 0 %}
+    <div class="empty-state">
+      <strong>暂无制品</strong>
+      <span>创建二进制应用、登记路径或上传制品后会出现在这里。</span>
+    </div>
+  {% else %}
+    <div class="table-wrap">
+      <table class="artifact-table">
+        <thead>
+          <tr>
+            <th>应用</th>
+            <th>版本</th>
+            <th>类型</th>
+            <th>大小</th>
+            <th>sha256</th>
+            <th>入口文件</th>
+            <th>制品路径</th>
+            <th>创建时间</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for artifact in artifacts %}
+            <tr>
+              <td>
+                <strong><a class="text-link" href="/apps/{{ artifact.app_id }}">{{ artifact.app_name }}</a></strong>
+                <span>{{ artifact.app_key }} · #{{ artifact.id }}</span>
+              </td>
+              <td>
+                <strong>{{ artifact.version }}</strong>
+                <span class="badge tone-{{ artifact.status_tone }}">{{ artifact.status }}</span>
+              </td>
+              <td>
+                <strong>{{ artifact.artifact_kind }}</strong>
+                <span>{{ artifact.source }}</span>
+              </td>
+              <td>{{ artifact.size }}</td>
+              <td><span class="mono-cell">sha256 {{ artifact.sha256 }}</span></td>
+              <td><span class="path-cell">{{ artifact.entry_file }}</span></td>
+              <td><span class="path-cell">{{ artifact.artifact_path }}</span></td>
+              <td>{{ artifact.created_at }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</section>
+{% endblock %}
+

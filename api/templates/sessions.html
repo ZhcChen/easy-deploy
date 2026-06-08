@@ -1,0 +1,115 @@
+﻿{% extends "layout.html" %}
+
+{% block title %}会话管理 - {{ product_name }}{% endblock %}
+
+{% block content %}
+{% if let Some(message) = notice %}
+  <div class="alert alert-success">{{ message }}</div>
+{% endif %}
+
+<section class="summary-grid" aria-label="会话概览">
+  {% for item in summary_items %}
+    <article class="summary-card tone-{{ item.tone }}">
+      <span>{{ item.label }}</span>
+      <strong>{{ item.value }}</strong>
+      <p>{{ item.detail }}</p>
+    </article>
+  {% endfor %}
+</section>
+
+<section class="panel filter-panel" aria-labelledby="session-filter-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="session-filter-title">会话筛选</h2>
+      <p>当前条件命中 {{ filtered_count }} 条会话，列表最多展示最近 100 条。</p>
+    </div>
+  </div>
+  <form class="filter-form session-filter-form" method="get" action="/admin/sessions">
+    <label>
+      状态
+      <select name="status">
+        {% for option in status_filters %}
+          <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      关键字
+      <input name="q" value="{{ query }}" placeholder="账号、IP、User-Agent">
+    </label>
+    <div class="filter-actions">
+      <button class="primary-button compact-button" type="submit">筛选</button>
+      <a class="ghost-button compact-button" href="/admin/sessions">重置</a>
+    </div>
+  </form>
+</section>
+
+<section class="panel" aria-labelledby="sessions-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="sessions-title">登录会话</h2>
+      {% if can_manage %}
+        <p>展示最近 100 条后台会话，可强制下线异常会话。</p>
+      {% else %}
+        <p>展示最近 100 条后台会话，当前角色只能查看会话状态。</p>
+      {% endif %}
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>账号</th>
+          <th>状态</th>
+          <th>风险</th>
+          <th>来源</th>
+          <th>创建时间</th>
+          <th>过期时间</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% if sessions.len() == 0 %}
+          <tr>
+            <td colspan="7">
+              <div class="empty-state">
+                <strong>没有匹配的会话</strong>
+                <span>调整筛选条件后再查看。</span>
+              </div>
+            </td>
+          </tr>
+        {% else %}
+          {% for session in sessions %}
+            <tr>
+              <td>
+                <strong>{{ session.account }}</strong>
+                <span>#{{ session.id }}</span>
+              </td>
+              <td><span class="badge tone-{{ session.status_tone }}">{{ session.status }}</span></td>
+              <td><span class="badge tone-{{ session.risk_tone }}">{{ session.risk_label }}</span></td>
+              <td>
+                <strong>{{ session.last_ip }}</strong>
+                <span>{{ session.user_agent }}</span>
+              </td>
+              <td>{{ session.created_at }}</td>
+              <td>{{ session.expires_at }}</td>
+              <td>
+                {% if session.can_revoke %}
+                  <form method="post" action="/admin/sessions/revoke">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="session_id" value="{{ session.id }}">
+                    <button class="text-button" type="submit">强制下线</button>
+                  </form>
+                {% else %}
+                  <span class="label">不可操作</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
+

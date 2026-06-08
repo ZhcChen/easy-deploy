@@ -1,0 +1,8295 @@
+use std::{
+    fs::{self, File},
+    net::TcpListener,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use flate2::read::GzDecoder;
+use fs2::available_space;
+use serde_json::Value as JsonValue;
+use serde_yaml::Value;
+use sha2::{Digest, Sha256};
+use sqlx::SqlitePool;
+use tar::Archive;
+use tokio::{net::TcpStream, sync::mpsc};
+use tracing::{error, warn};
+use url::Url;
+
+use crate::{
+    deploy::{
+        ComposeCommandOutput, ComposeExecutor, DeployError, SshExecutor, SshTarget, SystemdExecutor,
+    },
+    health::{HealthCheckConfig, HealthCheckKind, normalize_health_config, run_health_check},
+    platform::{PlatformConfigError, PlatformConfigService},
+    runtimefs::{
+        AppRuntimeConfig, BinaryRuntimeConfig, BinaryRuntimeFiles, BinaryRuntimeMetadata,
+        META_DIR_NAME, RuntimeFs, RuntimeFsError, SYSTEMD_DIR_NAME, TargetNodeMetadata,
+    },
+    tasks::{
+        CreateTaskInput, TaskError, TaskNodeResultInput, TaskService, active_task_status_label,
+    },
+};
+
+const COMPOSE_TASK_QUEUE_CAPACITY: usize = 100;
+const MIN_COMPOSE_FREE_SPACE_BYTES: u64 = 512 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeployStrategy {
+    RollingStopOnFailure,
+    RollingContinue,
+}
+
+impl DeployStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RollingStopOnFailure => "rolling_stop_on_failure",
+            Self::RollingContinue => "rolling_continue",
+        }
+    }
+
+    fn should_stop_after_failure(self) -> bool {
+        self == Self::RollingStopOnFailure
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::RollingStopOnFailure => "滚动部署，失败停止",
+            Self::RollingContinue => "逐节点继续，最终汇总失败",
+        }
+    }
+}
+
+pub fn normalize_deploy_strategy(value: &str) -> Result<String, AppError> {
+    let strategy = value.trim();
+    if strategy.is_empty() {
+        return Ok(DeployStrategy::RollingStopOnFailure.as_str().to_owned());
+    }
+    match strategy {
+        "rolling_stop_on_failure" | "rolling_continue" => Ok(strategy.to_owned()),
+        _ => Err(AppError::InvalidInput("部署策略不支持".to_owned())),
+    }
+}
+
+fn parse_deploy_strategy(value: &str) -> DeployStrategy {
+    match value {
+        "rolling_continue" => DeployStrategy::RollingContinue,
+        _ => DeployStrategy::RollingStopOnFailure,
+    }
+}
+
+#[derive(Clone)]
+pub struct AppService {
+    db: SqlitePool,
+    runtime_fs: RuntimeFs,
+    compose: ComposeExecutor,
+    systemd: SystemdExecutor,
+    tasks: TaskService,
+    compose_queue: ComposeTaskQueue,
+    binary_queue: BinaryTaskQueue,
+    platform: PlatformConfigService,
+}
+
+#[derive(Debug)]
+pub enum AppError {
+    InvalidInput(String),
+    Conflict(String),
+    Internal(String),
+}
+
+impl AppError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::InvalidInput(message) | Self::Conflict(message) | Self::Internal(message) => {
+                message
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for AppError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for AppError {}
+
+impl From<sqlx::Error> for AppError {
+    fn from(value: sqlx::Error) -> Self {
+        if let sqlx::Error::Database(err) = &value
+            && err.is_unique_violation()
+        {
+            return Self::Conflict("应用标识已存在".to_owned());
+        }
+        Self::Internal(format!("应用数据操作失败: {value}"))
+    }
+}
+
+impl From<RuntimeFsError> for AppError {
+    fn from(value: RuntimeFsError) -> Self {
+        match value {
+            RuntimeFsError::InvalidInput(message) => Self::InvalidInput(message),
+            RuntimeFsError::Io(message) => Self::Internal(message),
+        }
+    }
+}
+
+impl From<PlatformConfigError> for AppError {
+    fn from(value: PlatformConfigError) -> Self {
+        match value {
+            PlatformConfigError::InvalidInput(message) => Self::InvalidInput(message),
+            PlatformConfigError::Internal(message) => Self::Internal(message),
+        }
+    }
+}
+
+impl From<DeployError> for AppError {
+    fn from(value: DeployError) -> Self {
+        match value {
+            DeployError::InvalidInput(message) => Self::InvalidInput(message),
+            DeployError::Command(message) => Self::Internal(message),
+        }
+    }
+}
+
+impl From<TaskError> for AppError {
+    fn from(value: TaskError) -> Self {
+        Self::Internal(value.message().to_owned())
+    }
+}
+
+impl From<crate::health::HealthError> for AppError {
+    fn from(value: crate::health::HealthError) -> Self {
+        match value {
+            crate::health::HealthError::InvalidInput(message) => Self::InvalidInput(message),
+            crate::health::HealthError::CheckFailed(message) => Self::Internal(message),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ComposeTaskQueue {
+    sender: mpsc::Sender<ComposeTaskJob>,
+}
+
+#[derive(Clone)]
+struct BinaryTaskQueue {
+    sender: mpsc::Sender<BinaryTaskJob>,
+}
+
+#[derive(Clone, Debug)]
+struct ComposeTaskJob {
+    task_id: i64,
+    app_id: i64,
+    app_key: String,
+    deploy_strategy: DeployStrategy,
+    action: ComposeTaskAction,
+}
+
+#[derive(Clone, Debug)]
+struct BinaryTaskJob {
+    task_id: i64,
+    app_id: i64,
+    app_key: String,
+    deploy_work_dir: String,
+    unit_name: String,
+    artifact_version: String,
+    artifact_path: String,
+    release_strategy: String,
+    active_slot: String,
+    base_port: i64,
+    standby_port: i64,
+    proxy_enabled: bool,
+    proxy_kind: String,
+    proxy_domain: String,
+    proxy_config_path: String,
+    deploy_strategy: DeployStrategy,
+    action: BinaryTaskAction,
+}
+
+impl BinaryTaskJob {
+    fn is_blue_green_restart(&self) -> bool {
+        self.release_strategy == "blue_green" && self.action == BinaryTaskAction::Restart
+    }
+
+    fn target_slot(&self) -> &'static str {
+        if self.is_blue_green_restart() {
+            standby_slot(&self.active_slot)
+        } else {
+            normalized_slot(&self.active_slot)
+        }
+    }
+
+    fn active_port(&self) -> i64 {
+        match normalized_slot(&self.active_slot) {
+            "green" => self.standby_port,
+            _ => self.base_port,
+        }
+    }
+
+    fn target_port(&self) -> i64 {
+        match self.target_slot() {
+            "green" => self.standby_port,
+            _ => self.base_port,
+        }
+    }
+
+    fn execution_unit_name(&self) -> String {
+        if self.is_blue_green_restart() {
+            binary_blue_green_unit_name(&self.unit_name, self.target_slot())
+        } else {
+            self.unit_name.clone()
+        }
+    }
+
+    fn promoted_slot(&self, success: bool) -> Option<String> {
+        if success && self.is_blue_green_restart() {
+            Some(self.target_slot().to_owned())
+        } else {
+            None
+        }
+    }
+
+    fn slot_health_endpoint(&self, endpoint: &str) -> String {
+        if !self.is_blue_green_restart() {
+            return endpoint.to_owned();
+        }
+        replace_endpoint_port(endpoint, self.active_port(), self.target_port())
+    }
+}
+
+impl ComposeTaskQueue {
+    fn start(
+        db: SqlitePool,
+        runtime_fs: RuntimeFs,
+        compose: ComposeExecutor,
+        systemd: SystemdExecutor,
+        tasks: TaskService,
+    ) -> Self {
+        let (sender, receiver) = mpsc::channel(COMPOSE_TASK_QUEUE_CAPACITY);
+        let _worker = tokio::spawn(async move {
+            compose_task_worker(receiver, db, runtime_fs, compose, systemd, tasks).await;
+        });
+        Self { sender }
+    }
+
+    async fn enqueue(&self, job: ComposeTaskJob) -> Result<(), AppError> {
+        self.sender
+            .send(job)
+            .await
+            .map_err(|_| AppError::Internal("后台部署任务队列不可用".to_owned()))
+    }
+}
+
+impl BinaryTaskQueue {
+    fn start(
+        db: SqlitePool,
+        runtime_fs: RuntimeFs,
+        compose: ComposeExecutor,
+        systemd: SystemdExecutor,
+        tasks: TaskService,
+    ) -> Self {
+        let (sender, receiver) = mpsc::channel(COMPOSE_TASK_QUEUE_CAPACITY);
+        let _worker = tokio::spawn(async move {
+            binary_task_worker(receiver, db, runtime_fs, compose, systemd, tasks).await;
+        });
+        Self { sender }
+    }
+
+    async fn enqueue(&self, job: BinaryTaskJob) -> Result<(), AppError> {
+        self.sender
+            .send(job)
+            .await
+            .map_err(|_| AppError::Internal("后台二进制部署任务队列不可用".to_owned()))
+    }
+}
+
+async fn compose_task_worker(
+    mut receiver: mpsc::Receiver<ComposeTaskJob>,
+    db: SqlitePool,
+    runtime_fs: RuntimeFs,
+    compose: ComposeExecutor,
+    systemd: SystemdExecutor,
+    tasks: TaskService,
+) {
+    while let Some(job) = receiver.recv().await {
+        run_compose_task_job(&db, &runtime_fs, &compose, &systemd, &tasks, job).await;
+    }
+}
+
+async fn binary_task_worker(
+    mut receiver: mpsc::Receiver<BinaryTaskJob>,
+    db: SqlitePool,
+    runtime_fs: RuntimeFs,
+    compose: ComposeExecutor,
+    systemd: SystemdExecutor,
+    tasks: TaskService,
+) {
+    while let Some(job) = receiver.recv().await {
+        run_binary_task_job(&db, &runtime_fs, &compose, &systemd, &tasks, job).await;
+    }
+}
+
+async fn run_compose_task_job(
+    db: &SqlitePool,
+    runtime_fs: &RuntimeFs,
+    compose: &ComposeExecutor,
+    systemd: &SystemdExecutor,
+    tasks: &TaskService,
+    job: ComposeTaskJob,
+) {
+    match tasks
+        .mark_running(job.task_id, "部署前预检", "preflight")
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(err) => {
+            error!(
+                task_id = job.task_id,
+                error = %err,
+                "failed to mark compose task running"
+            );
+            return;
+        }
+    }
+
+    let work_dir = match runtime_fs.app_root(&job.app_key) {
+        Ok(work_dir) => work_dir,
+        Err(err) => {
+            fail_compose_task(db, tasks, job.app_id, job.task_id, err.message()).await;
+            return;
+        }
+    };
+    if !work_dir.is_dir() {
+        let message = format!("Compose 工作目录不存在: {}", work_dir.to_string_lossy());
+        fail_compose_task(db, tasks, job.app_id, job.task_id, &message).await;
+        return;
+    }
+    if !work_dir.join("compose.yaml").is_file() {
+        let message = format!(
+            "Compose 配置文件不存在: {}",
+            work_dir.join("compose.yaml").to_string_lossy()
+        );
+        fail_compose_task(db, tasks, job.app_id, job.task_id, &message).await;
+        return;
+    }
+
+    let target_nodes = match app_target_nodes(db, job.app_id).await {
+        Ok(nodes) if !nodes.is_empty() => nodes,
+        Ok(_) => {
+            fail_compose_task(
+                db,
+                tasks,
+                job.app_id,
+                job.task_id,
+                "Compose 应用没有绑定目标节点",
+            )
+            .await;
+            return;
+        }
+        Err(err) => {
+            fail_compose_task(db, tasks, job.app_id, job.task_id, err.message()).await;
+            return;
+        }
+    };
+
+    let ssh = systemd.ssh_executor();
+    let mut outputs = Vec::new();
+    let mut node_messages = Vec::new();
+    let mut overall_success = true;
+    let execution_context = ComposeTaskExecutionContext {
+        db,
+        compose,
+        systemd,
+        ssh: &ssh,
+        tasks,
+        task_id: job.task_id,
+        runtime_work_dir: &work_dir,
+        job: &job,
+    };
+
+    let mut stop_after_node_id = None;
+    for node in &target_nodes {
+        let result = run_compose_task_on_node(&execution_context, node).await;
+        match result {
+            Ok(result) => {
+                overall_success &= result.success;
+                record_task_node_result_best_effort(
+                    tasks,
+                    job.task_id,
+                    node,
+                    if result.success { "success" } else { "failed" },
+                    &result.message,
+                    result.outputs.len(),
+                )
+                .await;
+                node_messages.push(format!("{}: {}", node.name, result.message));
+                outputs.extend(result.outputs);
+
+                let deployment_status = if result.success { "success" } else { "failed" };
+                let runtime_status = job.action.runtime_status(result.success, deployment_status);
+                let service_count = if result.success {
+                    Some(if job.action == ComposeTaskAction::Down {
+                        0
+                    } else {
+                        runtime_service_count(&work_dir)
+                    })
+                } else {
+                    None
+                };
+                let active_version = if result.success {
+                    Some(format!("task-{}", job.task_id))
+                } else {
+                    None
+                };
+                update_runtime_state_for_node_best_effort(RuntimeStateUpdate {
+                    db,
+                    app_id: job.app_id,
+                    node_id: node.id,
+                    runtime_status,
+                    service_count,
+                    active_version: active_version.as_deref(),
+                    message: &result.message,
+                    task_id: Some(job.task_id),
+                    touch_deploy_time: result.success,
+                })
+                .await;
+
+                if !result.success {
+                    if job.deploy_strategy.should_stop_after_failure() {
+                        stop_after_node_id = Some(node.id);
+                        break;
+                    }
+                    continue;
+                }
+            }
+            Err(err) => {
+                overall_success = false;
+                let message = err.message().to_owned();
+                record_task_node_result_best_effort(
+                    tasks,
+                    job.task_id,
+                    node,
+                    "failed",
+                    &message,
+                    0,
+                )
+                .await;
+                node_messages.push(format!("{}: {}", node.name, message));
+                update_runtime_state_for_node_best_effort(RuntimeStateUpdate {
+                    db,
+                    app_id: job.app_id,
+                    node_id: node.id,
+                    runtime_status: "unhealthy",
+                    service_count: None,
+                    active_version: None,
+                    message: &message,
+                    task_id: Some(job.task_id),
+                    touch_deploy_time: false,
+                })
+                .await;
+                if job.deploy_strategy.should_stop_after_failure() {
+                    stop_after_node_id = Some(node.id);
+                    break;
+                }
+            }
+        }
+    }
+    mark_unexecuted_nodes_after_failure(
+        tasks,
+        job.task_id,
+        db,
+        job.app_id,
+        &target_nodes,
+        stop_after_node_id,
+        &mut node_messages,
+    )
+    .await;
+
+    let final_output = merge_command_outputs(outputs, overall_success, "Compose 部署");
+    let deployment_status = if overall_success { "success" } else { "failed" };
+    let deployment_message = if node_messages.is_empty() {
+        friendly_command_error(&final_output.output, "命令没有输出")
+    } else {
+        node_messages.join("；")
+    };
+    let final_output = prepend_failure_context(final_output, &deployment_message);
+
+    if let Err(err) = tasks
+        .record_deployment_run(
+            job.app_id,
+            job.task_id,
+            job.action.deploy_action(),
+            deployment_status,
+            &deployment_message,
+        )
+        .await
+    {
+        error!(
+            task_id = job.task_id,
+            error = %err,
+            "failed to record deployment run"
+        );
+    };
+    if overall_success
+        && let Err(err) = record_deploy_config_snapshot(
+            db,
+            job.app_id,
+            &work_dir,
+            "compose_task",
+            &format!("task-{}", job.task_id),
+        )
+        .await
+    {
+        error!(
+            task_id = job.task_id,
+            error = %err,
+            "failed to record compose deploy config snapshot"
+        );
+    }
+    update_app_status_best_effort(
+        db,
+        job.app_id,
+        if overall_success {
+            job.action.success_status()
+        } else {
+            "failed"
+        },
+    )
+    .await;
+    if let Err(err) = tasks
+        .finish_with_compose_output(job.task_id, &final_output)
+        .await
+    {
+        error!(
+            task_id = job.task_id,
+            error = %err,
+            "failed to finish compose task"
+        );
+    }
+}
+
+async fn run_binary_task_job(
+    db: &SqlitePool,
+    runtime_fs: &RuntimeFs,
+    compose: &ComposeExecutor,
+    systemd: &SystemdExecutor,
+    tasks: &TaskService,
+    job: BinaryTaskJob,
+) {
+    match tasks
+        .mark_running(job.task_id, "systemd 操作", "preparing_files")
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(err) => {
+            error!(
+                task_id = job.task_id,
+                error = %err,
+                "failed to mark binary task running"
+            );
+            return;
+        }
+    }
+
+    let work_dir = match runtime_fs.app_root(&job.app_key) {
+        Ok(work_dir) => work_dir,
+        Err(err) => {
+            fail_binary_task(db, tasks, job.app_id, job.task_id, err.message()).await;
+            return;
+        }
+    };
+    if !work_dir.is_dir() {
+        let message = format!("二进制工作目录不存在: {}", work_dir.to_string_lossy());
+        fail_binary_task(db, tasks, job.app_id, job.task_id, &message).await;
+        return;
+    }
+
+    let target_nodes = match app_target_nodes(db, job.app_id).await {
+        Ok(nodes) if !nodes.is_empty() => nodes,
+        Ok(_) => {
+            fail_binary_task(
+                db,
+                tasks,
+                job.app_id,
+                job.task_id,
+                "二进制应用没有绑定目标节点",
+            )
+            .await;
+            return;
+        }
+        Err(err) => {
+            fail_binary_task(db, tasks, job.app_id, job.task_id, err.message()).await;
+            return;
+        }
+    };
+
+    if job.release_strategy == "blue_green"
+        && let Err(err) = tasks
+            .append_log(
+                job.task_id,
+                "system",
+                &binary_blue_green_job_plan_message(&job),
+            )
+            .await
+    {
+        fail_binary_task(db, tasks, job.app_id, job.task_id, err.message()).await;
+        return;
+    }
+
+    let ssh = systemd.ssh_executor();
+    let mut outputs = Vec::new();
+    let mut node_messages = Vec::new();
+    let mut overall_success = true;
+    let execution_context = BinaryTaskExecutionContext {
+        db,
+        compose,
+        systemd,
+        ssh: &ssh,
+        tasks,
+        task_id: job.task_id,
+        runtime_work_dir: &work_dir,
+        job: &job,
+    };
+
+    let mut stop_after_node_id = None;
+    let mut promoted_slot = None;
+    for node in &target_nodes {
+        let result = run_binary_task_on_node(&execution_context, node).await;
+
+        match result {
+            Ok(result) => {
+                overall_success &= result.success;
+                record_task_node_result_best_effort(
+                    tasks,
+                    job.task_id,
+                    node,
+                    if result.success { "success" } else { "failed" },
+                    &result.message,
+                    result.outputs.len(),
+                )
+                .await;
+                node_messages.push(format!("{}: {}", node.name, result.message));
+                outputs.extend(result.outputs);
+
+                let deployment_status = if result.success { "success" } else { "failed" };
+                let runtime_status = job.action.runtime_status(result.success, deployment_status);
+                let service_count = if result.success {
+                    Some(if job.action == BinaryTaskAction::Stop {
+                        0
+                    } else {
+                        1
+                    })
+                } else {
+                    None
+                };
+                let active_version = if result.success {
+                    Some(job.artifact_version.as_str())
+                } else {
+                    None
+                };
+                update_runtime_state_for_node_best_effort(RuntimeStateUpdate {
+                    db,
+                    app_id: job.app_id,
+                    node_id: node.id,
+                    runtime_status,
+                    service_count,
+                    active_version,
+                    message: &result.message,
+                    task_id: Some(job.task_id),
+                    touch_deploy_time: result.success,
+                })
+                .await;
+
+                if result.success
+                    && let Some(slot) = result.promoted_slot
+                {
+                    if promoted_slot
+                        .as_deref()
+                        .is_some_and(|existing| existing != slot)
+                    {
+                        overall_success = false;
+                        node_messages.push(format!("节点 {} 返回的目标槽位不一致", node.name));
+                    } else {
+                        promoted_slot = Some(slot);
+                    }
+                }
+
+                if !result.success {
+                    if job.deploy_strategy.should_stop_after_failure() {
+                        stop_after_node_id = Some(node.id);
+                        break;
+                    }
+                    continue;
+                }
+            }
+            Err(err) => {
+                overall_success = false;
+                let message = err.message().to_owned();
+                record_task_node_result_best_effort(
+                    tasks,
+                    job.task_id,
+                    node,
+                    "failed",
+                    &message,
+                    0,
+                )
+                .await;
+                node_messages.push(format!("{}: {}", node.name, message));
+                update_runtime_state_for_node_best_effort(RuntimeStateUpdate {
+                    db,
+                    app_id: job.app_id,
+                    node_id: node.id,
+                    runtime_status: "unhealthy",
+                    service_count: None,
+                    active_version: None,
+                    message: &message,
+                    task_id: Some(job.task_id),
+                    touch_deploy_time: false,
+                })
+                .await;
+                if job.deploy_strategy.should_stop_after_failure() {
+                    stop_after_node_id = Some(node.id);
+                    break;
+                }
+            }
+        }
+    }
+    mark_unexecuted_nodes_after_failure(
+        tasks,
+        job.task_id,
+        db,
+        job.app_id,
+        &target_nodes,
+        stop_after_node_id,
+        &mut node_messages,
+    )
+    .await;
+
+    if overall_success && let Some(slot) = promoted_slot.as_deref() {
+        match switch_binary_proxy_to_targets(
+            tasks,
+            job.task_id,
+            systemd,
+            &ssh,
+            &work_dir,
+            &job,
+            &target_nodes,
+        )
+        .await
+        {
+            Ok(proxy_outputs) => {
+                outputs.extend(proxy_outputs);
+                if job.proxy_enabled {
+                    let message = format!(
+                        "Blue/Green 反向代理已切换到 {slot}({})",
+                        display_port(job.target_port())
+                    );
+                    node_messages.push(message.clone());
+                    if let Err(err) = tasks.append_log(job.task_id, "system", &message).await {
+                        overall_success = false;
+                        node_messages.push(format!("记录反向代理切流日志失败: {}", err.message()));
+                    }
+                }
+            }
+            Err(err) => {
+                overall_success = false;
+                let message = format!(
+                    "Blue/Green 反向代理切流失败，保留当前槽位 {}: {}",
+                    job.active_slot,
+                    err.message()
+                );
+                node_messages.push(message.clone());
+                if let Err(log_err) = tasks.append_log(job.task_id, "system", &message).await {
+                    error!(
+                        task_id = job.task_id,
+                        error = %log_err,
+                        "failed to append proxy switch failure log"
+                    );
+                }
+                match cleanup_binary_standby_slot(
+                    tasks,
+                    job.task_id,
+                    systemd,
+                    &ssh,
+                    &work_dir,
+                    &job,
+                    &target_nodes,
+                )
+                .await
+                {
+                    Ok(cleanup_outputs) => {
+                        outputs.extend(cleanup_outputs);
+                        let cleanup_message = format!(
+                            "已尝试停止本次启动的备用槽位 {}，旧槽位 {} 继续保留",
+                            job.target_slot(),
+                            job.active_slot
+                        );
+                        node_messages.push(cleanup_message.clone());
+                        if let Err(log_err) = tasks
+                            .append_log(job.task_id, "system", &cleanup_message)
+                            .await
+                        {
+                            error!(
+                                task_id = job.task_id,
+                                error = %log_err,
+                                "failed to append standby cleanup log"
+                            );
+                        }
+                    }
+                    Err(cleanup_err) => {
+                        let cleanup_message = format!(
+                            "停止备用槽位 {} 失败，请人工检查: {}",
+                            job.target_slot(),
+                            cleanup_err.message()
+                        );
+                        node_messages.push(cleanup_message.clone());
+                        if let Err(log_err) = tasks
+                            .append_log(job.task_id, "system", &cleanup_message)
+                            .await
+                        {
+                            error!(
+                                task_id = job.task_id,
+                                error = %log_err,
+                                "failed to append standby cleanup failure log"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if overall_success && let Some(slot) = promoted_slot.as_deref() {
+        match promote_binary_active_slot(db, runtime_fs, &job, &work_dir, slot).await {
+            Ok(()) => {
+                match sync_promoted_binary_runtime_to_targets(
+                    tasks,
+                    job.task_id,
+                    &ssh,
+                    &work_dir,
+                    &job,
+                    &target_nodes,
+                )
+                .await
+                {
+                    Ok(sync_outputs) => {
+                        outputs.extend(sync_outputs);
+                        let message = format!(
+                            "Blue/Green 槽位已记录为 {slot}；已同步提升后的运行文件；旧槽未自动停止"
+                        );
+                        node_messages.push(message.clone());
+                        if let Err(err) = tasks.append_log(job.task_id, "system", &message).await {
+                            overall_success = false;
+                            node_messages
+                                .push(format!("记录 Blue/Green 槽位日志失败: {}", err.message()));
+                        }
+                    }
+                    Err(err) => {
+                        overall_success = false;
+                        let message =
+                            format!("同步提升后的 Blue/Green 运行文件失败: {}", err.message());
+                        node_messages.push(message.clone());
+                        if let Err(log_err) =
+                            tasks.append_log(job.task_id, "system", &message).await
+                        {
+                            error!(
+                                task_id = job.task_id,
+                                error = %log_err,
+                                "failed to append blue/green resync failure log"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                overall_success = false;
+                let message = format!("更新 Blue/Green 槽位失败: {}", err.message());
+                node_messages.push(message.clone());
+                if let Err(log_err) = tasks.append_log(job.task_id, "system", &message).await {
+                    error!(
+                        task_id = job.task_id,
+                        error = %log_err,
+                        "failed to append blue/green promotion failure log"
+                    );
+                }
+            }
+        }
+    }
+
+    let final_output = merge_command_outputs(outputs, overall_success, "二进制部署");
+    let deployment_status = if overall_success { "success" } else { "failed" };
+    let deployment_message = if node_messages.is_empty() {
+        friendly_command_error(&final_output.output, "命令没有输出")
+    } else {
+        node_messages.join("；")
+    };
+    let final_output = prepend_failure_context(final_output, &deployment_message);
+
+    if let Err(err) = tasks
+        .record_deployment_run(
+            job.app_id,
+            job.task_id,
+            job.action.deploy_action(),
+            deployment_status,
+            &deployment_message,
+        )
+        .await
+    {
+        error!(
+            task_id = job.task_id,
+            error = %err,
+            "failed to record binary deployment run"
+        );
+    };
+    if overall_success
+        && let Err(err) = record_deploy_config_snapshot(
+            db,
+            job.app_id,
+            &work_dir,
+            "binary_task",
+            &job.artifact_version,
+        )
+        .await
+    {
+        error!(
+            task_id = job.task_id,
+            error = %err,
+            "failed to record binary deploy config snapshot"
+        );
+    }
+    update_app_status_best_effort(
+        db,
+        job.app_id,
+        if overall_success {
+            job.action.success_status()
+        } else {
+            "failed"
+        },
+    )
+    .await;
+    if let Err(err) = tasks
+        .finish_with_compose_output(job.task_id, &final_output)
+        .await
+    {
+        error!(
+            task_id = job.task_id,
+            error = %err,
+            "failed to finish binary task"
+        );
+    }
+}
+
+async fn fail_compose_task(
+    db: &SqlitePool,
+    tasks: &TaskService,
+    app_id: i64,
+    task_id: i64,
+    message: &str,
+) {
+    update_app_status_best_effort(db, app_id, "failed").await;
+    update_runtime_states_best_effort(RuntimeStatesUpdate {
+        db,
+        app_id,
+        runtime_status: "unhealthy",
+        service_count: None,
+        active_version: None,
+        message,
+        task_id: Some(task_id),
+        touch_deploy_time: false,
+    })
+    .await;
+    if let Err(err) = tasks.fail_task(task_id, message).await {
+        error!(
+            task_id,
+            error = %err,
+            "failed to mark compose task failed"
+        );
+    }
+}
+
+async fn fail_binary_task(
+    db: &SqlitePool,
+    tasks: &TaskService,
+    app_id: i64,
+    task_id: i64,
+    message: &str,
+) {
+    update_app_status_best_effort(db, app_id, "failed").await;
+    update_runtime_states_best_effort(RuntimeStatesUpdate {
+        db,
+        app_id,
+        runtime_status: "unhealthy",
+        service_count: None,
+        active_version: None,
+        message,
+        task_id: Some(task_id),
+        touch_deploy_time: false,
+    })
+    .await;
+    if let Err(err) = tasks.fail_task(task_id, message).await {
+        error!(
+            task_id,
+            error = %err,
+            "failed to mark binary task failed"
+        );
+    }
+}
+
+#[derive(Debug)]
+struct ComposeNodeTaskResult {
+    success: bool,
+    message: String,
+    outputs: Vec<ComposeCommandOutput>,
+}
+
+struct ComposeTaskExecutionContext<'a> {
+    db: &'a SqlitePool,
+    compose: &'a ComposeExecutor,
+    systemd: &'a SystemdExecutor,
+    ssh: &'a SshExecutor,
+    tasks: &'a TaskService,
+    task_id: i64,
+    runtime_work_dir: &'a Path,
+    job: &'a ComposeTaskJob,
+}
+
+async fn run_compose_task_on_node(
+    context: &ComposeTaskExecutionContext<'_>,
+    node: &AppTargetNode,
+) -> Result<ComposeNodeTaskResult, AppError> {
+    context
+        .tasks
+        .append_log(
+            context.task_id,
+            "system",
+            &format!(
+                "开始在节点 {}({}) 执行 Compose 任务",
+                node.name, node.node_key
+            ),
+        )
+        .await?;
+
+    context
+        .tasks
+        .update_phase(context.task_id, "preflight")
+        .await?;
+    if let Some(message) =
+        block_unavailable_node_preflight(context.tasks, context.task_id, node).await?
+    {
+        return Ok(ComposeNodeTaskResult {
+            success: false,
+            message,
+            outputs: Vec::new(),
+        });
+    }
+
+    let mut outputs = if node.node_type == "ssh" {
+        context
+            .tasks
+            .update_phase(context.task_id, "preparing_files")
+            .await?;
+        sync_compose_runtime_to_ssh_target(
+            context.tasks,
+            context.task_id,
+            context.ssh,
+            context.runtime_work_dir,
+            context.job,
+            node,
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+
+    context
+        .tasks
+        .update_phase(context.task_id, "preflight")
+        .await?;
+    let preflight = run_compose_preflight_on_node(context, node).await?;
+    if !preflight.success {
+        outputs.extend(preflight.outputs);
+        return Ok(ComposeNodeTaskResult {
+            success: false,
+            message: preflight.message,
+            outputs,
+        });
+    }
+    outputs.extend(preflight.outputs);
+
+    context
+        .tasks
+        .update_phase(context.task_id, "executing")
+        .await?;
+    let output = run_compose_action_on_node(context, node).await?;
+    let command_success = output.success;
+    let mut message = friendly_command_error(&output.output, "命令没有输出");
+    outputs.push(output);
+
+    if command_success && context.job.action.runs_health_check() {
+        context
+            .tasks
+            .update_phase(context.task_id, "healthchecking")
+            .await?;
+        let health = run_compose_health_check_on_node(context, node).await?;
+        message = health.message.clone();
+        outputs.extend(health.outputs);
+        return Ok(ComposeNodeTaskResult {
+            success: health.success,
+            message,
+            outputs,
+        });
+    }
+
+    Ok(ComposeNodeTaskResult {
+        success: command_success,
+        message,
+        outputs,
+    })
+}
+
+async fn run_compose_action_on_node(
+    context: &ComposeTaskExecutionContext<'_>,
+    node: &AppTargetNode,
+) -> Result<ComposeCommandOutput, AppError> {
+    match node.node_type.as_str() {
+        "local" => match context.job.action {
+            ComposeTaskAction::Up => {
+                context
+                    .compose
+                    .up(context.runtime_work_dir.to_path_buf())
+                    .await
+            }
+            ComposeTaskAction::Down => {
+                context
+                    .compose
+                    .down(context.runtime_work_dir.to_path_buf())
+                    .await
+            }
+            ComposeTaskAction::Restart => {
+                context
+                    .compose
+                    .restart(context.runtime_work_dir.to_path_buf())
+                    .await
+            }
+        }
+        .map_err(AppError::from),
+        "ssh" => {
+            let target = node.ssh_target()?;
+            let remote_work_dir = compose_node_deploy_work_dir(context.job, node);
+            match context.job.action {
+                ComposeTaskAction::Up => {
+                    context
+                        .ssh
+                        .compose_up(
+                            &target,
+                            context.runtime_work_dir.to_path_buf(),
+                            &remote_work_dir,
+                        )
+                        .await
+                }
+                ComposeTaskAction::Down => {
+                    context
+                        .ssh
+                        .compose_down(
+                            &target,
+                            context.runtime_work_dir.to_path_buf(),
+                            &remote_work_dir,
+                        )
+                        .await
+                }
+                ComposeTaskAction::Restart => {
+                    context
+                        .ssh
+                        .compose_restart(
+                            &target,
+                            context.runtime_work_dir.to_path_buf(),
+                            &remote_work_dir,
+                        )
+                        .await
+                }
+            }
+            .map_err(AppError::from)
+        }
+        _ => Err(AppError::InvalidInput(format!(
+            "节点 {} 的类型 {} 不支持 Compose 部署",
+            node.name, node.node_type
+        ))),
+    }
+}
+
+async fn run_compose_preflight_on_node(
+    context: &ComposeTaskExecutionContext<'_>,
+    node: &AppTargetNode,
+) -> Result<ComposeNodeTaskResult, AppError> {
+    match node.node_type.as_str() {
+        "local" => {
+            run_local_compose_preflight(
+                context.tasks,
+                context.compose,
+                context.task_id,
+                context.runtime_work_dir.to_path_buf(),
+            )
+            .await
+        }
+        "ssh" => run_ssh_compose_preflight(context, node).await,
+        _ => Err(AppError::InvalidInput(format!(
+            "节点 {} 的类型 {} 不支持 Compose 部署",
+            node.name, node.node_type
+        ))),
+    }
+}
+
+async fn run_local_compose_preflight(
+    tasks: &TaskService,
+    compose: &ComposeExecutor,
+    task_id: i64,
+    work_dir: PathBuf,
+) -> Result<ComposeNodeTaskResult, AppError> {
+    Ok(run_compose_preflight(tasks, compose, task_id, work_dir).await)
+}
+
+async fn run_ssh_compose_preflight(
+    context: &ComposeTaskExecutionContext<'_>,
+    node: &AppTargetNode,
+) -> Result<ComposeNodeTaskResult, AppError> {
+    context
+        .tasks
+        .append_log(
+            context.task_id,
+            "system",
+            &format!("开始节点 {} Compose 远程预检", node.name),
+        )
+        .await?;
+    let target = node.ssh_target()?;
+    let remote_work_dir = compose_node_deploy_work_dir(context.job, node);
+    let output = context
+        .ssh
+        .compose_config(
+            &target,
+            context.runtime_work_dir.to_path_buf(),
+            &remote_work_dir,
+        )
+        .await?;
+    append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+    let success = output.success;
+    let message = if success {
+        "Compose 远程配置校验通过".to_owned()
+    } else {
+        friendly_command_error(&output.output, "远程 docker compose config 失败")
+    };
+    Ok(ComposeNodeTaskResult {
+        success,
+        message,
+        outputs: vec![output],
+    })
+}
+
+async fn run_compose_health_check_on_node(
+    context: &ComposeTaskExecutionContext<'_>,
+    node: &AppTargetNode,
+) -> Result<ComposeNodeTaskResult, AppError> {
+    let config = load_health_check_config(context.db, context.job.app_id).await?;
+    if node.node_type == "local" {
+        return match run_app_health_check(
+            context.db,
+            context.tasks,
+            context.compose,
+            context.systemd,
+            context.job.app_id,
+            context.task_id,
+            context.runtime_work_dir,
+        )
+        .await?
+        {
+            true => Ok(ComposeNodeTaskResult {
+                success: true,
+                message: format!("节点 {} 健康检查通过", node.name),
+                outputs: Vec::new(),
+            }),
+            false => Ok(ComposeNodeTaskResult {
+                success: false,
+                message: "健康检查失败".to_owned(),
+                outputs: Vec::new(),
+            }),
+        };
+    }
+
+    match config.kind {
+        HealthCheckKind::None => Ok(ComposeNodeTaskResult {
+            success: true,
+            message: "未配置健康检查".to_owned(),
+            outputs: Vec::new(),
+        }),
+        HealthCheckKind::ComposeRunning => {
+            context
+                .tasks
+                .append_log(
+                    context.task_id,
+                    "system",
+                    &format!("开始节点 {} 容器运行状态检查", node.name),
+                )
+                .await?;
+            let target = node.ssh_target()?;
+            let remote_work_dir = compose_node_deploy_work_dir(context.job, node);
+            let output = context
+                .ssh
+                .compose_ps_running(
+                    &target,
+                    context.runtime_work_dir.to_path_buf(),
+                    &remote_work_dir,
+                )
+                .await?;
+            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            let running_lines = count_compose_running_lines(&output.output);
+            let success = output.success && running_lines > 0;
+            let message = if success {
+                format!("容器运行状态检查通过: {running_lines} 个运行中容器")
+            } else {
+                friendly_command_error(&output.output, "容器运行状态检查失败: 未发现运行中容器")
+            };
+            Ok(ComposeNodeTaskResult {
+                success,
+                message,
+                outputs: vec![output],
+            })
+        }
+        HealthCheckKind::Http => {
+            let target = node.ssh_target()?;
+            let output = context
+                .ssh
+                .http_health_check(
+                    &target,
+                    context.runtime_work_dir.to_path_buf(),
+                    &config.endpoint,
+                    config.timeout_secs,
+                )
+                .await?;
+            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            let status = output.output.trim();
+            let success = output.success && status == config.expected_status.to_string().as_str();
+            let message = if success {
+                format!("HTTP 健康检查通过: {status}")
+            } else {
+                friendly_command_error(
+                    &output.output,
+                    &format!(
+                        "HTTP 健康检查失败: 返回 {status}，期望 {}",
+                        config.expected_status
+                    ),
+                )
+            };
+            context
+                .tasks
+                .append_log(context.task_id, "system", &message)
+                .await?;
+            Ok(ComposeNodeTaskResult {
+                success,
+                message,
+                outputs: vec![output],
+            })
+        }
+        HealthCheckKind::Tcp => {
+            let target = node.ssh_target()?;
+            let output = context
+                .ssh
+                .tcp_health_check(
+                    &target,
+                    context.runtime_work_dir.to_path_buf(),
+                    &config.endpoint,
+                    config.timeout_secs,
+                )
+                .await?;
+            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            let success = output.success;
+            let message = if success {
+                format!("TCP 健康检查通过: {}", config.endpoint)
+            } else {
+                friendly_command_error(
+                    &output.output,
+                    &format!("TCP 健康检查失败: {}", config.endpoint),
+                )
+            };
+            context
+                .tasks
+                .append_log(context.task_id, "system", &message)
+                .await?;
+            Ok(ComposeNodeTaskResult {
+                success,
+                message,
+                outputs: vec![output],
+            })
+        }
+        _ => Ok(ComposeNodeTaskResult {
+            success: true,
+            message: format!(
+                "SSH 节点 {} 暂跳过 {} 健康检查",
+                node.name,
+                config.kind.label()
+            ),
+            outputs: Vec::new(),
+        }),
+    }
+}
+
+async fn sync_compose_runtime_to_ssh_target(
+    tasks: &TaskService,
+    task_id: i64,
+    ssh: &SshExecutor,
+    runtime_work_dir: &Path,
+    job: &ComposeTaskJob,
+    node: &AppTargetNode,
+) -> Result<Vec<ComposeCommandOutput>, AppError> {
+    let target = node.ssh_target()?;
+    let target_root = normalize_remote_target_root(&compose_node_deploy_work_dir(job, node))?;
+    let files = vec![
+        RemoteCopyFile {
+            local_path: runtime_work_dir.join("compose.yaml"),
+            remote_path: remote_join(&target_root, "compose.yaml"),
+        },
+        RemoteCopyFile {
+            local_path: runtime_work_dir.join(".env"),
+            remote_path: remote_join(&target_root, ".env"),
+        },
+        RemoteCopyFile {
+            local_path: runtime_work_dir.join(".easy-deploy").join("app.yaml"),
+            remote_path: remote_join(&remote_join(&target_root, ".easy-deploy"), "app.yaml"),
+        },
+    ];
+    let mut outputs = Vec::new();
+    for dir in remote_parent_dirs(&files, &target_root) {
+        let output = ssh
+            .mkdir_all(&target, runtime_work_dir.to_path_buf(), &dir)
+            .await?;
+        append_intermediate_command_output(tasks, task_id, &output).await?;
+        let success = output.success;
+        outputs.push(output);
+        if !success {
+            return Err(AppError::Internal(format!("SSH 创建目录 {dir} 失败")));
+        }
+    }
+    for file in files {
+        let output = ssh
+            .copy_file(
+                &target,
+                runtime_work_dir.to_path_buf(),
+                file.local_path,
+                &file.remote_path,
+            )
+            .await?;
+        append_intermediate_command_output(tasks, task_id, &output).await?;
+        let success = output.success;
+        let remote_path = file.remote_path;
+        outputs.push(output);
+        if !success {
+            return Err(AppError::Internal(format!(
+                "SSH 同步文件 {remote_path} 失败"
+            )));
+        }
+    }
+    tasks
+        .append_log(
+            task_id,
+            "system",
+            &format!(
+                "已同步 Compose 运行文件到 SSH 节点 {}: {}",
+                node.name, target_root
+            ),
+        )
+        .await?;
+    Ok(outputs)
+}
+
+fn compose_node_deploy_work_dir(job: &ComposeTaskJob, node: &AppTargetNode) -> String {
+    let app = target_work_dir_path(&node.work_dir, &job.app_key);
+    if app.starts_with('/') {
+        app
+    } else {
+        node.work_dir.clone()
+    }
+}
+
+fn compose_node_deploy_work_dir_for_app(app: &AppDetailItem, node: &AppTargetNode) -> String {
+    let target = target_work_dir_path(&node.work_dir, &app.app_key);
+    if target.starts_with('/') {
+        target
+    } else {
+        node.work_dir.clone()
+    }
+}
+
+fn count_compose_running_lines(output: &str) -> usize {
+    output
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty()
+                && !line.starts_with("NAME")
+                && !line.starts_with("time=\"")
+                && !line.starts_with("---")
+        })
+        .count()
+}
+
+#[derive(Debug)]
+struct BinaryNodeTaskResult {
+    success: bool,
+    message: String,
+    outputs: Vec<ComposeCommandOutput>,
+    promoted_slot: Option<String>,
+}
+
+struct BinaryTaskExecutionContext<'a> {
+    db: &'a SqlitePool,
+    compose: &'a ComposeExecutor,
+    systemd: &'a SystemdExecutor,
+    ssh: &'a SshExecutor,
+    tasks: &'a TaskService,
+    task_id: i64,
+    runtime_work_dir: &'a Path,
+    job: &'a BinaryTaskJob,
+}
+
+async fn run_binary_task_on_node(
+    context: &BinaryTaskExecutionContext<'_>,
+    node: &AppTargetNode,
+) -> Result<BinaryNodeTaskResult, AppError> {
+    context
+        .tasks
+        .append_log(
+            context.task_id,
+            "system",
+            &format!("开始在节点 {}({}) 执行二进制任务", node.name, node.node_key),
+        )
+        .await?;
+
+    context
+        .tasks
+        .update_phase(context.task_id, "preflight")
+        .await?;
+    if let Some(message) =
+        block_unavailable_node_preflight(context.tasks, context.task_id, node).await?
+    {
+        return Ok(BinaryNodeTaskResult {
+            success: false,
+            message,
+            outputs: Vec::new(),
+            promoted_slot: None,
+        });
+    }
+    if let Some(message) =
+        block_missing_proxy_preflight(context.tasks, context.task_id, node, context.job).await?
+    {
+        return Ok(BinaryNodeTaskResult {
+            success: false,
+            message,
+            outputs: Vec::new(),
+            promoted_slot: None,
+        });
+    }
+
+    let mut outputs = Vec::new();
+    if context.job.action.syncs_runtime_files() {
+        context
+            .tasks
+            .update_phase(context.task_id, "preparing_files")
+            .await?;
+        let unit_name = context.job.execution_unit_name();
+        match node.node_type.as_str() {
+            "local" => {
+                sync_binary_runtime_to_local_target(
+                    context.tasks,
+                    context.task_id,
+                    context.runtime_work_dir,
+                    context.job,
+                    node,
+                )
+                .await?;
+                let command_work_dir = binary_command_work_dir(
+                    &binary_node_deploy_work_dir(context.job, node),
+                    context.runtime_work_dir,
+                );
+                if let Some(artifact_path) = binary_target_artifact_path(
+                    &binary_node_deploy_work_dir(context.job, node),
+                    &context.job.artifact_path,
+                ) {
+                    let output = context
+                        .systemd
+                        .make_executable(command_work_dir.clone(), &artifact_path)
+                        .await?;
+                    append_intermediate_command_output(context.tasks, context.task_id, &output)
+                        .await?;
+                    let success = output.success;
+                    let message = friendly_command_error(&output.output, "chmod +x 制品失败");
+                    outputs.push(output);
+                    if !success {
+                        return Ok(BinaryNodeTaskResult {
+                            success: false,
+                            message,
+                            outputs,
+                            promoted_slot: None,
+                        });
+                    }
+                }
+                let unit_path = binary_systemd_unit_path(&command_work_dir, &unit_name);
+                let output = context
+                    .systemd
+                    .link_unit(command_work_dir.clone(), unit_path)
+                    .await?;
+                append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+                let success = output.success;
+                let message = friendly_command_error(&output.output, "systemctl link failed");
+                outputs.push(output);
+                if !success {
+                    return Ok(BinaryNodeTaskResult {
+                        success: false,
+                        message,
+                        outputs,
+                        promoted_slot: None,
+                    });
+                }
+                let output = context.systemd.daemon_reload(command_work_dir).await?;
+                append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+                let success = output.success;
+                let message =
+                    friendly_command_error(&output.output, "systemctl daemon-reload 失败");
+                outputs.push(output);
+                if !success {
+                    return Ok(BinaryNodeTaskResult {
+                        success: false,
+                        message,
+                        outputs,
+                        promoted_slot: None,
+                    });
+                }
+            }
+            "ssh" => {
+                let sync_outputs = sync_binary_runtime_to_ssh_target(
+                    context.tasks,
+                    context.task_id,
+                    context.ssh,
+                    context.runtime_work_dir,
+                    context.job,
+                    node,
+                )
+                .await?;
+                outputs.extend(sync_outputs);
+                let target = node.ssh_target()?;
+                if let Some(remote_artifact_path) = binary_target_artifact_path(
+                    &binary_node_deploy_work_dir(context.job, node),
+                    &context.job.artifact_path,
+                ) {
+                    let output = context
+                        .ssh
+                        .make_executable(
+                            &target,
+                            context.runtime_work_dir.to_path_buf(),
+                            &remote_artifact_path,
+                        )
+                        .await?;
+                    append_intermediate_command_output(context.tasks, context.task_id, &output)
+                        .await?;
+                    let success = output.success;
+                    let message = friendly_command_error(&output.output, "远程 chmod +x 制品失败");
+                    outputs.push(output);
+                    if !success {
+                        return Ok(BinaryNodeTaskResult {
+                            success: false,
+                            message,
+                            outputs,
+                            promoted_slot: None,
+                        });
+                    }
+                }
+                let remote_unit_path = remote_binary_systemd_unit_path(
+                    &binary_node_deploy_work_dir(context.job, node),
+                    &unit_name,
+                )?;
+                let output = context
+                    .ssh
+                    .link_unit(
+                        &target,
+                        context.runtime_work_dir.to_path_buf(),
+                        &remote_unit_path,
+                    )
+                    .await?;
+                append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+                let success = output.success;
+                let message =
+                    friendly_command_error(&output.output, "remote systemctl link failed");
+                outputs.push(output);
+                if !success {
+                    return Ok(BinaryNodeTaskResult {
+                        success: false,
+                        message,
+                        outputs,
+                        promoted_slot: None,
+                    });
+                }
+                let output = context
+                    .ssh
+                    .daemon_reload(&target, context.runtime_work_dir.to_path_buf())
+                    .await?;
+                append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+                let success = output.success;
+                let message =
+                    friendly_command_error(&output.output, "远程 systemctl daemon-reload 失败");
+                outputs.push(output);
+                if !success {
+                    return Ok(BinaryNodeTaskResult {
+                        success: false,
+                        message,
+                        outputs,
+                        promoted_slot: None,
+                    });
+                }
+            }
+            _ => {
+                return Err(AppError::InvalidInput(format!(
+                    "节点 {} 的类型 {} 不支持二进制部署",
+                    node.name, node.node_type
+                )));
+            }
+        }
+    }
+
+    context
+        .tasks
+        .update_phase(context.task_id, "executing")
+        .await?;
+    let output = match node.node_type.as_str() {
+        "local" => {
+            let command_work_dir = binary_command_work_dir(
+                &binary_node_deploy_work_dir(context.job, node),
+                context.runtime_work_dir,
+            );
+            let unit_name = context.job.execution_unit_name();
+            match context.job.action {
+                BinaryTaskAction::Restart => {
+                    context
+                        .systemd
+                        .restart(command_work_dir, &unit_name)
+                        .await?
+                }
+                BinaryTaskAction::Stop => {
+                    context.systemd.stop(command_work_dir, &unit_name).await?
+                }
+            }
+        }
+        "ssh" => {
+            let target = node.ssh_target()?;
+            let unit_name = context.job.execution_unit_name();
+            match context.job.action {
+                BinaryTaskAction::Restart => {
+                    context
+                        .ssh
+                        .restart(&target, context.runtime_work_dir.to_path_buf(), &unit_name)
+                        .await?
+                }
+                BinaryTaskAction::Stop => {
+                    context
+                        .ssh
+                        .stop(&target, context.runtime_work_dir.to_path_buf(), &unit_name)
+                        .await?
+                }
+            }
+        }
+        _ => {
+            return Err(AppError::InvalidInput(format!(
+                "节点 {} 的类型 {} 不支持二进制部署",
+                node.name, node.node_type
+            )));
+        }
+    };
+    let command_success = output.success;
+    let mut message = friendly_command_error(&output.output, "命令没有输出");
+    outputs.push(output);
+
+    if command_success && context.job.action.runs_health_check() {
+        context
+            .tasks
+            .update_phase(context.task_id, "healthchecking")
+            .await?;
+        let health = run_binary_health_check_on_node(context, node).await?;
+        message = health.message.clone();
+        let health_success = health.success;
+        outputs.extend(health.outputs);
+        return Ok(BinaryNodeTaskResult {
+            success: health_success,
+            message,
+            outputs,
+            promoted_slot: context.job.promoted_slot(health_success),
+        });
+    }
+
+    Ok(BinaryNodeTaskResult {
+        success: command_success,
+        message,
+        outputs,
+        promoted_slot: context.job.promoted_slot(command_success),
+    })
+}
+
+async fn run_binary_health_check_on_node(
+    context: &BinaryTaskExecutionContext<'_>,
+    node: &AppTargetNode,
+) -> Result<BinaryNodeTaskResult, AppError> {
+    let config = load_health_check_config(context.db, context.job.app_id).await?;
+    if node.node_type == "local" {
+        let command_work_dir = binary_command_work_dir(
+            &binary_node_deploy_work_dir(context.job, node),
+            context.runtime_work_dir,
+        );
+        if context.job.release_strategy == "blue_green" {
+            return match run_binary_slot_health_check(
+                context,
+                &config,
+                node,
+                &command_work_dir,
+                None,
+            )
+            .await?
+            {
+                true => Ok(BinaryNodeTaskResult {
+                    success: true,
+                    message: format!(
+                        "节点 {} 备用槽位 {} 健康检查通过",
+                        node.name,
+                        context.job.target_slot()
+                    ),
+                    outputs: Vec::new(),
+                    promoted_slot: None,
+                }),
+                false => Ok(BinaryNodeTaskResult {
+                    success: false,
+                    message: "备用槽位健康检查失败，保留当前槽位".to_owned(),
+                    outputs: Vec::new(),
+                    promoted_slot: None,
+                }),
+            };
+        }
+        return match run_app_health_check(
+            context.db,
+            context.tasks,
+            context.compose,
+            context.systemd,
+            context.job.app_id,
+            context.task_id,
+            &command_work_dir,
+        )
+        .await?
+        {
+            true => Ok(BinaryNodeTaskResult {
+                success: true,
+                message: format!("节点 {} 健康检查通过", node.name),
+                outputs: Vec::new(),
+                promoted_slot: None,
+            }),
+            false => Ok(BinaryNodeTaskResult {
+                success: false,
+                message: "健康检查失败".to_owned(),
+                outputs: Vec::new(),
+                promoted_slot: None,
+            }),
+        };
+    }
+
+    match config.kind {
+        HealthCheckKind::None => Ok(BinaryNodeTaskResult {
+            success: true,
+            message: "未配置健康检查".to_owned(),
+            outputs: Vec::new(),
+            promoted_slot: None,
+        }),
+        HealthCheckKind::SystemdActive => {
+            if context.job.release_strategy == "blue_green" {
+                let target = node.ssh_target()?;
+                let success = run_binary_slot_health_check(
+                    context,
+                    &config,
+                    node,
+                    context.runtime_work_dir,
+                    Some(&target),
+                )
+                .await?;
+                return Ok(BinaryNodeTaskResult {
+                    success,
+                    message: if success {
+                        format!(
+                            "节点 {} 备用槽位 {} 健康检查通过",
+                            node.name,
+                            context.job.target_slot()
+                        )
+                    } else {
+                        "备用槽位健康检查失败，保留当前槽位".to_owned()
+                    },
+                    outputs: Vec::new(),
+                    promoted_slot: None,
+                });
+            }
+            context
+                .tasks
+                .append_log(
+                    context.task_id,
+                    "system",
+                    &format!("开始节点 {} systemd active 检查", node.name),
+                )
+                .await?;
+            let target = node.ssh_target()?;
+            let endpoint = if context.job.release_strategy == "blue_green" {
+                context.job.execution_unit_name()
+            } else {
+                config.endpoint.clone()
+            };
+            let output = context
+                .ssh
+                .is_active(&target, context.runtime_work_dir.to_path_buf(), &endpoint)
+                .await?;
+            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            let success = output.success && output.output.trim() == "active";
+            let message = if success {
+                format!("systemd active 检查通过: {endpoint}")
+            } else {
+                friendly_command_error(
+                    &output.output,
+                    &format!("systemd active 检查失败: {endpoint}"),
+                )
+            };
+            Ok(BinaryNodeTaskResult {
+                success,
+                message,
+                outputs: vec![output],
+                promoted_slot: None,
+            })
+        }
+        HealthCheckKind::Http => {
+            if context.job.release_strategy == "blue_green" {
+                let target = node.ssh_target()?;
+                let success = run_binary_slot_health_check(
+                    context,
+                    &config,
+                    node,
+                    context.runtime_work_dir,
+                    Some(&target),
+                )
+                .await?;
+                return Ok(BinaryNodeTaskResult {
+                    success,
+                    message: if success {
+                        format!(
+                            "节点 {} 备用槽位 {} 健康检查通过",
+                            node.name,
+                            context.job.target_slot()
+                        )
+                    } else {
+                        "备用槽位健康检查失败，保留当前槽位".to_owned()
+                    },
+                    outputs: Vec::new(),
+                    promoted_slot: None,
+                });
+            }
+            let target = node.ssh_target()?;
+            let endpoint = config.endpoint.clone();
+            let output = context
+                .ssh
+                .http_health_check(
+                    &target,
+                    context.runtime_work_dir.to_path_buf(),
+                    &endpoint,
+                    config.timeout_secs,
+                )
+                .await?;
+            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            let status = output.output.trim();
+            let success = output.success && status == config.expected_status.to_string().as_str();
+            let message = if success {
+                format!("HTTP 健康检查通过: {status}")
+            } else {
+                friendly_command_error(
+                    &output.output,
+                    &format!(
+                        "HTTP 健康检查失败: 返回 {status}，期望 {}",
+                        config.expected_status
+                    ),
+                )
+            };
+            context
+                .tasks
+                .append_log(context.task_id, "system", &message)
+                .await?;
+            Ok(BinaryNodeTaskResult {
+                success,
+                message,
+                outputs: vec![output],
+                promoted_slot: None,
+            })
+        }
+        HealthCheckKind::Tcp => {
+            if context.job.release_strategy == "blue_green" {
+                let target = node.ssh_target()?;
+                let success = run_binary_slot_health_check(
+                    context,
+                    &config,
+                    node,
+                    context.runtime_work_dir,
+                    Some(&target),
+                )
+                .await?;
+                return Ok(BinaryNodeTaskResult {
+                    success,
+                    message: if success {
+                        format!(
+                            "节点 {} 备用槽位 {} 健康检查通过",
+                            node.name,
+                            context.job.target_slot()
+                        )
+                    } else {
+                        "备用槽位健康检查失败，保留当前槽位".to_owned()
+                    },
+                    outputs: Vec::new(),
+                    promoted_slot: None,
+                });
+            }
+            let target = node.ssh_target()?;
+            let endpoint = config.endpoint.clone();
+            let output = context
+                .ssh
+                .tcp_health_check(
+                    &target,
+                    context.runtime_work_dir.to_path_buf(),
+                    &endpoint,
+                    config.timeout_secs,
+                )
+                .await?;
+            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            let success = output.success;
+            let message = if success {
+                format!("TCP 健康检查通过: {}", config.endpoint)
+            } else {
+                friendly_command_error(
+                    &output.output,
+                    &format!("TCP 健康检查失败: {}", config.endpoint),
+                )
+            };
+            context
+                .tasks
+                .append_log(context.task_id, "system", &message)
+                .await?;
+            Ok(BinaryNodeTaskResult {
+                success,
+                message,
+                outputs: vec![output],
+                promoted_slot: None,
+            })
+        }
+        _ => Ok(BinaryNodeTaskResult {
+            success: true,
+            message: format!(
+                "SSH 节点 {} 暂跳过 {} 健康检查",
+                node.name,
+                config.kind.label()
+            ),
+            outputs: Vec::new(),
+            promoted_slot: None,
+        }),
+    }
+}
+
+async fn run_binary_slot_health_check(
+    context: &BinaryTaskExecutionContext<'_>,
+    config: &HealthCheckConfig,
+    _node: &AppTargetNode,
+    work_dir: &Path,
+    ssh_target: Option<&SshTarget>,
+) -> Result<bool, AppError> {
+    context
+        .tasks
+        .append_log(
+            context.task_id,
+            "system",
+            &format!(
+                "开始 Blue/Green 备用槽位 {} 健康检查: {}",
+                context.job.target_slot(),
+                config.kind.label()
+            ),
+        )
+        .await?;
+    match config.kind {
+        HealthCheckKind::None => {
+            context
+                .tasks
+                .append_log(context.task_id, "system", "未配置健康检查")
+                .await?;
+            Ok(true)
+        }
+        HealthCheckKind::SystemdActive => {
+            let unit_name = context.job.execution_unit_name();
+            let output = if let Some(target) = ssh_target {
+                context
+                    .ssh
+                    .is_active(target, context.runtime_work_dir.to_path_buf(), &unit_name)
+                    .await?
+            } else {
+                context
+                    .systemd
+                    .is_active(work_dir.to_path_buf(), &unit_name)
+                    .await?
+            };
+            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            let success = output.success && output.output.trim() == "active";
+            let message = if success {
+                format!("systemd active 检查通过: {unit_name}")
+            } else {
+                friendly_command_error(
+                    &output.output,
+                    &format!("systemd active 检查失败: {unit_name}"),
+                )
+            };
+            context
+                .tasks
+                .append_log(context.task_id, "system", &message)
+                .await?;
+            Ok(success)
+        }
+        HealthCheckKind::Http => {
+            let endpoint = context.job.slot_health_endpoint(&config.endpoint);
+            if let Some(target) = ssh_target {
+                let output = context
+                    .ssh
+                    .http_health_check(
+                        target,
+                        context.runtime_work_dir.to_path_buf(),
+                        &endpoint,
+                        config.timeout_secs,
+                    )
+                    .await?;
+                append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+                let status = output.output.trim();
+                let success = output.success && status == config.expected_status.to_string();
+                let message = if success {
+                    format!("HTTP 健康检查通过: {status}")
+                } else {
+                    friendly_command_error(
+                        &output.output,
+                        &format!(
+                            "HTTP 健康检查失败: 返回 {status}，期望 {}",
+                            config.expected_status
+                        ),
+                    )
+                };
+                context
+                    .tasks
+                    .append_log(context.task_id, "system", &message)
+                    .await?;
+                return Ok(success);
+            }
+            let outcome =
+                run_slot_http_check(&endpoint, config.timeout_secs, config.expected_status).await;
+            context
+                .tasks
+                .append_log(context.task_id, "system", &outcome)
+                .await?;
+            Ok(outcome.starts_with("HTTP 健康检查通过"))
+        }
+        HealthCheckKind::Tcp => {
+            let endpoint = context.job.slot_health_endpoint(&config.endpoint);
+            if let Some(target) = ssh_target {
+                let output = context
+                    .ssh
+                    .tcp_health_check(
+                        target,
+                        context.runtime_work_dir.to_path_buf(),
+                        &endpoint,
+                        config.timeout_secs,
+                    )
+                    .await?;
+                append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+                let success = output.success;
+                let message = if success {
+                    format!("TCP 健康检查通过: {endpoint}")
+                } else {
+                    friendly_command_error(&output.output, &format!("TCP 健康检查失败: {endpoint}"))
+                };
+                context
+                    .tasks
+                    .append_log(context.task_id, "system", &message)
+                    .await?;
+                return Ok(success);
+            }
+            let outcome = run_slot_tcp_check(&endpoint, config.timeout_secs).await;
+            context
+                .tasks
+                .append_log(context.task_id, "system", &outcome)
+                .await?;
+            Ok(outcome.starts_with("TCP 健康检查通过"))
+        }
+        HealthCheckKind::ComposeRunning => {
+            context
+                .tasks
+                .append_log(
+                    context.task_id,
+                    "system",
+                    "Blue/Green 二进制部署不使用容器运行状态检查，已跳过",
+                )
+                .await?;
+            Ok(true)
+        }
+    }
+}
+
+async fn run_slot_http_check(endpoint: &str, timeout_secs: u64, expected_status: u16) -> String {
+    let Ok(url) = Url::parse(endpoint) else {
+        return format!("HTTP 健康检查地址无效: {endpoint}");
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs.clamp(1, 60)))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => return format!("HTTP 健康检查客户端创建失败: {err}"),
+    };
+    match client.get(url).send().await {
+        Ok(response) if response.status().as_u16() == expected_status => {
+            format!("HTTP 健康检查通过: {}", response.status().as_u16())
+        }
+        Ok(response) => format!(
+            "HTTP 健康检查失败: 返回 {}，期望 {}",
+            response.status().as_u16(),
+            expected_status
+        ),
+        Err(err) => format!("HTTP 健康检查失败: {err}"),
+    }
+}
+
+async fn run_slot_tcp_check(endpoint: &str, timeout_secs: u64) -> String {
+    match tokio::time::timeout(
+        Duration::from_secs(timeout_secs.clamp(1, 60)),
+        TcpStream::connect(endpoint),
+    )
+    .await
+    {
+        Ok(Ok(_)) => format!("TCP 健康检查通过: {endpoint}"),
+        Ok(Err(err)) => format!("TCP 健康检查失败: {endpoint}: {err}"),
+        Err(_) => format!("TCP 健康检查超时: {endpoint}"),
+    }
+}
+
+async fn block_unavailable_node_preflight(
+    tasks: &TaskService,
+    task_id: i64,
+    node: &AppTargetNode,
+) -> Result<Option<String>, AppError> {
+    let message = match node.status.as_str() {
+        "offline" => format!("节点 {} 当前离线，预检阻断部署", node.name),
+        _ => return Ok(None),
+    };
+    tasks.append_log(task_id, "system", &message).await?;
+    Ok(Some(message))
+}
+
+async fn block_missing_proxy_preflight(
+    tasks: &TaskService,
+    task_id: i64,
+    node: &AppTargetNode,
+    job: &BinaryTaskJob,
+) -> Result<Option<String>, AppError> {
+    if job.action != BinaryTaskAction::Restart || !job.proxy_enabled {
+        return Ok(None);
+    }
+    let missing = match job.proxy_kind.as_str() {
+        "caddy" if node.caddy_available == 0 => Some("Caddy"),
+        "nginx" if node.nginx_available == 0 => Some("Nginx"),
+        _ => None,
+    };
+    let Some(proxy_name) = missing else {
+        return Ok(None);
+    };
+    let message = format!(
+        "节点 {} 未通过 {} 能力探测，已启用反向代理切流，预检阻断部署",
+        node.name, proxy_name
+    );
+    tasks.append_log(task_id, "system", &message).await?;
+    Ok(Some(message))
+}
+
+async fn app_target_nodes(db: &SqlitePool, app_id: i64) -> Result<Vec<AppTargetNode>, AppError> {
+    sqlx::query_as::<_, AppTargetNode>(
+        r#"
+        SELECT
+            n.id,
+            n.node_key,
+            n.name,
+            n.node_type,
+            n.status,
+            n.address,
+            n.ssh_port,
+            n.ssh_user,
+            cred.private_key_path AS credential_private_key_path,
+            n.work_dir,
+            COALESCE(c.caddy_available, 0) AS caddy_available,
+            COALESCE(c.nginx_available, 0) AS nginx_available
+        FROM nodes n
+        JOIN app_targets t ON t.node_id = n.id
+        LEFT JOIN node_credentials cred ON cred.id = n.credential_id
+        LEFT JOIN node_capabilities c ON c.node_id = n.id
+        WHERE t.app_id = ?1
+          AND n.status != 'disabled'
+        ORDER BY n.id
+        "#,
+    )
+    .bind(app_id)
+    .fetch_all(db)
+    .await
+    .map_err(AppError::from)
+}
+
+fn merge_command_outputs(
+    outputs: Vec<ComposeCommandOutput>,
+    success: bool,
+    fallback_command: &str,
+) -> ComposeCommandOutput {
+    let command = outputs
+        .last()
+        .map(|output| output.command.clone())
+        .unwrap_or_else(|| fallback_command.to_owned());
+    let status_code = if success {
+        Some(0)
+    } else {
+        outputs
+            .iter()
+            .rev()
+            .find_map(|output| output.status_code.filter(|code| *code != 0))
+            .or(Some(1))
+    };
+    let ordered_outputs = if success {
+        outputs.iter().collect::<Vec<_>>()
+    } else {
+        outputs
+            .iter()
+            .filter(|output| !output.success)
+            .chain(outputs.iter().filter(|output| output.success))
+            .collect::<Vec<_>>()
+    };
+    let output = ordered_outputs
+        .into_iter()
+        .filter_map(|output| {
+            let body = output.output.trim();
+            if body.is_empty() {
+                None
+            } else {
+                Some(format!("$ {}\n{}", output.command, body))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    ComposeCommandOutput {
+        command,
+        success,
+        status_code,
+        output,
+    }
+}
+
+fn prepend_failure_context(
+    mut output: ComposeCommandOutput,
+    context: &str,
+) -> ComposeCommandOutput {
+    if output.success {
+        return output;
+    }
+
+    let context = context.trim();
+    if context.is_empty() || output.output.contains(context) {
+        return output;
+    }
+
+    output.output = if output.output.trim().is_empty() {
+        context.to_owned()
+    } else {
+        format!("{context}\n{}", output.output)
+    };
+    output
+}
+
+async fn append_intermediate_command_output(
+    tasks: &TaskService,
+    task_id: i64,
+    output: &ComposeCommandOutput,
+) -> Result<(), TaskError> {
+    tasks
+        .append_log(
+            task_id,
+            "system",
+            &format!(
+                "{} · 退出码 {}",
+                output.command,
+                output
+                    .status_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "无".to_owned())
+            ),
+        )
+        .await?;
+    if !output.output.trim().is_empty() {
+        tasks
+            .append_log(task_id, "combined", &output.output)
+            .await?;
+    }
+    Ok(())
+}
+
+fn binary_command_work_dir(deploy_work_dir: &str, runtime_work_dir: &Path) -> PathBuf {
+    let target = PathBuf::from(deploy_work_dir);
+    if target.is_absolute() {
+        target
+    } else {
+        runtime_work_dir.to_path_buf()
+    }
+}
+
+fn binary_systemd_unit_path(root: &Path, unit_name: &str) -> PathBuf {
+    root.join(META_DIR_NAME)
+        .join(SYSTEMD_DIR_NAME)
+        .join(unit_name)
+}
+
+fn remote_binary_systemd_unit_path(root: &str, unit_name: &str) -> Result<String, AppError> {
+    let root = normalize_remote_target_root(root)?;
+    Ok(remote_join(
+        &remote_join(&remote_join(&root, META_DIR_NAME), SYSTEMD_DIR_NAME),
+        unit_name,
+    ))
+}
+
+async fn sync_binary_runtime_to_local_target(
+    tasks: &TaskService,
+    task_id: i64,
+    runtime_work_dir: &Path,
+    job: &BinaryTaskJob,
+    node: &AppTargetNode,
+) -> Result<(), AppError> {
+    let target_root =
+        binary_command_work_dir(&binary_node_deploy_work_dir(job, node), runtime_work_dir);
+    tokio::fs::create_dir_all(&target_root)
+        .await
+        .map_err(|err| {
+            AppError::Internal(format!(
+                "创建二进制目标部署目录 {} 失败: {err}",
+                target_root.to_string_lossy()
+            ))
+        })?;
+
+    let release_source = runtime_work_dir
+        .join("releases")
+        .join(&job.artifact_version);
+    let release_target = target_root.join("releases").join(&job.artifact_version);
+    copy_dir_all(&release_source, &release_target)?;
+
+    let systemd_source = runtime_work_dir.join(".easy-deploy").join("systemd");
+    let systemd_target = target_root.join(".easy-deploy").join("systemd");
+    copy_dir_all(&systemd_source, &systemd_target)?;
+
+    copy_file(
+        &runtime_work_dir.join("current"),
+        &target_root.join("current"),
+        "同步 current 指针",
+    )?;
+    copy_file(
+        &runtime_work_dir.join(".easy-deploy").join("app.yaml"),
+        &target_root.join(".easy-deploy").join("app.yaml"),
+        "同步 app.yaml",
+    )?;
+    tasks
+        .append_log(
+            task_id,
+            "system",
+            &format!(
+                "已同步二进制运行文件到本机部署目录: {}",
+                target_root.to_string_lossy()
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn sync_binary_runtime_to_ssh_target(
+    tasks: &TaskService,
+    task_id: i64,
+    ssh: &SshExecutor,
+    runtime_work_dir: &Path,
+    job: &BinaryTaskJob,
+    node: &AppTargetNode,
+) -> Result<Vec<ComposeCommandOutput>, AppError> {
+    let target = node.ssh_target()?;
+    let target_root = normalize_remote_target_root(&binary_node_deploy_work_dir(job, node))?;
+    let mut outputs = Vec::new();
+
+    let release_source = runtime_work_dir
+        .join("releases")
+        .join(&job.artifact_version);
+    let systemd_source = runtime_work_dir.join(".easy-deploy").join("systemd");
+    let mut files = collect_remote_copy_files(
+        &release_source,
+        &remote_join(
+            &remote_join(&target_root, "releases"),
+            &job.artifact_version,
+        ),
+    )?;
+    files.extend(collect_remote_copy_files(
+        &systemd_source,
+        &remote_join(&remote_join(&target_root, ".easy-deploy"), "systemd"),
+    )?);
+    files.extend([
+        RemoteCopyFile {
+            local_path: runtime_work_dir.join("current"),
+            remote_path: remote_join(&target_root, "current"),
+        },
+        RemoteCopyFile {
+            local_path: runtime_work_dir.join(".easy-deploy").join("app.yaml"),
+            remote_path: remote_join(&remote_join(&target_root, ".easy-deploy"), "app.yaml"),
+        },
+    ]);
+
+    for dir in remote_parent_dirs(&files, &target_root) {
+        let output = ssh
+            .mkdir_all(&target, runtime_work_dir.to_path_buf(), &dir)
+            .await?;
+        append_intermediate_command_output(tasks, task_id, &output).await?;
+        let success = output.success;
+        outputs.push(output);
+        if !success {
+            return Err(AppError::Internal(format!("SSH 创建目录 {dir} 失败")));
+        }
+    }
+
+    for file in files {
+        let output = ssh
+            .copy_file(
+                &target,
+                runtime_work_dir.to_path_buf(),
+                file.local_path,
+                &file.remote_path,
+            )
+            .await?;
+        append_intermediate_command_output(tasks, task_id, &output).await?;
+        let success = output.success;
+        let remote_path = file.remote_path;
+        outputs.push(output);
+        if !success {
+            return Err(AppError::Internal(format!(
+                "SSH 同步文件 {remote_path} 失败"
+            )));
+        }
+    }
+
+    tasks
+        .append_log(
+            task_id,
+            "system",
+            &format!(
+                "已同步二进制运行文件到 SSH 节点 {}: {}",
+                node.name, target_root
+            ),
+        )
+        .await?;
+
+    Ok(outputs)
+}
+
+async fn sync_promoted_binary_runtime_to_targets(
+    tasks: &TaskService,
+    task_id: i64,
+    ssh: &SshExecutor,
+    runtime_work_dir: &Path,
+    job: &BinaryTaskJob,
+    target_nodes: &[AppTargetNode],
+) -> Result<Vec<ComposeCommandOutput>, AppError> {
+    let mut outputs = Vec::new();
+    for node in target_nodes {
+        match node.node_type.as_str() {
+            "local" => {
+                sync_binary_runtime_to_local_target(tasks, task_id, runtime_work_dir, job, node)
+                    .await?;
+            }
+            "ssh" => {
+                outputs.extend(
+                    sync_binary_runtime_to_ssh_target(
+                        tasks,
+                        task_id,
+                        ssh,
+                        runtime_work_dir,
+                        job,
+                        node,
+                    )
+                    .await?,
+                );
+            }
+            _ => {
+                return Err(AppError::InvalidInput(format!(
+                    "节点 {} 的类型 {} 不支持二进制部署",
+                    node.name, node.node_type
+                )));
+            }
+        }
+    }
+    Ok(outputs)
+}
+
+async fn switch_binary_proxy_to_targets(
+    tasks: &TaskService,
+    task_id: i64,
+    systemd: &SystemdExecutor,
+    ssh: &SshExecutor,
+    runtime_work_dir: &Path,
+    job: &BinaryTaskJob,
+    target_nodes: &[AppTargetNode],
+) -> Result<Vec<ComposeCommandOutput>, AppError> {
+    if !job.proxy_enabled {
+        return Ok(Vec::new());
+    }
+    if !job.is_blue_green_restart() {
+        return Err(AppError::InvalidInput(
+            "反向代理切流仅支持 Blue/Green restart 任务".to_owned(),
+        ));
+    }
+    let proxy_config = render_binary_proxy_config(job)?;
+    let context = BinaryProxySwitchContext {
+        tasks,
+        task_id,
+        systemd,
+        ssh,
+        runtime_work_dir,
+        job,
+        proxy_config: &proxy_config,
+    };
+    let mut outputs = Vec::new();
+    for node in target_nodes {
+        outputs.extend(switch_binary_proxy_on_node(&context, node).await?);
+    }
+    Ok(outputs)
+}
+
+async fn cleanup_binary_standby_slot(
+    tasks: &TaskService,
+    task_id: i64,
+    systemd: &SystemdExecutor,
+    ssh: &SshExecutor,
+    runtime_work_dir: &Path,
+    job: &BinaryTaskJob,
+    target_nodes: &[AppTargetNode],
+) -> Result<Vec<ComposeCommandOutput>, AppError> {
+    if !job.is_blue_green_restart() {
+        return Ok(Vec::new());
+    }
+    let unit_name = job.execution_unit_name();
+    let mut outputs = Vec::new();
+    for node in target_nodes {
+        tasks
+            .append_log(
+                task_id,
+                "system",
+                &format!(
+                    "开始在节点 {} 停止备用槽位 systemd unit: {}",
+                    node.name, unit_name
+                ),
+            )
+            .await?;
+        let output = match node.node_type.as_str() {
+            "local" => {
+                let command_work_dir = binary_command_work_dir(
+                    &binary_node_deploy_work_dir(job, node),
+                    runtime_work_dir,
+                );
+                systemd.stop(command_work_dir, &unit_name).await?
+            }
+            "ssh" => {
+                let target = node.ssh_target()?;
+                ssh.stop(&target, runtime_work_dir.to_path_buf(), &unit_name)
+                    .await?
+            }
+            _ => {
+                return Err(AppError::InvalidInput(format!(
+                    "节点 {} 的类型 {} 不支持备用槽位清理",
+                    node.name, node.node_type
+                )));
+            }
+        };
+        append_intermediate_command_output(tasks, task_id, &output).await?;
+        let success = output.success;
+        let message = friendly_command_error(&output.output, "停止备用槽位失败");
+        outputs.push(output);
+        if !success {
+            return Err(AppError::Internal(message));
+        }
+    }
+    Ok(outputs)
+}
+
+struct BinaryProxySwitchContext<'a> {
+    tasks: &'a TaskService,
+    task_id: i64,
+    systemd: &'a SystemdExecutor,
+    ssh: &'a SshExecutor,
+    runtime_work_dir: &'a Path,
+    job: &'a BinaryTaskJob,
+    proxy_config: &'a str,
+}
+
+async fn switch_binary_proxy_on_node(
+    context: &BinaryProxySwitchContext<'_>,
+    node: &AppTargetNode,
+) -> Result<Vec<ComposeCommandOutput>, AppError> {
+    let job = context.job;
+    let config_path = binary_proxy_config_path(context.job)?;
+    context
+        .tasks
+        .append_log(
+            context.task_id,
+            "system",
+            &format!(
+                "开始在节点 {} 切换 {} 反向代理到 {}({})",
+                node.name,
+                binary_proxy_kind_label(&job.proxy_kind),
+                job.target_slot(),
+                display_port(job.target_port())
+            ),
+        )
+        .await?;
+    match node.node_type.as_str() {
+        "local" => {
+            write_local_proxy_config(&config_path, context.proxy_config).await?;
+            let command_work_dir = binary_command_work_dir(
+                &binary_node_deploy_work_dir(job, node),
+                context.runtime_work_dir,
+            );
+            run_local_proxy_switch(
+                context.tasks,
+                context.task_id,
+                context.systemd,
+                command_work_dir,
+                &job.proxy_kind,
+                &config_path,
+            )
+            .await
+        }
+        "ssh" => {
+            let target = node.ssh_target()?;
+            let local_proxy_path = write_runtime_proxy_config(
+                context.runtime_work_dir,
+                &node.node_key,
+                job,
+                context.proxy_config,
+            )
+            .await?;
+            let mut outputs = Vec::new();
+            let parent = remote_parent_path(&config_path)?;
+            let output = context
+                .ssh
+                .mkdir_all(&target, context.runtime_work_dir.to_path_buf(), &parent)
+                .await?;
+            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            let success = output.success;
+            outputs.push(output);
+            if !success {
+                return Err(AppError::Internal(format!(
+                    "SSH 创建代理配置目录 {parent} 失败"
+                )));
+            }
+
+            let output = context
+                .ssh
+                .copy_file(
+                    &target,
+                    context.runtime_work_dir.to_path_buf(),
+                    local_proxy_path,
+                    &config_path,
+                )
+                .await?;
+            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            let success = output.success;
+            outputs.push(output);
+            if !success {
+                return Err(AppError::Internal(format!(
+                    "SSH 同步代理配置 {config_path} 失败"
+                )));
+            }
+
+            outputs.extend(
+                run_ssh_proxy_switch(
+                    context.tasks,
+                    context.task_id,
+                    context.ssh,
+                    &target,
+                    context.runtime_work_dir,
+                    &job.proxy_kind,
+                    &config_path,
+                )
+                .await?,
+            );
+            Ok(outputs)
+        }
+        _ => Err(AppError::InvalidInput(format!(
+            "节点 {} 的类型 {} 不支持反向代理切流",
+            node.name, node.node_type
+        ))),
+    }
+}
+
+async fn run_local_proxy_switch(
+    tasks: &TaskService,
+    task_id: i64,
+    systemd: &SystemdExecutor,
+    work_dir: PathBuf,
+    proxy_kind: &str,
+    config_path: &str,
+) -> Result<Vec<ComposeCommandOutput>, AppError> {
+    let mut outputs = Vec::new();
+    let validate = match proxy_kind {
+        "nginx" => {
+            systemd
+                .nginx_validate(work_dir.clone(), config_path)
+                .await?
+        }
+        _ => {
+            systemd
+                .caddy_validate(work_dir.clone(), config_path)
+                .await?
+        }
+    };
+    append_intermediate_command_output(tasks, task_id, &validate).await?;
+    let success = validate.success;
+    let message = friendly_command_error(&validate.output, "反向代理配置校验失败");
+    outputs.push(validate);
+    if !success {
+        return Err(AppError::Internal(message));
+    }
+
+    let service_name = proxy_systemd_service_name(proxy_kind);
+    let reload = systemd.reload_service(work_dir, service_name).await?;
+    append_intermediate_command_output(tasks, task_id, &reload).await?;
+    let success = reload.success;
+    let message = friendly_command_error(&reload.output, "反向代理 reload 失败");
+    outputs.push(reload);
+    if !success {
+        return Err(AppError::Internal(message));
+    }
+    Ok(outputs)
+}
+
+async fn run_ssh_proxy_switch(
+    tasks: &TaskService,
+    task_id: i64,
+    ssh: &SshExecutor,
+    target: &SshTarget,
+    runtime_work_dir: &Path,
+    proxy_kind: &str,
+    config_path: &str,
+) -> Result<Vec<ComposeCommandOutput>, AppError> {
+    let mut outputs = Vec::new();
+    let validate = match proxy_kind {
+        "nginx" => {
+            ssh.nginx_validate(target, runtime_work_dir.to_path_buf(), config_path)
+                .await?
+        }
+        _ => {
+            ssh.caddy_validate(target, runtime_work_dir.to_path_buf(), config_path)
+                .await?
+        }
+    };
+    append_intermediate_command_output(tasks, task_id, &validate).await?;
+    let success = validate.success;
+    let message = friendly_command_error(&validate.output, "远程反向代理配置校验失败");
+    outputs.push(validate);
+    if !success {
+        return Err(AppError::Internal(message));
+    }
+
+    let service_name = proxy_systemd_service_name(proxy_kind);
+    let reload = ssh
+        .reload_service(target, runtime_work_dir.to_path_buf(), service_name)
+        .await?;
+    append_intermediate_command_output(tasks, task_id, &reload).await?;
+    let success = reload.success;
+    let message = friendly_command_error(&reload.output, "远程反向代理 reload 失败");
+    outputs.push(reload);
+    if !success {
+        return Err(AppError::Internal(message));
+    }
+    Ok(outputs)
+}
+
+async fn write_local_proxy_config(path: &str, content: &str) -> Result<(), AppError> {
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|err| {
+            AppError::Internal(format!(
+                "创建反向代理配置目录 {} 失败: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    tokio::fs::write(&path, content).await.map_err(|err| {
+        AppError::Internal(format!("写入反向代理配置 {} 失败: {err}", path.display()))
+    })
+}
+
+async fn write_runtime_proxy_config(
+    runtime_work_dir: &Path,
+    node_key: &str,
+    job: &BinaryTaskJob,
+    content: &str,
+) -> Result<PathBuf, AppError> {
+    let local_path = runtime_work_dir
+        .join(".easy-deploy")
+        .join("proxy")
+        .join(node_key)
+        .join(proxy_config_file_name(job)?);
+    if let Some(parent) = local_path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|err| {
+            AppError::Internal(format!("创建代理临时目录 {} 失败: {err}", parent.display()))
+        })?;
+    }
+    tokio::fs::write(&local_path, content)
+        .await
+        .map_err(|err| {
+            AppError::Internal(format!(
+                "写入代理临时配置 {} 失败: {err}",
+                local_path.display()
+            ))
+        })?;
+    Ok(local_path)
+}
+
+fn render_binary_proxy_config(job: &BinaryTaskJob) -> Result<String, AppError> {
+    let domain = required_text(&job.proxy_domain, "请输入反向代理域名")?;
+    let port = job.target_port();
+    if port <= 0 {
+        return Err(AppError::InvalidInput(
+            "Blue/Green 切流需要配置目标槽位端口".to_owned(),
+        ));
+    }
+    match job.proxy_kind.as_str() {
+        "caddy" => Ok(format!(
+            "{domain} {{\n    reverse_proxy 127.0.0.1:{port}\n}}\n"
+        )),
+        "nginx" => Ok(format!(
+            "server {{\n    listen 80;\n    server_name {domain};\n\n    location / {{\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_pass http://127.0.0.1:{port};\n    }}\n}}\n"
+        )),
+        _ => Err(AppError::InvalidInput("反向代理类型不支持".to_owned())),
+    }
+}
+
+fn binary_proxy_config_path(job: &BinaryTaskJob) -> Result<String, AppError> {
+    let path = job.proxy_config_path.trim();
+    if path.is_empty() {
+        Ok(default_proxy_config_path(&job.proxy_kind, &job.app_key))
+    } else {
+        normalize_proxy_config_path(path)
+    }
+}
+
+fn proxy_config_file_name(job: &BinaryTaskJob) -> Result<String, AppError> {
+    let suffix = match job.proxy_kind.as_str() {
+        "nginx" => "conf",
+        "caddy" => "caddy",
+        _ => return Err(AppError::InvalidInput("反向代理类型不支持".to_owned())),
+    };
+    Ok(format!("{}.{}", job.app_key, suffix))
+}
+
+fn remote_parent_path(path: &str) -> Result<String, AppError> {
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent.to_owned())
+        .filter(|parent| !parent.is_empty())
+        .ok_or_else(|| AppError::InvalidInput("反向代理配置路径必须包含目录".to_owned()))
+}
+
+fn proxy_systemd_service_name(proxy_kind: &str) -> &'static str {
+    match proxy_kind {
+        "nginx" => "nginx.service",
+        _ => "caddy.service",
+    }
+}
+
+fn binary_proxy_kind_label(proxy_kind: &str) -> &'static str {
+    match proxy_kind {
+        "nginx" => "Nginx",
+        "caddy" => "Caddy",
+        _ => "反向代理",
+    }
+}
+
+#[derive(Debug)]
+struct RemoteCopyFile {
+    local_path: PathBuf,
+    remote_path: String,
+}
+
+fn collect_remote_copy_files(
+    source: &Path,
+    remote_root: &str,
+) -> Result<Vec<RemoteCopyFile>, AppError> {
+    let mut files = Vec::new();
+    collect_remote_copy_files_inner(source, source, remote_root, &mut files)?;
+    Ok(files)
+}
+
+fn collect_remote_copy_files_inner(
+    base: &Path,
+    source: &Path,
+    remote_root: &str,
+    files: &mut Vec<RemoteCopyFile>,
+) -> Result<(), AppError> {
+    if !source.is_dir() {
+        return Err(AppError::InvalidInput(format!(
+            "源目录不存在: {}",
+            source.to_string_lossy()
+        )));
+    }
+    for entry in fs::read_dir(source).map_err(|err| {
+        AppError::Internal(format!("读取目录 {} 失败: {err}", source.to_string_lossy()))
+    })? {
+        let entry = entry.map_err(|err| AppError::Internal(format!("读取目录条目失败: {err}")))?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|err| {
+            AppError::Internal(format!(
+                "读取文件类型 {} 失败: {err}",
+                path.to_string_lossy()
+            ))
+        })?;
+        if file_type.is_dir() {
+            collect_remote_copy_files_inner(base, &path, remote_root, files)?;
+        } else if file_type.is_file() {
+            let relative = path.strip_prefix(base).map_err(|err| {
+                AppError::Internal(format!(
+                    "计算相对路径 {} 失败: {err}",
+                    path.to_string_lossy()
+                ))
+            })?;
+            let remote_path = relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy().to_string())
+                .fold(remote_root.to_owned(), |acc, part| remote_join(&acc, &part));
+            files.push(RemoteCopyFile {
+                local_path: path,
+                remote_path,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn remote_parent_dirs(files: &[RemoteCopyFile], target_root: &str) -> Vec<String> {
+    let mut dirs = vec![target_root.to_owned()];
+    for file in files {
+        if let Some((dir, _)) = file.remote_path.rsplit_once('/')
+            && !dir.is_empty()
+            && !dirs.iter().any(|existing| existing == dir)
+        {
+            dirs.push(dir.to_owned());
+        }
+    }
+    dirs
+}
+
+fn normalize_remote_target_root(value: &str) -> Result<String, AppError> {
+    let value = value.trim().replace('\\', "/");
+    if !value.starts_with('/') {
+        return Err(AppError::InvalidInput(
+            "SSH 二进制部署目录必须是绝对路径".to_owned(),
+        ));
+    }
+    if value.contains("//")
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '-' | '_' | '@'))
+        || value.split('/').any(|part| part == "." || part == "..")
+    {
+        return Err(AppError::InvalidInput(
+            "SSH 二进制部署目录仅支持字母、数字、斜线、点、短横线、下划线和 @".to_owned(),
+        ));
+    }
+    Ok(value.trim_end_matches('/').to_owned())
+}
+
+fn binary_node_deploy_work_dir(job: &BinaryTaskJob, node: &AppTargetNode) -> String {
+    if job.deploy_work_dir.trim().is_empty() {
+        target_work_dir_path(&node.work_dir, &job.app_key)
+    } else {
+        job.deploy_work_dir.clone()
+    }
+}
+
+fn binary_node_deploy_work_dir_for_app(app: &AppDetailItem, node: &AppTargetNode) -> String {
+    if app.work_dir.trim().is_empty() {
+        target_work_dir_path(&node.work_dir, &app.app_key)
+    } else {
+        app.work_dir.clone()
+    }
+}
+
+fn binary_target_artifact_path(deploy_work_dir: &str, artifact_path: &str) -> Option<String> {
+    let deploy_work_dir = deploy_work_dir.trim().replace('\\', "/");
+    let artifact_path = artifact_path.trim().replace('\\', "/");
+    if deploy_work_dir.is_empty() || artifact_path.is_empty() {
+        return None;
+    }
+    let release_prefix = format!("{}/releases/", deploy_work_dir.trim_end_matches('/'));
+    if artifact_path.starts_with(&release_prefix) {
+        Some(artifact_path)
+    } else {
+        None
+    }
+}
+
+fn remote_join(root: &str, relative: &str) -> String {
+    format!(
+        "{}/{}",
+        root.trim_end_matches('/'),
+        relative.trim_matches('/')
+    )
+}
+
+fn copy_dir_all(source: &Path, target: &Path) -> Result<(), AppError> {
+    if !source.is_dir() {
+        return Err(AppError::InvalidInput(format!(
+            "源目录不存在: {}",
+            source.to_string_lossy()
+        )));
+    }
+    fs::create_dir_all(target).map_err(|err| {
+        AppError::Internal(format!("创建目录 {} 失败: {err}", target.to_string_lossy()))
+    })?;
+    for entry in fs::read_dir(source).map_err(|err| {
+        AppError::Internal(format!("读取目录 {} 失败: {err}", source.to_string_lossy()))
+    })? {
+        let entry = entry.map_err(|err| AppError::Internal(format!("读取目录条目失败: {err}")))?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|err| {
+            AppError::Internal(format!(
+                "读取文件类型 {} 失败: {err}",
+                source_path.to_string_lossy()
+            ))
+        })?;
+        if file_type.is_dir() {
+            copy_dir_all(&source_path, &target_path)?;
+        } else if file_type.is_file() {
+            copy_file(&source_path, &target_path, "同步文件")?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_file(source: &Path, target: &Path, action: &str) -> Result<(), AppError> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            AppError::Internal(format!("创建目录 {} 失败: {err}", parent.to_string_lossy()))
+        })?;
+    }
+    fs::copy(source, target).map_err(|err| {
+        AppError::Internal(format!(
+            "{action} {} -> {} 失败: {err}",
+            source.to_string_lossy(),
+            target.to_string_lossy()
+        ))
+    })?;
+    Ok(())
+}
+
+async fn load_health_check_config(
+    db: &SqlitePool,
+    app_id: i64,
+) -> Result<HealthCheckConfig, AppError> {
+    #[derive(sqlx::FromRow)]
+    struct HealthCheckRow {
+        check_kind: String,
+        endpoint: String,
+        timeout_secs: i64,
+        expected_status: i64,
+    }
+
+    let Some(row) = sqlx::query_as::<_, HealthCheckRow>(
+        r#"
+        SELECT check_kind, endpoint, timeout_secs, expected_status
+        FROM app_health_checks
+        WHERE app_id = ?1
+        "#,
+    )
+    .bind(app_id)
+    .fetch_optional(db)
+    .await?
+    else {
+        return Ok(HealthCheckConfig::default());
+    };
+    normalize_health_config(
+        &row.check_kind,
+        &row.endpoint,
+        row.timeout_secs,
+        row.expected_status,
+    )
+    .map_err(AppError::from)
+}
+
+async fn run_app_health_check(
+    db: &SqlitePool,
+    tasks: &TaskService,
+    compose: &ComposeExecutor,
+    systemd: &SystemdExecutor,
+    app_id: i64,
+    task_id: i64,
+    work_dir: &Path,
+) -> Result<bool, AppError> {
+    let config = load_health_check_config(db, app_id).await?;
+    if let Err(err) = tasks
+        .append_log(
+            task_id,
+            "system",
+            &format!("开始健康检查: {}", config.kind.label()),
+        )
+        .await
+    {
+        return Err(AppError::from(err));
+    }
+    let outcome = run_health_check(&config, compose, systemd, work_dir.to_path_buf()).await?;
+    if let Err(err) = tasks.append_log(task_id, "system", &outcome.message).await {
+        return Err(AppError::from(err));
+    }
+    Ok(outcome.healthy)
+}
+
+async fn run_compose_preflight(
+    tasks: &TaskService,
+    compose: &ComposeExecutor,
+    task_id: i64,
+    work_dir: std::path::PathBuf,
+) -> ComposeNodeTaskResult {
+    let mut outputs = Vec::new();
+    if let Err(err) = tasks
+        .append_log(task_id, "system", "开始部署前预检: Docker daemon")
+        .await
+    {
+        error!(
+            task_id,
+            error = %err,
+            "failed to append compose preflight log"
+        );
+        return ComposeNodeTaskResult {
+            success: false,
+            message: "写入预检日志失败".to_owned(),
+            outputs,
+        };
+    }
+    match compose.docker_info(work_dir.clone()).await {
+        Ok(output) if output.success => {
+            outputs.push(output);
+            if let Err(err) = tasks
+                .append_log(task_id, "system", "Docker daemon 连接正常")
+                .await
+            {
+                error!(
+                    task_id,
+                    error = %err,
+                    "failed to append compose preflight log"
+                );
+                return ComposeNodeTaskResult {
+                    success: false,
+                    message: "写入预检日志失败".to_owned(),
+                    outputs,
+                };
+            }
+        }
+        Ok(output) => {
+            let message = format!(
+                "Docker daemon 预检失败: {}",
+                friendly_command_error(&output.output, "docker info 返回非 0 状态")
+            );
+            outputs.push(output);
+            return ComposeNodeTaskResult {
+                success: false,
+                message,
+                outputs,
+            };
+        }
+        Err(err) => {
+            let message = format!("Docker daemon 预检失败: {}", err.message());
+            return ComposeNodeTaskResult {
+                success: false,
+                message,
+                outputs,
+            };
+        }
+    }
+
+    match run_local_preflight(&work_dir) {
+        Ok(result) => {
+            for message in result.messages {
+                if let Err(err) = tasks.append_log(task_id, "system", &message).await {
+                    error!(
+                        task_id,
+                        error = %err,
+                        "failed to append local preflight log"
+                    );
+                    return ComposeNodeTaskResult {
+                        success: false,
+                        message: "写入本地预检日志失败".to_owned(),
+                        outputs,
+                    };
+                }
+            }
+        }
+        Err(err) => {
+            let message = format!("本地环境预检失败: {}", err.message());
+            return ComposeNodeTaskResult {
+                success: false,
+                message,
+                outputs,
+            };
+        }
+    }
+
+    if let Err(err) = tasks
+        .append_log(task_id, "system", "开始部署前预检: docker compose config")
+        .await
+    {
+        error!(
+            task_id,
+            error = %err,
+            "failed to append compose config preflight log"
+        );
+        return ComposeNodeTaskResult {
+            success: false,
+            message: "写入 Compose 预检日志失败".to_owned(),
+            outputs,
+        };
+    }
+    match compose.config(work_dir).await {
+        Ok(output) if output.success => {
+            outputs.push(output);
+            if let Err(err) = tasks
+                .append_log(task_id, "system", "Compose 配置校验通过")
+                .await
+            {
+                error!(
+                    task_id,
+                    error = %err,
+                    "failed to append compose config preflight log"
+                );
+                return ComposeNodeTaskResult {
+                    success: false,
+                    message: "写入 Compose 预检日志失败".to_owned(),
+                    outputs,
+                };
+            }
+            ComposeNodeTaskResult {
+                success: true,
+                message: "部署前预检通过".to_owned(),
+                outputs,
+            }
+        }
+        Ok(output) => {
+            let message = format!(
+                "Compose 配置预检失败: {}",
+                friendly_command_error(&output.output, "docker compose config 返回非 0 状态")
+            );
+            outputs.push(output);
+            ComposeNodeTaskResult {
+                success: false,
+                message,
+                outputs,
+            }
+        }
+        Err(err) => {
+            let message = format!("Compose 配置预检失败: {}", err.message());
+            ComposeNodeTaskResult {
+                success: false,
+                message,
+                outputs,
+            }
+        }
+    }
+}
+
+struct LocalPreflightResult {
+    messages: Vec<String>,
+}
+
+fn run_local_preflight(work_dir: &Path) -> Result<LocalPreflightResult, AppError> {
+    ensure_directory_writable(work_dir)?;
+    let free_space = available_space(work_dir).map_err(|err| {
+        AppError::Internal(format!(
+            "读取磁盘可用空间失败: {}: {err}",
+            work_dir.to_string_lossy()
+        ))
+    })?;
+    if free_space < MIN_COMPOSE_FREE_SPACE_BYTES {
+        return Err(AppError::InvalidInput(format!(
+            "磁盘可用空间不足，当前 {}，至少需要 {}",
+            human_bytes(free_space),
+            human_bytes(MIN_COMPOSE_FREE_SPACE_BYTES)
+        )));
+    }
+
+    let compose_path = work_dir.join("compose.yaml");
+    let compose_content = fs::read_to_string(&compose_path).map_err(|err| {
+        AppError::Internal(format!(
+            "读取 Compose 配置失败: {}: {err}",
+            compose_path.to_string_lossy()
+        ))
+    })?;
+    let ports = parse_compose_host_ports(&compose_content)?;
+    let occupied_ports = occupied_ports(&ports);
+
+    let mut messages = vec![
+        "工作目录可写".to_owned(),
+        format!("磁盘可用空间 {}", human_bytes(free_space)),
+    ];
+    if ports.is_empty() {
+        messages.push("Compose 未声明主机端口映射".to_owned());
+    } else if occupied_ports.is_empty() {
+        messages.push(format!("主机端口未被占用: {}", join_ports(&ports)));
+    } else {
+        messages.push(format!(
+            "主机端口可能已被占用: {}。如果这是当前应用已有容器占用，Compose 会自行重建；否则部署可能失败。",
+            join_ports(&occupied_ports)
+        ));
+    }
+    Ok(LocalPreflightResult { messages })
+}
+
+fn ensure_directory_writable(work_dir: &Path) -> Result<(), AppError> {
+    let probe_path = work_dir.join(".easy-deploy-write-test");
+    File::create(&probe_path)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| {
+            AppError::InvalidInput(format!(
+                "工作目录不可写: {}: {err}",
+                work_dir.to_string_lossy()
+            ))
+        })?;
+    fs::remove_file(&probe_path).map_err(|err| {
+        AppError::InvalidInput(format!(
+            "工作目录写入探针清理失败: {}: {err}",
+            probe_path.to_string_lossy()
+        ))
+    })?;
+    Ok(())
+}
+
+fn parse_compose_host_ports(compose_content: &str) -> Result<Vec<u16>, AppError> {
+    let value = serde_yaml::from_str::<Value>(compose_content)
+        .map_err(|err| AppError::InvalidInput(format!("Compose YAML 解析失败: {err}")))?;
+    let mut ports = Vec::new();
+    let Some(services) = value.get("services").and_then(Value::as_mapping) else {
+        return Ok(ports);
+    };
+    for service in services.values() {
+        let Some(port_entries) = service.get("ports").and_then(Value::as_sequence) else {
+            continue;
+        };
+        for entry in port_entries {
+            match entry {
+                Value::Number(number) => {
+                    if let Some(port) = number.as_u64().and_then(to_port) {
+                        ports.push(port);
+                    }
+                }
+                Value::String(value) => {
+                    if let Some(port) = parse_compose_port_string(value) {
+                        ports.push(port);
+                    }
+                }
+                Value::Mapping(mapping) => {
+                    if let Some(port) = mapping
+                        .get(Value::String("published".to_owned()))
+                        .and_then(value_to_port)
+                    {
+                        ports.push(port);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    Ok(ports)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedService {
+    name: String,
+    image: String,
+    ports: String,
+    replicas: String,
+}
+
+fn parse_compose_services(compose_content: &str) -> Result<Vec<ParsedService>, AppError> {
+    if compose_content.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let value = serde_yaml::from_str::<Value>(compose_content)
+        .map_err(|err| AppError::InvalidInput(format!("Compose YAML 解析失败: {err}")))?;
+    let Some(services) = value.get("services").and_then(Value::as_mapping) else {
+        return Ok(Vec::new());
+    };
+    let mut parsed = Vec::new();
+    for (name, service) in services {
+        let Some(name) = name.as_str() else {
+            continue;
+        };
+        let image = service
+            .get("image")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("未配置镜像")
+            .to_owned();
+        parsed.push(ParsedService {
+            name: name.to_owned(),
+            image,
+            ports: parse_service_ports(service),
+            replicas: parse_service_replicas(service),
+        });
+    }
+    parsed.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(parsed)
+}
+
+fn parse_service_ports(service: &Value) -> String {
+    let Some(entries) = service.get("ports").and_then(Value::as_sequence) else {
+        return "未声明端口".to_owned();
+    };
+    let ports = entries
+        .iter()
+        .filter_map(render_compose_port)
+        .collect::<Vec<_>>();
+    if ports.is_empty() {
+        "未声明端口".to_owned()
+    } else {
+        ports.join(", ")
+    }
+}
+
+fn render_compose_port(value: &Value) -> Option<String> {
+    match value {
+        Value::Number(number) => number.as_u64().map(|port| port.to_string()),
+        Value::String(value) => Some(value.clone()),
+        Value::Mapping(mapping) => {
+            let target = mapping
+                .get(Value::String("target".to_owned()))
+                .and_then(value_to_port);
+            let published = mapping
+                .get(Value::String("published".to_owned()))
+                .and_then(value_to_port);
+            match (published, target) {
+                (Some(published), Some(target)) => Some(format!("{published}:{target}")),
+                (None, Some(target)) => Some(target.to_string()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_service_replicas(service: &Value) -> String {
+    service
+        .get("deploy")
+        .and_then(|deploy| deploy.get("replicas"))
+        .and_then(Value::as_i64)
+        .filter(|replicas| *replicas > 0)
+        .map(|replicas| replicas.to_string())
+        .unwrap_or_else(|| "1".to_owned())
+}
+
+fn value_to_port(value: &Value) -> Option<u16> {
+    match value {
+        Value::Number(number) => number.as_u64().and_then(to_port),
+        Value::String(value) => parse_port(value),
+        _ => None,
+    }
+}
+
+fn parse_compose_port_string(value: &str) -> Option<u16> {
+    let first_part = value.split('/').next().unwrap_or(value);
+    if !first_part.contains(':') {
+        return None;
+    }
+    let host_part = first_part.rsplit(':').nth(1).unwrap_or(first_part);
+    let port_part = host_part.split('-').next().unwrap_or(host_part);
+    parse_port(port_part)
+}
+
+fn parse_port(value: &str) -> Option<u16> {
+    value.trim().parse::<u16>().ok().filter(|port| *port > 0)
+}
+
+fn to_port(value: u64) -> Option<u16> {
+    u16::try_from(value).ok().filter(|port| *port > 0)
+}
+
+fn occupied_ports(ports: &[u16]) -> Vec<u16> {
+    ports
+        .iter()
+        .copied()
+        .filter(|port| TcpListener::bind(("127.0.0.1", *port)).is_err())
+        .collect()
+}
+
+fn join_ports(ports: &[u16]) -> String {
+    ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn human_bytes(value: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    if value >= GIB {
+        format!("{:.1} GiB", value as f64 / GIB as f64)
+    } else {
+        format!("{:.1} MiB", value as f64 / MIB as f64)
+    }
+}
+
+fn friendly_command_error(value: &str, fallback: &str) -> String {
+    let lines = value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("time=\""))
+        .map(strip_common_error_prefix)
+        .take(3)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        fallback.to_owned()
+    } else {
+        lines.join("；")
+    }
+}
+
+async fn record_deploy_config_snapshot(
+    db: &SqlitePool,
+    app_id: i64,
+    work_dir: &Path,
+    source: &str,
+    version: &str,
+) -> Result<(), AppError> {
+    let compose_content = fs::read_to_string(work_dir.join("compose.yaml")).unwrap_or_default();
+    let env_content = fs::read_to_string(work_dir.join(".env")).unwrap_or_default();
+    sqlx::query(
+        r#"
+        INSERT INTO app_config_snapshots(
+            app_id,
+            snapshot_kind,
+            compose_content,
+            env_content,
+            metadata
+        )
+        VALUES (?1, 'deploy', ?2, ?3, ?4)
+        "#,
+    )
+    .bind(app_id)
+    .bind(compose_content)
+    .bind(env_content)
+    .bind(format!(
+        "{{\"source\":\"{}\",\"version\":\"{}\",\"runtime\":\"file\",\"runtime_root\":\"{}\"}}",
+        json_escape(source),
+        json_escape(version),
+        json_escape(&work_dir.to_string_lossy())
+    ))
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn promote_binary_active_slot(
+    db: &SqlitePool,
+    runtime_fs: &RuntimeFs,
+    job: &BinaryTaskJob,
+    work_dir: &Path,
+    slot: &str,
+) -> Result<(), AppError> {
+    update_binary_active_slot(db, job.app_id, slot).await?;
+
+    let app = fetch_app_detail_by_id(db, job.app_id).await?;
+    let mut binary_config = fetch_binary_config_for_app(db, job.app_id).await?;
+    binary_config.active_slot = slot.to_owned();
+    let target_nodes = target_node_metadata_for_app(db, job.app_id).await?;
+    let metadata_content = render_runtime_metadata(
+        &app,
+        target_nodes,
+        &work_dir.to_string_lossy(),
+        Some(&binary_config),
+    );
+    runtime_fs
+        .save_app_runtime_files(
+            &app.app_key,
+            "",
+            &binary_config.env_content,
+            &metadata_content,
+        )
+        .await?;
+    runtime_fs
+        .save_binary_runtime_files(to_binary_runtime_config(
+            app.id,
+            &app.app_key,
+            &app.name,
+            &binary_config,
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn update_binary_active_slot(
+    db: &SqlitePool,
+    app_id: i64,
+    slot: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        UPDATE app_binary_configs
+        SET active_slot = ?2,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE app_id = ?1
+        "#,
+    )
+    .bind(app_id)
+    .bind(slot)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn fetch_app_detail_by_id(db: &SqlitePool, app_id: i64) -> Result<AppDetailItem, AppError> {
+    sqlx::query_as::<_, AppDetailItem>(
+        r#"
+        SELECT
+            a.id,
+            a.app_key,
+            a.name,
+            a.description,
+            a.app_type,
+            a.deploy_mode,
+            a.deploy_strategy,
+            a.work_dir,
+            a.status,
+            GROUP_CONCAT(n.name, '、') AS target_names,
+            COUNT(t.node_id) AS target_count,
+            a.created_at,
+            a.updated_at
+        FROM apps a
+        LEFT JOIN app_targets t ON t.app_id = a.id
+        LEFT JOIN nodes n ON n.id = t.node_id
+        WHERE a.id = ?1
+        GROUP BY a.id
+        "#,
+    )
+    .bind(app_id)
+    .fetch_one(db)
+    .await
+    .map_err(AppError::from)
+}
+
+async fn fetch_binary_config_for_app(
+    db: &SqlitePool,
+    app_id: i64,
+) -> Result<BinaryConfigItem, AppError> {
+    sqlx::query_as::<_, BinaryConfigItem>(
+        r#"
+        SELECT
+            service_name,
+            artifact_version,
+            artifact_path,
+            exec_args,
+            working_dir,
+            service_user,
+            unit_name,
+            release_strategy,
+            active_slot,
+            base_port,
+            standby_port,
+            proxy_enabled,
+            proxy_kind,
+            proxy_domain,
+            proxy_config_path,
+            env_content
+        FROM app_binary_configs
+        WHERE app_id = ?1
+        "#,
+    )
+    .bind(app_id)
+    .fetch_one(db)
+    .await
+    .map_err(AppError::from)
+}
+
+async fn target_node_metadata_for_app(
+    db: &SqlitePool,
+    app_id: i64,
+) -> Result<Vec<TargetNodeMetadata>, AppError> {
+    #[derive(sqlx::FromRow)]
+    struct TargetNodeMetadataRow {
+        node_key: String,
+        name: String,
+    }
+
+    sqlx::query_as::<_, TargetNodeMetadataRow>(
+        r#"
+        SELECT
+            n.node_key,
+            n.name
+        FROM nodes n
+        JOIN app_targets t ON t.node_id = n.id
+        WHERE t.app_id = ?1
+        ORDER BY n.id
+        "#,
+    )
+    .bind(app_id)
+    .fetch_all(db)
+    .await
+    .map(|nodes| {
+        nodes
+            .into_iter()
+            .map(|node| TargetNodeMetadata {
+                node_key: node.node_key,
+                name: node.name,
+            })
+            .collect()
+    })
+    .map_err(AppError::from)
+}
+
+async fn update_app_status_best_effort(db: &SqlitePool, app_id: i64, status: &str) {
+    if let Err(err) = update_app_status_in_db(db, app_id, status).await {
+        warn!(
+            app_id,
+            status,
+            error = %err,
+            "failed to update app status from compose task"
+        );
+    }
+}
+
+struct RuntimeStatesUpdate<'a> {
+    db: &'a SqlitePool,
+    app_id: i64,
+    runtime_status: &'a str,
+    service_count: Option<i64>,
+    active_version: Option<&'a str>,
+    message: &'a str,
+    task_id: Option<i64>,
+    touch_deploy_time: bool,
+}
+
+async fn update_runtime_states_best_effort(update: RuntimeStatesUpdate<'_>) {
+    if let Err(err) = update_runtime_states_in_db(&update).await {
+        warn!(
+            app_id = update.app_id,
+            runtime_status = update.runtime_status,
+            error = %err,
+            "failed to update app runtime states"
+        );
+    }
+}
+
+struct RuntimeStateUpdate<'a> {
+    db: &'a SqlitePool,
+    app_id: i64,
+    node_id: i64,
+    runtime_status: &'a str,
+    service_count: Option<i64>,
+    active_version: Option<&'a str>,
+    message: &'a str,
+    task_id: Option<i64>,
+    touch_deploy_time: bool,
+}
+
+async fn update_runtime_state_for_node_best_effort(update: RuntimeStateUpdate<'_>) {
+    if let Err(err) = update_runtime_state_for_node_in_db(&update).await {
+        warn!(
+            app_id = update.app_id,
+            node_id = update.node_id,
+            runtime_status = update.runtime_status,
+            error = %err,
+            "failed to update node runtime state"
+        );
+    }
+}
+
+async fn record_task_node_result_best_effort(
+    tasks: &TaskService,
+    task_id: i64,
+    node: &AppTargetNode,
+    status: &str,
+    message: &str,
+    command_count: usize,
+) {
+    if let Err(err) = tasks
+        .record_node_result(TaskNodeResultInput {
+            task_id,
+            node_id: node.id,
+            node_name: &node.name,
+            node_key: &node.node_key,
+            node_type: &node.node_type,
+            status,
+            message,
+            command_count: command_count as i64,
+        })
+        .await
+    {
+        warn!(
+            task_id,
+            node_id = node.id,
+            status,
+            error = %err,
+            "failed to record task node result"
+        );
+    }
+}
+
+async fn mark_unexecuted_nodes_after_failure(
+    tasks: &TaskService,
+    task_id: i64,
+    db: &SqlitePool,
+    app_id: i64,
+    target_nodes: &[AppTargetNode],
+    stop_after_node_id: Option<i64>,
+    node_messages: &mut Vec<String>,
+) {
+    let Some(failed_node_id) = stop_after_node_id else {
+        return;
+    };
+    let mut mark_remaining = false;
+    for node in target_nodes {
+        if mark_remaining {
+            let message = "前序节点失败，未执行本次任务";
+            record_task_node_result_best_effort(tasks, task_id, node, "skipped", message, 0).await;
+            node_messages.push(format!("{}: {message}", node.name));
+            update_runtime_state_for_node_best_effort(RuntimeStateUpdate {
+                db,
+                app_id,
+                node_id: node.id,
+                runtime_status: "unknown",
+                service_count: None,
+                active_version: None,
+                message,
+                task_id: Some(task_id),
+                touch_deploy_time: false,
+            })
+            .await;
+        }
+        if node.id == failed_node_id {
+            mark_remaining = true;
+        }
+    }
+}
+
+async fn update_runtime_states_in_db(update: &RuntimeStatesUpdate<'_>) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE app_runtime_states
+        SET runtime_status = ?2,
+            service_count = COALESCE(?3, service_count),
+            active_version = COALESCE(?4, active_version),
+            message = ?5,
+            last_task_id = COALESCE(?6, last_task_id),
+            last_deploy_at = CASE
+                WHEN ?7 THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                ELSE last_deploy_at
+            END,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE app_id = ?1
+        "#,
+    )
+    .bind(update.app_id)
+    .bind(update.runtime_status)
+    .bind(update.service_count)
+    .bind(update.active_version)
+    .bind(update.message)
+    .bind(update.task_id)
+    .bind(update.touch_deploy_time)
+    .execute(update.db)
+    .await?;
+    Ok(())
+}
+
+async fn update_runtime_state_for_node_in_db(
+    update: &RuntimeStateUpdate<'_>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE app_runtime_states
+        SET runtime_status = ?3,
+            service_count = COALESCE(?4, service_count),
+            active_version = COALESCE(?5, active_version),
+            message = ?6,
+            last_task_id = COALESCE(?7, last_task_id),
+            last_deploy_at = CASE
+                WHEN ?8 THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                ELSE last_deploy_at
+            END,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE app_id = ?1
+          AND node_id = ?2
+        "#,
+    )
+    .bind(update.app_id)
+    .bind(update.node_id)
+    .bind(update.runtime_status)
+    .bind(update.service_count)
+    .bind(update.active_version)
+    .bind(update.message)
+    .bind(update.task_id)
+    .bind(update.touch_deploy_time)
+    .execute(update.db)
+    .await?;
+    Ok(())
+}
+
+async fn upsert_binary_config(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    app_id: i64,
+    config: &BinaryConfigItem,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO app_binary_configs(
+            app_id,
+            service_name,
+            artifact_version,
+            artifact_path,
+            exec_args,
+            working_dir,
+            service_user,
+            unit_name,
+            release_strategy,
+            active_slot,
+            base_port,
+            standby_port,
+            proxy_enabled,
+            proxy_kind,
+            proxy_domain,
+            proxy_config_path,
+            env_content,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        ON CONFLICT(app_id) DO UPDATE SET
+            service_name = excluded.service_name,
+            artifact_version = excluded.artifact_version,
+            artifact_path = excluded.artifact_path,
+            exec_args = excluded.exec_args,
+            working_dir = excluded.working_dir,
+            service_user = excluded.service_user,
+            unit_name = excluded.unit_name,
+            release_strategy = excluded.release_strategy,
+            active_slot = excluded.active_slot,
+            base_port = excluded.base_port,
+            standby_port = excluded.standby_port,
+            proxy_enabled = excluded.proxy_enabled,
+            proxy_kind = excluded.proxy_kind,
+            proxy_domain = excluded.proxy_domain,
+            proxy_config_path = excluded.proxy_config_path,
+            env_content = excluded.env_content,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        "#,
+    )
+    .bind(app_id)
+    .bind(&config.service_name)
+    .bind(&config.artifact_version)
+    .bind(&config.artifact_path)
+    .bind(&config.exec_args)
+    .bind(&config.working_dir)
+    .bind(&config.service_user)
+    .bind(&config.unit_name)
+    .bind(&config.release_strategy)
+    .bind(&config.active_slot)
+    .bind(config.base_port)
+    .bind(config.standby_port)
+    .bind(config.proxy_enabled)
+    .bind(&config.proxy_kind)
+    .bind(&config.proxy_domain)
+    .bind(&config.proxy_config_path)
+    .bind(&config.env_content)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO binary_artifacts(
+            app_id,
+            version,
+            artifact_path,
+            artifact_kind,
+            status,
+            metadata
+        )
+        VALUES (?1, ?2, ?3, 'binary', 'registered', ?4)
+        ON CONFLICT(app_id, version) DO UPDATE SET
+            artifact_path = excluded.artifact_path,
+            status = 'registered',
+            metadata = excluded.metadata
+        "#,
+    )
+    .bind(app_id)
+    .bind(&config.artifact_version)
+    .bind(&config.artifact_path)
+    .bind(format!(
+        "{{\"source\":\"manual\",\"unit_name\":\"{}\"}}",
+        json_escape(&config.unit_name)
+    ))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn prune_uploaded_binary_releases(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    app_id: i64,
+    active_version: &str,
+    releases_to_keep: usize,
+) -> Result<Vec<String>, AppError> {
+    let rows = sqlx::query_as::<_, BinaryArtifactItem>(
+        r#"
+        SELECT id, version, artifact_path, artifact_kind, status, metadata, created_at
+        FROM binary_artifacts
+        WHERE app_id = ?1
+          AND status != 'disabled'
+        ORDER BY created_at DESC, id DESC
+        "#,
+    )
+    .bind(app_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let (prune_ids, pruned_versions) =
+        select_uploaded_binary_release_prunes(&rows, active_version, releases_to_keep);
+
+    for artifact_id in prune_ids {
+        sqlx::query(
+            r#"
+            UPDATE binary_artifacts
+            SET status = 'disabled'
+            WHERE id = ?1
+            "#,
+        )
+        .bind(artifact_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    Ok(pruned_versions)
+}
+
+fn select_uploaded_binary_release_prunes(
+    rows: &[BinaryArtifactItem],
+    active_version: &str,
+    releases_to_keep: usize,
+) -> (Vec<i64>, Vec<String>) {
+    let releases_to_keep = releases_to_keep.max(1);
+    let mut seen_uploads = 0usize;
+    let mut prune_ids = Vec::new();
+    let mut pruned_versions = Vec::new();
+    for row in rows {
+        if row.metadata_value("source") != "upload" {
+            continue;
+        }
+        seen_uploads += 1;
+        if row.version == active_version {
+            continue;
+        }
+        if seen_uploads > releases_to_keep {
+            prune_ids.push(row.id);
+            pruned_versions.push(row.version.clone());
+        }
+    }
+    (prune_ids, pruned_versions)
+}
+
+fn cleanup_pruned_binary_release_dirs(
+    runtime_root: &Path,
+    versions: &[String],
+) -> Result<(), AppError> {
+    for version in versions {
+        let release_dir = runtime_root.join("releases").join(version);
+        match fs::remove_dir_all(&release_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(AppError::Internal(format!(
+                    "清理旧二进制版本目录 {} 失败: {err}",
+                    release_dir.to_string_lossy()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn runtime_service_count(work_dir: &Path) -> i64 {
+    let compose_path = work_dir.join("compose.yaml");
+    match fs::read_to_string(compose_path) {
+        Ok(content) => parse_compose_services(&content)
+            .map(|services| services.len() as i64)
+            .unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+fn build_deploy_diff(
+    app: &AppDetailItem,
+    compose_content: &str,
+    env_content: &str,
+    binary_config: &BinaryConfigItem,
+    baseline: Option<&AppConfigSnapshotItem>,
+) -> AppDeployDiff {
+    let Some(baseline) = baseline else {
+        return AppDeployDiff {
+            baseline_snapshot_id: None,
+            baseline_created_at: None,
+            status: AppDeployDiffStatus::NoBaseline,
+            rows: Vec::new(),
+        };
+    };
+
+    let mut rows = Vec::new();
+    rows.push(diff_row(
+        "Compose",
+        compose_content,
+        &baseline.compose_content,
+        summarize_config_content,
+    ));
+    rows.push(diff_row(
+        "环境变量",
+        env_content,
+        &baseline.env_content,
+        summarize_config_content,
+    ));
+
+    if app.app_type == "binary" {
+        let baseline_binary = binary_config_from_metadata(&baseline.metadata);
+        rows.push(diff_row(
+            "制品版本",
+            &binary_config.artifact_version,
+            &baseline_binary.artifact_version,
+            summarize_inline_value,
+        ));
+        rows.push(diff_row(
+            "制品路径",
+            &binary_config.artifact_path,
+            &baseline_binary.artifact_path,
+            summarize_inline_value,
+        ));
+        rows.push(diff_row(
+            "启动参数",
+            &binary_config.exec_args,
+            &baseline_binary.exec_args,
+            summarize_inline_value,
+        ));
+        rows.push(diff_row(
+            "运行用户",
+            &binary_config.service_user,
+            &baseline_binary.service_user,
+            summarize_inline_value,
+        ));
+        rows.push(diff_row(
+            "Unit 名称",
+            &binary_config.unit_name,
+            &baseline_binary.unit_name,
+            summarize_inline_value,
+        ));
+    }
+
+    let changed = rows.iter().any(|row| row.changed);
+    AppDeployDiff {
+        baseline_snapshot_id: Some(baseline.id),
+        baseline_created_at: Some(baseline.created_at.clone()),
+        status: if changed {
+            AppDeployDiffStatus::Changed
+        } else {
+            AppDeployDiffStatus::Unchanged
+        },
+        rows,
+    }
+}
+
+fn diff_row(
+    label: &'static str,
+    current: &str,
+    baseline: &str,
+    summarize: fn(&str) -> String,
+) -> AppDeployDiffRow {
+    let normalized_current = normalize_diff_text(current);
+    let normalized_baseline = normalize_diff_text(baseline);
+    AppDeployDiffRow {
+        label,
+        current_summary: summarize(&normalized_current),
+        baseline_summary: summarize(&normalized_baseline),
+        current_preview: diff_preview(&normalized_current),
+        baseline_preview: diff_preview(&normalized_baseline),
+        changed: normalized_current != normalized_baseline,
+    }
+}
+
+fn normalize_diff_text(value: &str) -> String {
+    value.trim().replace("\r\n", "\n")
+}
+
+fn summarize_config_content(value: &str) -> String {
+    if value.trim().is_empty() {
+        return "空".to_owned();
+    }
+    let line_count = value.lines().filter(|line| !line.trim().is_empty()).count();
+    let first_line = value
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.ends_with(':'))
+        .or_else(|| value.lines().map(str::trim).find(|line| !line.is_empty()))
+        .unwrap_or("空")
+        .chars()
+        .take(80)
+        .collect::<String>();
+    format!("{line_count} 行 · {first_line}")
+}
+
+fn summarize_inline_value(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        "空".to_owned()
+    } else {
+        value.chars().take(80).collect()
+    }
+}
+
+fn diff_preview(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return "空".to_owned();
+    }
+    let mut output = value
+        .lines()
+        .take(12)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .chars()
+        .take(1200)
+        .collect::<String>();
+    let truncated_by_lines = value.lines().count() > 12;
+    let truncated_by_chars = value.chars().count() > output.chars().count();
+    if truncated_by_lines || truncated_by_chars {
+        output.push_str("\n...");
+    }
+    output
+}
+
+fn binary_config_from_metadata(metadata: &str) -> BinaryConfigItem {
+    let Ok(value) = serde_yaml::from_str::<Value>(metadata) else {
+        return BinaryConfigItem::default();
+    };
+    let Some(binary) = value.get("binary") else {
+        return BinaryConfigItem::default();
+    };
+    BinaryConfigItem {
+        service_name: yaml_string(binary, "service_name"),
+        artifact_version: yaml_string(binary, "artifact_version"),
+        artifact_path: yaml_string(binary, "artifact_path"),
+        exec_args: yaml_string(binary, "exec_args"),
+        working_dir: yaml_string(binary, "working_dir"),
+        service_user: yaml_string(binary, "service_user"),
+        unit_name: yaml_string(binary, "unit_name"),
+        release_strategy: yaml_string(binary, "release_strategy"),
+        active_slot: yaml_string(binary, "active_slot"),
+        base_port: yaml_i64(binary, "base_port"),
+        standby_port: yaml_i64(binary, "standby_port"),
+        proxy_enabled: if yaml_bool(binary, "proxy_enabled") {
+            1
+        } else {
+            0
+        },
+        proxy_kind: yaml_string(binary, "proxy_kind"),
+        proxy_domain: yaml_string(binary, "proxy_domain"),
+        proxy_config_path: yaml_string(binary, "proxy_config_path"),
+        env_content: String::new(),
+    }
+}
+
+fn yaml_string(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn yaml_i64(value: &Value, key: &str) -> i64 {
+    value.get(key).and_then(Value::as_i64).unwrap_or_default()
+}
+
+fn yaml_bool(value: &Value, key: &str) -> bool {
+    value.get(key).and_then(Value::as_bool).unwrap_or_default()
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct AppListItem {
+    pub id: i64,
+    pub app_key: String,
+    pub name: String,
+    pub description: String,
+    pub app_type: String,
+    pub deploy_mode: String,
+    pub deploy_strategy: String,
+    pub work_dir: String,
+    pub status: String,
+    pub target_names: Option<String>,
+    pub target_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct AppDetailItem {
+    pub id: i64,
+    pub app_key: String,
+    pub name: String,
+    pub description: String,
+    pub app_type: String,
+    pub deploy_mode: String,
+    pub deploy_strategy: String,
+    pub work_dir: String,
+    pub status: String,
+    pub target_names: Option<String>,
+    pub target_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+pub struct AppStatusChange {
+    pub app_id: i64,
+    pub app_name: String,
+    pub previous_status: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AppConfigDetail {
+    pub app: AppDetailItem,
+    pub runtime_root: String,
+    pub compose_content: String,
+    pub env_content: String,
+    pub metadata_content: String,
+    pub service_names: Vec<String>,
+    pub binary_runtime: BinaryRuntimeFiles,
+    pub health_check: HealthCheckConfig,
+    pub deployment_runs: Vec<AppDeploymentRunItem>,
+    pub config_snapshots: Vec<AppConfigSnapshotItem>,
+    pub deploy_diff: AppDeployDiff,
+    pub runtime_states: Vec<AppRuntimeStateItem>,
+    pub target_nodes: Vec<AppTargetSummaryItem>,
+    pub target_choices: Vec<AppTargetChoiceItem>,
+    pub binary_config: BinaryConfigItem,
+    pub binary_releases: Vec<BinaryArtifactItem>,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct AppDeploymentRunItem {
+    pub id: i64,
+    pub task_id: Option<i64>,
+    pub task_title: Option<String>,
+    pub deploy_action: String,
+    pub status: String,
+    pub message: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct AppConfigSnapshotItem {
+    pub id: i64,
+    pub snapshot_kind: String,
+    pub compose_content: String,
+    pub env_content: String,
+    pub metadata: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AppDeployDiff {
+    pub baseline_snapshot_id: Option<i64>,
+    pub baseline_created_at: Option<String>,
+    pub status: AppDeployDiffStatus,
+    pub rows: Vec<AppDeployDiffRow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppDeployDiffStatus {
+    NoBaseline,
+    Unchanged,
+    Changed,
+}
+
+#[derive(Clone, Debug)]
+pub struct AppDeployDiffRow {
+    pub label: &'static str,
+    pub current_summary: String,
+    pub baseline_summary: String,
+    pub current_preview: String,
+    pub baseline_preview: String,
+    pub changed: bool,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct AppRuntimeStateItem {
+    pub node_id: i64,
+    pub node_name: String,
+    pub node_key: String,
+    pub runtime_status: String,
+    pub active_version: String,
+    pub service_count: i64,
+    pub message: String,
+    pub last_task_id: Option<i64>,
+    pub last_task_status: Option<String>,
+    pub last_task_kind: Option<String>,
+    pub last_deploy_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct AppTargetChoiceItem {
+    pub id: i64,
+    pub name: String,
+    pub node_key: String,
+    pub checked: bool,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct AppTargetSummaryItem {
+    pub id: i64,
+    pub name: String,
+    pub node_key: String,
+    pub node_type: String,
+    pub status: String,
+    pub docker_status: String,
+    pub capability_status: String,
+    pub docker_available: i64,
+    pub compose_available: i64,
+    pub systemd_available: i64,
+    pub caddy_available: i64,
+    pub nginx_available: i64,
+    pub capability_message: String,
+}
+
+#[derive(Clone, Debug, Default, sqlx::FromRow)]
+pub struct BinaryConfigItem {
+    pub service_name: String,
+    pub artifact_version: String,
+    pub artifact_path: String,
+    pub exec_args: String,
+    pub working_dir: String,
+    pub service_user: String,
+    pub unit_name: String,
+    pub release_strategy: String,
+    pub active_slot: String,
+    pub base_port: i64,
+    pub standby_port: i64,
+    pub proxy_enabled: i64,
+    pub proxy_kind: String,
+    pub proxy_domain: String,
+    pub proxy_config_path: String,
+    pub env_content: String,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct BinaryArtifactItem {
+    pub id: i64,
+    pub version: String,
+    pub artifact_path: String,
+    pub artifact_kind: String,
+    pub status: String,
+    pub metadata: String,
+    pub created_at: String,
+}
+
+impl BinaryArtifactItem {
+    pub fn metadata_value(&self, key: &str) -> String {
+        artifact_metadata_value(&self.metadata, key)
+    }
+}
+
+pub struct BinaryRollbackResult {
+    pub task_id: i64,
+    pub version: String,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct ArtifactListItem {
+    pub id: i64,
+    pub app_id: i64,
+    pub app_name: String,
+    pub app_key: String,
+    pub version: String,
+    pub artifact_path: String,
+    pub artifact_kind: String,
+    pub status: String,
+    pub metadata: String,
+    pub created_at: String,
+}
+
+impl ArtifactListItem {
+    pub fn metadata_value(&self, key: &str) -> String {
+        artifact_metadata_value(&self.metadata, key)
+    }
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct AppNodeOption {
+    pub id: i64,
+    pub name: String,
+    pub node_key: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServiceListItem {
+    pub app_id: i64,
+    pub app_name: String,
+    pub app_key: String,
+    pub service_name: String,
+    pub service_kind: String,
+    pub image: String,
+    pub ports: String,
+    pub replicas: String,
+    pub target_names: String,
+    pub app_status: String,
+    pub runtime_status: String,
+    pub runtime_summary: String,
+    pub active_version: String,
+    pub health_check: HealthCheckConfig,
+    pub health_check_detail: String,
+    pub last_health_message: String,
+    pub last_health_at: String,
+    pub updated_at: String,
+    pub target_nodes: Vec<ServiceTargetNodeItem>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServiceTargetNodeItem {
+    pub id: i64,
+    pub name: String,
+    pub node_key: String,
+    pub runtime_status: String,
+    pub active_version: String,
+    pub service_count: i64,
+    pub message: String,
+    pub last_task_id: Option<i64>,
+    pub last_task_status: Option<String>,
+    pub last_task_kind: Option<String>,
+    pub last_deploy_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServiceLogOutput {
+    pub command_output: ComposeCommandOutput,
+    pub node: ServiceTargetNodeItem,
+    pub target_nodes: Vec<ServiceTargetNodeItem>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CreateAppInput {
+    pub app_key: String,
+    pub name: String,
+    pub description: String,
+    pub app_type: String,
+    pub deploy_strategy: String,
+    pub work_dir: String,
+    pub target_node_ids: Vec<i64>,
+    pub compose_content: String,
+    pub env_content: String,
+    pub binary_artifact_version: String,
+    pub binary_artifact_path: String,
+    pub binary_exec_args: String,
+    pub binary_service_user: String,
+    pub binary_unit_name: String,
+    pub binary_release_strategy: String,
+    pub binary_active_slot: String,
+    pub binary_base_port: i64,
+    pub binary_standby_port: i64,
+    pub binary_proxy_enabled: bool,
+    pub binary_proxy_kind: String,
+    pub binary_proxy_domain: String,
+    pub binary_proxy_config_path: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct UpdateAppConfigInput {
+    pub app_id: i64,
+    pub compose_content: String,
+    pub env_content: String,
+    pub binary_artifact_version: String,
+    pub binary_artifact_path: String,
+    pub binary_exec_args: String,
+    pub binary_service_user: String,
+    pub binary_unit_name: String,
+    pub binary_release_strategy: String,
+    pub binary_active_slot: String,
+    pub binary_base_port: i64,
+    pub binary_standby_port: i64,
+    pub binary_proxy_enabled: bool,
+    pub binary_proxy_kind: String,
+    pub binary_proxy_domain: String,
+    pub binary_proxy_config_path: String,
+    pub health_check: HealthCheckConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct UpdateAppMetadataInput {
+    pub app_id: i64,
+    pub name: String,
+    pub description: String,
+    pub work_dir: String,
+    pub deploy_strategy: String,
+    pub target_node_ids: Vec<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct UploadBinaryArtifactInput {
+    pub app_id: i64,
+    pub artifact_version: String,
+    pub file_name: String,
+    pub bytes: Vec<u8>,
+    pub entry_file: String,
+}
+
+struct NormalizeBinaryConfigInput<'a> {
+    app_key: &'a str,
+    work_dir: &'a str,
+    artifact_version: &'a str,
+    artifact_path: &'a str,
+    exec_args: &'a str,
+    service_user: &'a str,
+    unit_name: &'a str,
+    release_strategy: &'a str,
+    active_slot: &'a str,
+    base_port: i64,
+    standby_port: i64,
+    proxy_enabled: bool,
+    proxy_kind: &'a str,
+    proxy_domain: &'a str,
+    proxy_config_path: &'a str,
+    env_content: &'a str,
+}
+
+impl AppService {
+    pub fn new(
+        db: SqlitePool,
+        runtime_fs: RuntimeFs,
+        compose: ComposeExecutor,
+        systemd: SystemdExecutor,
+        tasks: TaskService,
+        platform: PlatformConfigService,
+    ) -> Self {
+        let compose_queue = ComposeTaskQueue::start(
+            db.clone(),
+            runtime_fs.clone(),
+            compose.clone(),
+            systemd.clone(),
+            tasks.clone(),
+        );
+        let binary_queue = BinaryTaskQueue::start(
+            db.clone(),
+            runtime_fs.clone(),
+            compose.clone(),
+            systemd.clone(),
+            tasks.clone(),
+        );
+        Self {
+            db,
+            runtime_fs,
+            compose,
+            systemd,
+            tasks,
+            compose_queue,
+            binary_queue,
+            platform,
+        }
+    }
+
+    pub async fn list_apps(&self) -> Result<Vec<AppListItem>, AppError> {
+        sqlx::query_as::<_, AppListItem>(
+            r#"
+            SELECT
+                a.id,
+                a.app_key,
+                a.name,
+                a.description,
+                a.app_type,
+                a.deploy_mode,
+                a.deploy_strategy,
+                a.work_dir,
+                a.status,
+                group_concat(n.name, '、') AS target_names,
+                COUNT(n.id) AS target_count,
+                a.created_at,
+                a.updated_at
+            FROM apps a
+            LEFT JOIN app_targets t ON t.app_id = a.id
+            LEFT JOIN nodes n ON n.id = t.node_id
+            GROUP BY a.id
+            ORDER BY a.id DESC
+            "#,
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(AppError::from)
+    }
+
+    pub async fn node_options(&self) -> Result<Vec<AppNodeOption>, AppError> {
+        sqlx::query_as::<_, AppNodeOption>(
+            r#"
+            SELECT id, name, node_key
+            FROM nodes
+            WHERE status != 'disabled'
+            ORDER BY CASE node_key WHEN 'local' THEN 0 ELSE 1 END, id DESC
+            "#,
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(AppError::from)
+    }
+
+    pub async fn app_detail(&self, app_id: i64) -> Result<AppConfigDetail, AppError> {
+        let app = self.fetch_app_detail(app_id).await?;
+        let runtime_files = self.runtime_fs.load_app_config(&app.app_key).await?;
+        let service_names = if app.app_type == "compose" {
+            parse_compose_services(&runtime_files.compose_content)?
+                .into_iter()
+                .map(|service| service.name)
+                .collect::<Vec<_>>()
+        } else {
+            vec![app.app_key.clone()]
+        };
+        let health_check = load_health_check_config(&self.db, app.id).await?;
+        let deployment_runs = self.list_app_deployment_runs(app.id).await?;
+        let config_snapshots = self.list_app_config_snapshots(app.id).await?;
+        let deploy_snapshot = self.latest_deploy_snapshot(app.id).await?;
+        let runtime_states = self.list_app_runtime_states(app.id).await?;
+        let target_nodes = self.list_app_target_summaries(app.id).await?;
+        let target_choices = self.list_app_target_choices(app.id).await?;
+        let binary_config = self.load_binary_config(&app).await?;
+        let binary_releases = if app.app_type == "binary" {
+            self.list_binary_artifacts(app.id).await?
+        } else {
+            Vec::new()
+        };
+        let binary_runtime = if app.app_type == "binary" {
+            self.runtime_fs
+                .load_binary_runtime_files(
+                    &app.app_key,
+                    &binary_config.unit_name,
+                    &binary_config.artifact_version,
+                )
+                .await?
+        } else {
+            BinaryRuntimeFiles::default()
+        };
+        let deploy_diff = build_deploy_diff(
+            &app,
+            &runtime_files.compose_content,
+            &runtime_files.env_content,
+            &binary_config,
+            deploy_snapshot.as_ref(),
+        );
+
+        Ok(AppConfigDetail {
+            app,
+            runtime_root: runtime_files.root_dir.to_string_lossy().to_string(),
+            compose_content: runtime_files.compose_content,
+            env_content: runtime_files.env_content,
+            metadata_content: runtime_files.metadata_content,
+            service_names,
+            binary_runtime,
+            health_check,
+            deployment_runs,
+            config_snapshots,
+            deploy_diff,
+            runtime_states,
+            target_nodes,
+            target_choices,
+            binary_config,
+            binary_releases,
+        })
+    }
+
+    async fn list_app_target_summaries(
+        &self,
+        app_id: i64,
+    ) -> Result<Vec<AppTargetSummaryItem>, AppError> {
+        sqlx::query_as::<_, AppTargetSummaryItem>(
+            r#"
+            SELECT
+                n.id,
+                n.name,
+                n.node_key,
+                n.node_type,
+                n.status,
+                n.docker_status,
+                COALESCE(c.check_status, 'unknown') AS capability_status,
+                COALESCE(c.docker_available, 0) AS docker_available,
+                COALESCE(c.compose_available, 0) AS compose_available,
+                COALESCE(c.systemd_available, 0) AS systemd_available,
+                COALESCE(c.caddy_available, 0) AS caddy_available,
+                COALESCE(c.nginx_available, 0) AS nginx_available,
+                COALESCE(c.message, '') AS capability_message
+            FROM nodes n
+            JOIN app_targets t ON t.node_id = n.id
+            LEFT JOIN node_capabilities c ON c.node_id = n.id
+            WHERE t.app_id = ?1
+              AND n.status != 'disabled'
+            ORDER BY n.id
+            "#,
+        )
+        .bind(app_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(AppError::from)
+    }
+
+    async fn list_app_deployment_runs(
+        &self,
+        app_id: i64,
+    ) -> Result<Vec<AppDeploymentRunItem>, AppError> {
+        sqlx::query_as::<_, AppDeploymentRunItem>(
+            r#"
+            SELECT
+                r.id,
+                r.task_id,
+                t.title AS task_title,
+                r.deploy_action,
+                r.status,
+                r.message,
+                r.started_at,
+                r.finished_at
+            FROM deployment_runs r
+            LEFT JOIN operation_tasks t ON t.id = r.task_id
+            WHERE r.app_id = ?1
+            ORDER BY r.id DESC
+            LIMIT 10
+            "#,
+        )
+        .bind(app_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(AppError::from)
+    }
+
+    async fn list_app_config_snapshots(
+        &self,
+        app_id: i64,
+    ) -> Result<Vec<AppConfigSnapshotItem>, AppError> {
+        sqlx::query_as::<_, AppConfigSnapshotItem>(
+            r#"
+            SELECT
+                id,
+                snapshot_kind,
+                compose_content,
+                env_content,
+                metadata,
+                created_at
+            FROM app_config_snapshots
+            WHERE app_id = ?1
+            ORDER BY id DESC
+            LIMIT 10
+            "#,
+        )
+        .bind(app_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(AppError::from)
+    }
+
+    async fn latest_deploy_snapshot(
+        &self,
+        app_id: i64,
+    ) -> Result<Option<AppConfigSnapshotItem>, AppError> {
+        sqlx::query_as::<_, AppConfigSnapshotItem>(
+            r#"
+            SELECT
+                id,
+                snapshot_kind,
+                compose_content,
+                env_content,
+                metadata,
+                created_at
+            FROM app_config_snapshots
+            WHERE app_id = ?1
+              AND snapshot_kind = 'deploy'
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(app_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(AppError::from)
+    }
+
+    async fn list_app_runtime_states(
+        &self,
+        app_id: i64,
+    ) -> Result<Vec<AppRuntimeStateItem>, AppError> {
+        sqlx::query_as::<_, AppRuntimeStateItem>(
+            r#"
+            SELECT
+                n.id AS node_id,
+                n.name AS node_name,
+                n.node_key,
+                s.runtime_status,
+                s.active_version,
+                s.service_count,
+                s.message,
+                s.last_task_id,
+                t.status AS last_task_status,
+                t.task_kind AS last_task_kind,
+                s.last_deploy_at,
+                s.updated_at
+            FROM app_runtime_states s
+            JOIN nodes n ON n.id = s.node_id
+            LEFT JOIN operation_tasks t ON t.id = s.last_task_id
+            WHERE s.app_id = ?1
+            ORDER BY n.id
+            "#,
+        )
+        .bind(app_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(AppError::from)
+    }
+
+    async fn list_app_target_choices(
+        &self,
+        app_id: i64,
+    ) -> Result<Vec<AppTargetChoiceItem>, AppError> {
+        sqlx::query_as::<_, AppTargetChoiceItem>(
+            r#"
+            SELECT
+                n.id,
+                n.name,
+                n.node_key,
+                EXISTS(
+                    SELECT 1
+                    FROM app_targets t
+                    WHERE t.app_id = ?1
+                      AND t.node_id = n.id
+                ) AS checked
+            FROM nodes n
+            WHERE n.status != 'disabled'
+               OR EXISTS(
+                    SELECT 1
+                    FROM app_targets t
+                    WHERE t.app_id = ?1
+                      AND t.node_id = n.id
+               )
+            ORDER BY CASE n.node_key WHEN 'local' THEN 0 ELSE 1 END, n.id DESC
+            "#,
+        )
+        .bind(app_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(AppError::from)
+    }
+
+    async fn load_binary_config(&self, app: &AppDetailItem) -> Result<BinaryConfigItem, AppError> {
+        if app.app_type != "binary" {
+            return Ok(BinaryConfigItem::default());
+        }
+        self.load_binary_config_for_app(app.id, &app.app_key, &app.work_dir)
+            .await
+    }
+
+    async fn load_binary_config_for_app(
+        &self,
+        app_id: i64,
+        app_key: &str,
+        work_dir: &str,
+    ) -> Result<BinaryConfigItem, AppError> {
+        let config = sqlx::query_as::<_, BinaryConfigItem>(
+            r#"
+            SELECT
+                service_name,
+                artifact_version,
+                artifact_path,
+                exec_args,
+                working_dir,
+                service_user,
+                unit_name,
+                release_strategy,
+                active_slot,
+                base_port,
+                standby_port,
+                proxy_enabled,
+                proxy_kind,
+                proxy_domain,
+                proxy_config_path,
+                env_content
+            FROM app_binary_configs
+            WHERE app_id = ?1
+            "#,
+        )
+        .bind(app_id)
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(config.unwrap_or_else(|| default_binary_config_for_app(app_key, work_dir)))
+    }
+
+    async fn list_binary_artifacts(
+        &self,
+        app_id: i64,
+    ) -> Result<Vec<BinaryArtifactItem>, AppError> {
+        sqlx::query_as::<_, BinaryArtifactItem>(
+            r#"
+            SELECT
+                id,
+                version,
+                artifact_path,
+                artifact_kind,
+                status,
+                metadata,
+                created_at
+            FROM binary_artifacts
+            WHERE app_id = ?1
+            ORDER BY id DESC
+            LIMIT 20
+            "#,
+        )
+        .bind(app_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(AppError::from)
+    }
+
+    pub async fn list_artifacts(&self) -> Result<Vec<ArtifactListItem>, AppError> {
+        sqlx::query_as::<_, ArtifactListItem>(
+            r#"
+            SELECT
+                ba.id,
+                ba.app_id,
+                a.name AS app_name,
+                a.app_key,
+                ba.version,
+                ba.artifact_path,
+                ba.artifact_kind,
+                ba.status,
+                ba.metadata,
+                ba.created_at
+            FROM binary_artifacts ba
+            JOIN apps a ON a.id = ba.app_id
+            ORDER BY ba.id DESC
+            LIMIT 100
+            "#,
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(AppError::from)
+    }
+
+    pub async fn list_services(&self) -> Result<Vec<ServiceListItem>, AppError> {
+        let apps = self.list_apps().await?;
+        let mut services = Vec::new();
+        for app in apps {
+            let health_check = load_health_check_config(&self.db, app.id).await?;
+            let runtime_states = self.list_app_runtime_states(app.id).await?;
+            let target_nodes = service_target_node_items(
+                &self.target_node_metadata_for_app(app.id).await?,
+                &runtime_states,
+            );
+            let runtime_overview = service_runtime_overview(&runtime_states);
+            let target_names = app
+                .target_names
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("未绑定节点")
+                .to_owned();
+            if app.app_type == "compose" {
+                let runtime_files = self.runtime_fs.load_app_config(&app.app_key).await?;
+                let mut compose_services = parse_compose_services(&runtime_files.compose_content)?;
+                if compose_services.is_empty() {
+                    compose_services.push(ParsedService {
+                        name: "未解析服务".to_owned(),
+                        image: "未配置镜像".to_owned(),
+                        ports: "未声明端口".to_owned(),
+                        replicas: "1".to_owned(),
+                    });
+                }
+                for service in compose_services {
+                    services.push(ServiceListItem {
+                        app_id: app.id,
+                        app_name: app.name.clone(),
+                        app_key: app.app_key.clone(),
+                        service_name: service.name,
+                        service_kind: "Docker Compose".to_owned(),
+                        image: service.image,
+                        ports: service.ports,
+                        replicas: service.replicas,
+                        target_names: target_names.clone(),
+                        app_status: app.status.clone(),
+                        runtime_status: runtime_overview.status.clone(),
+                        runtime_summary: runtime_overview.summary.clone(),
+                        active_version: runtime_overview.active_version.clone(),
+                        health_check: health_check.clone(),
+                        health_check_detail: health_check_detail_text(&health_check, None),
+                        last_health_message: runtime_overview.latest_message.clone(),
+                        last_health_at: runtime_overview.latest_checked_at.clone(),
+                        updated_at: app.updated_at.clone(),
+                        target_nodes: target_nodes.clone(),
+                    });
+                }
+            } else {
+                let binary_config = self
+                    .load_binary_config_for_app(app.id, &app.app_key, &app.work_dir)
+                    .await?;
+                let health_check_detail =
+                    health_check_detail_text(&health_check, Some(&binary_config));
+                services.push(ServiceListItem {
+                    app_id: app.id,
+                    app_name: app.name.clone(),
+                    app_key: app.app_key.clone(),
+                    service_name: binary_config.service_name.clone(),
+                    service_kind: "二进制".to_owned(),
+                    image: "systemd 服务".to_owned(),
+                    ports: "待配置".to_owned(),
+                    replicas: "1".to_owned(),
+                    target_names,
+                    app_status: app.status,
+                    runtime_status: runtime_overview.status,
+                    runtime_summary: runtime_overview.summary,
+                    active_version: runtime_overview.active_version,
+                    health_check,
+                    health_check_detail,
+                    last_health_message: runtime_overview.latest_message,
+                    last_health_at: runtime_overview.latest_checked_at,
+                    updated_at: app.updated_at,
+                    target_nodes,
+                });
+            }
+        }
+        Ok(services)
+    }
+
+    pub async fn create_app(&self, input: CreateAppInput) -> Result<i64, AppError> {
+        let app_key = normalize_key(&input.app_key)?;
+        let name = required_text(&input.name, "请输入应用名称")?;
+        let app_type = normalize_app_type(&input.app_type)?;
+        let deploy_mode = app_type.clone();
+        let deploy_strategy = normalize_deploy_strategy(&input.deploy_strategy)?;
+        let work_dir = required_text(&input.work_dir, "请输入部署目录")?;
+        let description = input.description.trim().to_owned();
+        let runtime_name = name.clone();
+        let compose_content = if app_type == "compose" {
+            normalize_compose_content(&input.compose_content, &app_key)?
+        } else {
+            String::new()
+        };
+        let env_content = normalize_env_content(&input.env_content);
+        let binary_config = if app_type == "binary" {
+            Some(normalize_binary_config(NormalizeBinaryConfigInput {
+                app_key: &app_key,
+                work_dir: &work_dir,
+                artifact_version: &input.binary_artifact_version,
+                artifact_path: &input.binary_artifact_path,
+                exec_args: &input.binary_exec_args,
+                service_user: &input.binary_service_user,
+                unit_name: &input.binary_unit_name,
+                release_strategy: &input.binary_release_strategy,
+                active_slot: &input.binary_active_slot,
+                base_port: input.binary_base_port,
+                standby_port: input.binary_standby_port,
+                proxy_enabled: input.binary_proxy_enabled,
+                proxy_kind: &input.binary_proxy_kind,
+                proxy_domain: &input.binary_proxy_domain,
+                proxy_config_path: &input.binary_proxy_config_path,
+                env_content: &input.env_content,
+            })?)
+        } else {
+            None
+        };
+        if input.target_node_ids.is_empty() {
+            return Err(AppError::InvalidInput(
+                "至少需要选择一个目标节点".to_owned(),
+            ));
+        }
+
+        let target_nodes = self.target_node_metadata(&input.target_node_ids).await?;
+        let missing_target = input
+            .target_node_ids
+            .iter()
+            .any(|node_id| !target_nodes.iter().any(|node| node.id == *node_id));
+        if missing_target {
+            return Err(AppError::InvalidInput("目标节点不存在".to_owned()));
+        }
+        let mut tx = self.db.begin().await?;
+        let app_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO apps(
+                app_key,
+                name,
+                description,
+                app_type,
+                deploy_mode,
+                deploy_strategy,
+                work_dir,
+                status
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'draft')
+            RETURNING id
+            "#,
+        )
+        .bind(&app_key)
+        .bind(&name)
+        .bind(&description)
+        .bind(&app_type)
+        .bind(&deploy_mode)
+        .bind(&deploy_strategy)
+        .bind(&work_dir)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        for node_id in dedupe_ids(&input.target_node_ids) {
+            sqlx::query(
+                "INSERT INTO app_targets(app_id, node_id, target_role) VALUES (?1, ?2, 'primary')",
+            )
+            .bind(app_id)
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                INSERT INTO app_runtime_states(app_id, node_id, runtime_status, message)
+                VALUES (?1, ?2, 'unknown', '等待首次部署')
+                "#,
+            )
+            .bind(app_id)
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO app_health_checks(app_id, check_kind)
+            VALUES (?1, 'none')
+            "#,
+        )
+        .bind(app_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if let Some(config) = &binary_config {
+            sqlx::query(
+                r#"
+                INSERT INTO app_binary_configs(
+                    app_id,
+                    service_name,
+                    artifact_version,
+                    artifact_path,
+                    exec_args,
+                    working_dir,
+                    service_user,
+                    unit_name,
+                    release_strategy,
+                    active_slot,
+                    base_port,
+                    standby_port,
+                    proxy_enabled,
+                    proxy_kind,
+                    proxy_domain,
+                    proxy_config_path,
+                    env_content
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                "#,
+            )
+            .bind(app_id)
+            .bind(&config.service_name)
+            .bind(&config.artifact_version)
+            .bind(&config.artifact_path)
+            .bind(&config.exec_args)
+            .bind(&config.working_dir)
+            .bind(&config.service_user)
+            .bind(&config.unit_name)
+            .bind(&config.release_strategy)
+            .bind(&config.active_slot)
+            .bind(config.base_port)
+            .bind(config.standby_port)
+            .bind(config.proxy_enabled)
+            .bind(&config.proxy_kind)
+            .bind(&config.proxy_domain)
+            .bind(&config.proxy_config_path)
+            .bind(&config.env_content)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                INSERT INTO binary_artifacts(
+                    app_id,
+                    version,
+                    artifact_path,
+                    artifact_kind,
+                    status,
+                    metadata
+                )
+                VALUES (?1, ?2, ?3, 'binary', 'registered', ?4)
+                ON CONFLICT(app_id, version) DO UPDATE SET
+                    artifact_path = excluded.artifact_path,
+                    status = 'registered',
+                    metadata = excluded.metadata
+                "#,
+            )
+            .bind(app_id)
+            .bind(&config.artifact_version)
+            .bind(&config.artifact_path)
+            .bind(format!(
+                "{{\"source\":\"manual\",\"unit_name\":\"{}\"}}",
+                json_escape(&config.unit_name)
+            ))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO app_config_snapshots(
+                app_id,
+                snapshot_kind,
+                compose_content,
+                env_content,
+                metadata
+            )
+            VALUES (?1, 'initial', ?2, ?3, ?4)
+            "#,
+        )
+        .bind(app_id)
+        .bind(&compose_content)
+        .bind(&env_content)
+        .bind("{\"source\":\"manual\",\"runtime\":\"file\"}")
+        .execute(&mut *tx)
+        .await?;
+
+        let runtime_result = self
+            .runtime_fs
+            .save_app_config(AppRuntimeConfig {
+                app_key: app_key.clone(),
+                app_id,
+                name,
+                description,
+                app_type,
+                deploy_mode,
+                deploy_strategy,
+                deploy_work_dir: work_dir,
+                target_nodes: target_nodes
+                    .into_iter()
+                    .map(|node| TargetNodeMetadata {
+                        node_key: node.node_key,
+                        name: node.name,
+                    })
+                    .collect(),
+                compose_content,
+                env_content,
+                binary: binary_config.as_ref().map(to_binary_runtime_metadata),
+            })
+            .await?;
+        if let Some(config) = &binary_config {
+            self.runtime_fs
+                .save_binary_runtime_files(to_binary_runtime_config(
+                    app_id,
+                    &app_key,
+                    &runtime_name,
+                    config,
+                ))
+                .await?;
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE app_config_snapshots
+            SET metadata = ?2
+            WHERE app_id = ?1
+              AND snapshot_kind = 'initial'
+            "#,
+        )
+        .bind(app_id)
+        .bind(format!(
+            "{{\"source\":\"manual\",\"runtime\":\"file\",\"runtime_root\":\"{}\"}}",
+            json_escape(&runtime_result.root_dir.to_string_lossy())
+        ))
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(app_id)
+    }
+
+    pub async fn update_app_config(&self, input: UpdateAppConfigInput) -> Result<(), AppError> {
+        let app = self.fetch_app_detail(input.app_id).await?;
+        ensure_app_enabled(&app)?;
+        ensure_app_idle(&app)?;
+        let compose_content = if app.app_type == "compose" {
+            normalize_compose_content(&input.compose_content, &app.app_key)?
+        } else {
+            String::new()
+        };
+        let env_content = normalize_env_content(&input.env_content);
+        let binary_config = if app.app_type == "binary" {
+            Some(normalize_binary_config(NormalizeBinaryConfigInput {
+                app_key: &app.app_key,
+                work_dir: &app.work_dir,
+                artifact_version: &input.binary_artifact_version,
+                artifact_path: &input.binary_artifact_path,
+                exec_args: &input.binary_exec_args,
+                service_user: &input.binary_service_user,
+                unit_name: &input.binary_unit_name,
+                release_strategy: &input.binary_release_strategy,
+                active_slot: &input.binary_active_slot,
+                base_port: input.binary_base_port,
+                standby_port: input.binary_standby_port,
+                proxy_enabled: input.binary_proxy_enabled,
+                proxy_kind: &input.binary_proxy_kind,
+                proxy_domain: &input.binary_proxy_domain,
+                proxy_config_path: &input.binary_proxy_config_path,
+                env_content: &input.env_content,
+            })?)
+        } else {
+            None
+        };
+        let target_nodes = self.target_node_metadata_for_app(app.id).await?;
+        let runtime_root = self.runtime_fs.app_root(&app.app_key)?;
+        let metadata_content = render_runtime_metadata(
+            &app,
+            target_nodes
+                .iter()
+                .map(|node| TargetNodeMetadata {
+                    node_key: node.node_key.clone(),
+                    name: node.name.clone(),
+                })
+                .collect(),
+            &runtime_root.to_string_lossy(),
+            binary_config.as_ref(),
+        );
+        self.runtime_fs
+            .save_app_runtime_files(
+                &app.app_key,
+                &compose_content,
+                &env_content,
+                &metadata_content,
+            )
+            .await?;
+        if let Some(config) = &binary_config {
+            self.runtime_fs
+                .save_binary_runtime_files(to_binary_runtime_config(
+                    app.id,
+                    &app.app_key,
+                    &app.name,
+                    config,
+                ))
+                .await?;
+        }
+
+        let mut tx = self.db.begin().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO app_health_checks(
+                app_id,
+                check_kind,
+                endpoint,
+                timeout_secs,
+                expected_status,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            ON CONFLICT(app_id) DO UPDATE SET
+                check_kind = excluded.check_kind,
+                endpoint = excluded.endpoint,
+                timeout_secs = excluded.timeout_secs,
+                expected_status = excluded.expected_status,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            "#,
+        )
+        .bind(app.id)
+        .bind(input.health_check.kind.as_str())
+        .bind(&input.health_check.endpoint)
+        .bind(input.health_check.timeout_secs as i64)
+        .bind(input.health_check.expected_status as i64)
+        .execute(&mut *tx)
+        .await?;
+        if let Some(config) = &binary_config {
+            upsert_binary_config(&mut tx, app.id, config).await?;
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO app_config_snapshots(
+                app_id,
+                snapshot_kind,
+                compose_content,
+                env_content,
+                metadata
+            )
+            VALUES (?1, 'manual', ?2, ?3, ?4)
+            "#,
+        )
+        .bind(app.id)
+        .bind(&compose_content)
+        .bind(&env_content)
+        .bind(format!(
+            "{{\"source\":\"manual\",\"runtime\":\"file\",\"runtime_root\":\"{}\"}}",
+            json_escape(&runtime_root.to_string_lossy())
+        ))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE apps
+            SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+            "#,
+        )
+        .bind(app.id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn update_app_metadata(&self, input: UpdateAppMetadataInput) -> Result<(), AppError> {
+        let mut app = self.fetch_app_detail(input.app_id).await?;
+        ensure_app_enabled(&app)?;
+        ensure_app_idle(&app)?;
+        let name = required_text(&input.name, "请输入应用名称")?;
+        let description = input.description.trim().to_owned();
+        let work_dir = required_text(&input.work_dir, "请输入部署目录")?;
+        let deploy_strategy = normalize_deploy_strategy(&input.deploy_strategy)?;
+        if input.target_node_ids.is_empty() {
+            return Err(AppError::InvalidInput(
+                "至少需要选择一个目标节点".to_owned(),
+            ));
+        }
+        let target_nodes = self.target_node_metadata(&input.target_node_ids).await?;
+        let missing_target = input
+            .target_node_ids
+            .iter()
+            .any(|node_id| !target_nodes.iter().any(|node| node.id == *node_id));
+        if missing_target {
+            return Err(AppError::InvalidInput("目标节点不存在或已禁用".to_owned()));
+        }
+
+        let previous_work_dir = app.work_dir.clone();
+        let runtime_files = self.runtime_fs.load_app_config(&app.app_key).await?;
+        let mut binary_config = self.load_binary_config(&app).await?;
+        app.name = name.clone();
+        app.description = description.clone();
+        app.work_dir = work_dir.clone();
+        app.deploy_strategy = deploy_strategy.clone();
+        let binary_config_for_metadata = if app.app_type == "binary" {
+            if binary_config.working_dir.trim().is_empty()
+                || binary_config.working_dir == previous_work_dir
+            {
+                binary_config.working_dir = work_dir.clone();
+            }
+            Some(binary_config.clone())
+        } else {
+            None
+        };
+        let runtime_root = self.runtime_fs.app_root(&app.app_key)?;
+        let metadata_content = render_runtime_metadata(
+            &app,
+            target_nodes
+                .iter()
+                .map(|node| TargetNodeMetadata {
+                    node_key: node.node_key.clone(),
+                    name: node.name.clone(),
+                })
+                .collect(),
+            &runtime_root.to_string_lossy(),
+            binary_config_for_metadata.as_ref(),
+        );
+        self.runtime_fs
+            .save_app_runtime_files(
+                &app.app_key,
+                &runtime_files.compose_content,
+                &runtime_files.env_content,
+                &metadata_content,
+            )
+            .await?;
+        if let Some(config) = &binary_config_for_metadata {
+            self.runtime_fs
+                .save_binary_runtime_files(to_binary_runtime_config(
+                    app.id,
+                    &app.app_key,
+                    &app.name,
+                    config,
+                ))
+                .await?;
+        }
+
+        let target_node_ids = dedupe_ids(&input.target_node_ids);
+        let mut tx = self.db.begin().await?;
+        sqlx::query(
+            r#"
+            UPDATE apps
+            SET name = ?2,
+                description = ?3,
+                work_dir = ?4,
+                deploy_strategy = ?5,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+            "#,
+        )
+        .bind(app.id)
+        .bind(&app.name)
+        .bind(&app.description)
+        .bind(&app.work_dir)
+        .bind(&app.deploy_strategy)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM app_targets WHERE app_id = ?1")
+            .bind(app.id)
+            .execute(&mut *tx)
+            .await?;
+        for node_id in target_node_ids {
+            sqlx::query(
+                "INSERT INTO app_targets(app_id, node_id, target_role) VALUES (?1, ?2, 'primary')",
+            )
+            .bind(app.id)
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                INSERT INTO app_runtime_states(app_id, node_id, runtime_status, message)
+                VALUES (?1, ?2, 'unknown', '等待首次部署')
+                ON CONFLICT(app_id, node_id) DO NOTHING
+                "#,
+            )
+            .bind(app.id)
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            r#"
+            DELETE FROM app_runtime_states
+            WHERE app_id = ?1
+              AND node_id NOT IN (
+                SELECT node_id
+                FROM app_targets
+                WHERE app_id = ?1
+              )
+            "#,
+        )
+        .bind(app.id)
+        .execute(&mut *tx)
+        .await?;
+        if let Some(config) = &binary_config_for_metadata {
+            upsert_binary_config(&mut tx, app.id, config).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn upload_binary_artifact(
+        &self,
+        input: UploadBinaryArtifactInput,
+    ) -> Result<(), AppError> {
+        let app = self.fetch_app_detail(input.app_id).await?;
+        ensure_app_enabled(&app)?;
+        ensure_app_idle(&app)?;
+        self.ensure_binary_app(&app)?;
+        let artifact_version = normalize_release_id(&input.artifact_version)?;
+        let file_name = required_text(&input.file_name, "请选择二进制制品文件")?;
+        if input.bytes.is_empty() {
+            return Err(AppError::InvalidInput("上传文件不能为空".to_owned()));
+        }
+        let mut config = self.load_binary_config(&app).await?;
+        let artifact_kind = artifact_kind_from_file_name(&file_name);
+        let uploaded_path = self
+            .runtime_fs
+            .save_binary_release_file(&app.app_key, &artifact_version, &file_name, &input.bytes)
+            .await?;
+        let checksum = sha256_hex(&input.bytes);
+        let size_bytes = input.bytes.len() as u64;
+        let entry_file = normalize_entry_file(&input.entry_file, &file_name, artifact_kind)?;
+        let local_artifact_path = if artifact_kind == "tar_gz" {
+            extract_tar_gz(&uploaded_path, &artifact_version)?;
+            uploaded_path
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join(&entry_file)
+        } else {
+            uploaded_path.clone()
+        };
+        if !local_artifact_path.is_file() {
+            return Err(AppError::InvalidInput(format!(
+                "入口文件不存在: {}",
+                local_artifact_path.to_string_lossy()
+            )));
+        }
+        let target_artifact_path = target_work_dir_path(
+            &app.work_dir,
+            &format!("releases/{artifact_version}/{entry_file}"),
+        );
+
+        config.artifact_version = artifact_version.clone();
+        config.artifact_path = target_artifact_path;
+        if config.working_dir.trim().is_empty() {
+            config.working_dir = app.work_dir.clone();
+        }
+        if config.unit_name.trim().is_empty() {
+            config.unit_name = format!("easy-deploy-{}.service", app.app_key);
+        }
+        if config.service_user.trim().is_empty() {
+            config.service_user = "deploy".to_owned();
+        }
+
+        let runtime_root = self.runtime_fs.app_root(&app.app_key)?;
+        let target_nodes = self.target_node_metadata_for_app(app.id).await?;
+        let runtime_files = self.runtime_fs.load_app_config(&app.app_key).await?;
+        let metadata_content = render_runtime_metadata(
+            &app,
+            target_nodes
+                .iter()
+                .map(|node| TargetNodeMetadata {
+                    node_key: node.node_key.clone(),
+                    name: node.name.clone(),
+                })
+                .collect(),
+            &runtime_root.to_string_lossy(),
+            Some(&config),
+        );
+        self.runtime_fs
+            .save_app_runtime_files(&app.app_key, "", &config.env_content, &metadata_content)
+            .await?;
+        self.runtime_fs
+            .save_binary_runtime_files(to_binary_runtime_config(
+                app.id,
+                &app.app_key,
+                &app.name,
+                &config,
+            ))
+            .await?;
+
+        let mut tx = self.db.begin().await?;
+        upsert_binary_config(&mut tx, app.id, &config).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO binary_artifacts(
+                app_id,
+                version,
+                artifact_path,
+                artifact_kind,
+                status,
+                metadata
+            )
+            VALUES (?1, ?2, ?3, ?4, 'active', ?5)
+            ON CONFLICT(app_id, version) DO UPDATE SET
+                artifact_path = excluded.artifact_path,
+                artifact_kind = excluded.artifact_kind,
+                status = 'active',
+                metadata = excluded.metadata
+            "#,
+        )
+        .bind(app.id)
+        .bind(&artifact_version)
+        .bind(&config.artifact_path)
+        .bind(artifact_kind)
+        .bind(render_artifact_metadata(ArtifactMetadataInput {
+            source: "upload",
+            unit_name: &config.unit_name,
+            uploaded_path: &uploaded_path.to_string_lossy(),
+            original_file_name: &file_name,
+            entry_file: &entry_file,
+            sha256: &checksum,
+            size_bytes,
+        }))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE binary_artifacts
+            SET status = 'registered'
+            WHERE app_id = ?1
+              AND version != ?2
+              AND status = 'active'
+            "#,
+        )
+        .bind(app.id)
+        .bind(&artifact_version)
+        .execute(&mut *tx)
+        .await?;
+        let platform_config = self.platform.config().await?;
+        let pruned_releases = prune_uploaded_binary_releases(
+            &mut tx,
+            app.id,
+            &artifact_version,
+            platform_config.uploaded_binary_releases_to_keep,
+        )
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO app_config_snapshots(
+                app_id,
+                snapshot_kind,
+                compose_content,
+                env_content,
+                metadata
+            )
+            VALUES (?1, 'manual', ?2, ?3, ?4)
+            "#,
+        )
+        .bind(app.id)
+        .bind(runtime_files.compose_content)
+        .bind(&config.env_content)
+        .bind(format!(
+            "{{\"source\":\"binary_upload\",\"version\":\"{}\",\"runtime\":\"file\",\"runtime_root\":\"{}\"}}",
+            json_escape(&artifact_version),
+            json_escape(&runtime_root.to_string_lossy())
+        ))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE apps
+            SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+            "#,
+        )
+        .bind(app.id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        cleanup_pruned_binary_release_dirs(&runtime_root, &pruned_releases)?;
+        Ok(())
+    }
+
+    pub async fn rollback_binary_artifact(
+        &self,
+        app_id: i64,
+        artifact_id: i64,
+        actor: &str,
+    ) -> Result<BinaryRollbackResult, AppError> {
+        let app = self.fetch_app_detail(app_id).await?;
+        ensure_app_enabled(&app)?;
+        ensure_app_idle(&app)?;
+        self.ensure_no_active_deploy_task(app.id).await?;
+        self.ensure_binary_app(&app)?;
+        ensure_has_enabled_targets(&self.target_node_metadata_for_app(app.id).await?)?;
+        let artifact = sqlx::query_as::<_, BinaryArtifactItem>(
+            r#"
+            SELECT
+                id,
+                version,
+                artifact_path,
+                artifact_kind,
+                status,
+                metadata,
+                created_at
+            FROM binary_artifacts
+            WHERE id = ?1
+              AND app_id = ?2
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(app.id)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or_else(|| AppError::InvalidInput("二进制发布版本不存在".to_owned()))?;
+        if artifact.status == "disabled" {
+            return Err(AppError::InvalidInput("该发布版本已禁用".to_owned()));
+        }
+        let mut config = self.load_binary_config(&app).await?;
+        config.artifact_version = artifact.version.clone();
+        config.artifact_path = artifact.artifact_path.clone();
+        if config.working_dir.trim().is_empty() {
+            config.working_dir = app.work_dir.clone();
+        }
+        if config.unit_name.trim().is_empty() {
+            config.unit_name = format!("easy-deploy-{}.service", app.app_key);
+        }
+        if config.service_user.trim().is_empty() {
+            config.service_user = "deploy".to_owned();
+        }
+
+        let runtime_root = self.runtime_fs.app_root(&app.app_key)?;
+        let target_nodes = self.target_node_metadata_for_app(app.id).await?;
+        let runtime_files = self.runtime_fs.load_app_config(&app.app_key).await?;
+        let metadata_content = render_runtime_metadata(
+            &app,
+            target_nodes
+                .iter()
+                .map(|node| TargetNodeMetadata {
+                    node_key: node.node_key.clone(),
+                    name: node.name.clone(),
+                })
+                .collect(),
+            &runtime_root.to_string_lossy(),
+            Some(&config),
+        );
+        self.runtime_fs
+            .save_app_runtime_files(&app.app_key, "", &config.env_content, &metadata_content)
+            .await?;
+        self.runtime_fs
+            .save_binary_runtime_files(to_binary_runtime_config(
+                app.id,
+                &app.app_key,
+                &app.name,
+                &config,
+            ))
+            .await?;
+
+        let mut tx = self.db.begin().await?;
+        upsert_binary_config(&mut tx, app.id, &config).await?;
+        sqlx::query(
+            r#"
+            UPDATE binary_artifacts
+            SET status = CASE WHEN id = ?2 THEN 'active' ELSE 'registered' END,
+                metadata = CASE WHEN id = ?2 THEN ?3 ELSE metadata END,
+                artifact_path = CASE WHEN id = ?2 THEN ?4 ELSE artifact_path END
+            WHERE app_id = ?1
+              AND status != 'disabled'
+            "#,
+        )
+        .bind(app.id)
+        .bind(artifact.id)
+        .bind(&artifact.metadata)
+        .bind(&artifact.artifact_path)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO app_config_snapshots(
+                app_id,
+                snapshot_kind,
+                compose_content,
+                env_content,
+                metadata
+            )
+            VALUES (?1, 'manual', ?2, ?3, ?4)
+            "#,
+        )
+        .bind(app.id)
+        .bind(runtime_files.compose_content)
+        .bind(&config.env_content)
+        .bind(format!(
+            "{{\"source\":\"binary_release_activate\",\"version\":\"{}\",\"runtime\":\"file\",\"runtime_root\":\"{}\"}}",
+            json_escape(&artifact.version),
+            json_escape(&runtime_root.to_string_lossy())
+        ))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let version = artifact.version.clone();
+        let task_id = self
+            .create_binary_task_for_config(
+                app,
+                config,
+                BinaryTaskAction::Restart,
+                actor,
+                "回滚并重启二进制",
+            )
+            .await?;
+        Ok(BinaryRollbackResult { task_id, version })
+    }
+
+    pub async fn restore_config_snapshot(
+        &self,
+        app_id: i64,
+        snapshot_id: i64,
+    ) -> Result<(), AppError> {
+        let app = self.fetch_app_detail(app_id).await?;
+        ensure_app_enabled(&app)?;
+        ensure_app_idle(&app)?;
+        let snapshot = sqlx::query_as::<_, AppConfigSnapshotItem>(
+            r#"
+            SELECT
+                id,
+                snapshot_kind,
+                compose_content,
+                env_content,
+                metadata,
+                created_at
+            FROM app_config_snapshots
+            WHERE id = ?1
+              AND app_id = ?2
+            "#,
+        )
+        .bind(snapshot_id)
+        .bind(app.id)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or_else(|| AppError::InvalidInput("配置快照不存在".to_owned()))?;
+
+        let binary_config = self.load_binary_config(&app).await?;
+        let compose_content = if app.app_type == "compose" {
+            normalize_compose_content(&snapshot.compose_content, &app.app_key)?
+        } else {
+            String::new()
+        };
+        let env_content = if app.app_type == "binary" {
+            binary_config.env_content.clone()
+        } else {
+            normalize_env_content(&snapshot.env_content)
+        };
+        let target_nodes = self.target_node_metadata_for_app(app.id).await?;
+        let runtime_root = self.runtime_fs.app_root(&app.app_key)?;
+        let metadata_content = render_runtime_metadata(
+            &app,
+            target_nodes
+                .iter()
+                .map(|node| TargetNodeMetadata {
+                    node_key: node.node_key.clone(),
+                    name: node.name.clone(),
+                })
+                .collect(),
+            &runtime_root.to_string_lossy(),
+            if app.app_type == "binary" {
+                Some(&binary_config)
+            } else {
+                None
+            },
+        );
+        self.runtime_fs
+            .save_app_runtime_files(
+                &app.app_key,
+                &compose_content,
+                &env_content,
+                &metadata_content,
+            )
+            .await?;
+        if app.app_type == "binary" {
+            self.runtime_fs
+                .save_binary_runtime_files(to_binary_runtime_config(
+                    app.id,
+                    &app.app_key,
+                    &app.name,
+                    &binary_config,
+                ))
+                .await?;
+        }
+
+        let mut tx = self.db.begin().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO app_config_snapshots(
+                app_id,
+                snapshot_kind,
+                compose_content,
+                env_content,
+                metadata
+            )
+            VALUES (?1, 'manual', ?2, ?3, ?4)
+            "#,
+        )
+        .bind(app.id)
+        .bind(&compose_content)
+        .bind(&env_content)
+        .bind(format!(
+            "{{\"source\":\"restore\",\"snapshot_id\":{},\"snapshot_kind\":\"{}\",\"runtime\":\"file\",\"runtime_root\":\"{}\"}}",
+            snapshot.id,
+            json_escape(&snapshot.snapshot_kind),
+            json_escape(&runtime_root.to_string_lossy())
+        ))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE apps
+            SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+            "#,
+        )
+        .bind(app.id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn compose_config(&self, app_id: i64) -> Result<ComposeCommandOutput, AppError> {
+        let app = self.fetch_app_detail(app_id).await?;
+        ensure_app_enabled(&app)?;
+        ensure_app_idle(&app)?;
+        self.ensure_compose_app(&app)?;
+        let work_dir = self.runtime_fs.app_root(&app.app_key)?;
+        self.compose.config(work_dir).await.map_err(AppError::from)
+    }
+
+    pub async fn compose_logs(&self, app_id: i64) -> Result<ComposeCommandOutput, AppError> {
+        let app = self.fetch_app_detail(app_id).await?;
+        ensure_app_enabled(&app)?;
+        self.ensure_compose_app(&app)?;
+        let work_dir = self.runtime_fs.app_root(&app.app_key)?;
+        self.compose.logs(work_dir).await.map_err(AppError::from)
+    }
+
+    pub async fn deploy_strategy(&self, app_id: i64) -> Result<String, AppError> {
+        self.fetch_app_detail(app_id)
+            .await
+            .map(|app| app.deploy_strategy)
+    }
+
+    pub async fn compose_service_logs(
+        &self,
+        app_id: i64,
+        service_name: &str,
+        node_id: Option<i64>,
+        tail_lines: u16,
+    ) -> Result<ServiceLogOutput, AppError> {
+        let app = self.fetch_app_detail(app_id).await?;
+        self.ensure_compose_app(&app)?;
+        let runtime_files = self.runtime_fs.load_app_config(&app.app_key).await?;
+        let service_exists = parse_compose_services(&runtime_files.compose_content)?
+            .iter()
+            .any(|service| service.name == service_name);
+        if !service_exists {
+            return Err(AppError::InvalidInput("Compose 服务不存在".to_owned()));
+        }
+        let target_nodes = self.target_node_metadata_for_app(app.id).await?;
+        let runtime_states = self.list_app_runtime_states(app.id).await?;
+        let node = select_service_log_node(&target_nodes, node_id, "Compose 应用未绑定目标节点")?;
+        let command_output = match node.node_type.as_str() {
+            "local" => self
+                .compose
+                .service_logs_with_tail(runtime_files.root_dir, service_name, tail_lines)
+                .await
+                .map_err(AppError::from)?,
+            "ssh" => {
+                let target = node.ssh_target()?;
+                let remote_work_dir = compose_node_deploy_work_dir_for_app(&app, node);
+                self.systemd
+                    .ssh_executor()
+                    .compose_service_logs_with_tail(
+                        &target,
+                        runtime_files.root_dir,
+                        &remote_work_dir,
+                        service_name,
+                        tail_lines,
+                    )
+                    .await
+                    .map_err(AppError::from)?
+            }
+            _ => Err(AppError::InvalidInput(format!(
+                "节点 {} 的类型 {} 不支持 Compose 日志",
+                node.name, node.node_type
+            )))?,
+        };
+        Ok(ServiceLogOutput {
+            command_output,
+            node: service_target_node_item(node, &runtime_states),
+            target_nodes: service_target_node_items(&target_nodes, &runtime_states),
+        })
+    }
+
+    pub async fn binary_service_logs(
+        &self,
+        app_id: i64,
+        service_name: &str,
+        node_id: Option<i64>,
+        tail_lines: u16,
+    ) -> Result<ServiceLogOutput, AppError> {
+        let app = self.fetch_app_detail(app_id).await?;
+        self.ensure_binary_app(&app)?;
+        if service_name != app.app_key {
+            return Err(AppError::InvalidInput("二进制服务不存在".to_owned()));
+        }
+        let config = self.load_binary_config(&app).await?;
+        let runtime_work_dir = self.runtime_fs.app_root(&app.app_key)?;
+        let target_nodes = self.target_node_metadata_for_app(app.id).await?;
+        let runtime_states = self.list_app_runtime_states(app.id).await?;
+        let node = select_service_log_node(&target_nodes, node_id, "二进制应用未绑定目标节点")?;
+        let command_output = match node.node_type.as_str() {
+            "local" => {
+                let work_dir = binary_command_work_dir(
+                    &binary_node_deploy_work_dir_for_app(&app, node),
+                    &runtime_work_dir,
+                );
+                self.systemd
+                    .logs_with_tail(work_dir, &config.unit_name, tail_lines)
+                    .await
+                    .map_err(AppError::from)?
+            }
+            "ssh" => {
+                let target = node.ssh_target()?;
+                self.systemd
+                    .ssh_executor()
+                    .logs_with_tail(&target, runtime_work_dir, &config.unit_name, tail_lines)
+                    .await
+                    .map_err(AppError::from)?
+            }
+            _ => Err(AppError::InvalidInput(format!(
+                "节点 {} 的类型 {} 不支持二进制日志",
+                node.name, node.node_type
+            )))?,
+        };
+        Ok(ServiceLogOutput {
+            command_output,
+            node: service_target_node_item(node, &runtime_states),
+            target_nodes: service_target_node_items(&target_nodes, &runtime_states),
+        })
+    }
+
+    pub async fn run_compose_task(
+        &self,
+        app_id: i64,
+        action: ComposeTaskAction,
+        actor: &str,
+    ) -> Result<i64, AppError> {
+        let app = self.fetch_app_detail(app_id).await?;
+        ensure_app_enabled(&app)?;
+        ensure_app_idle(&app)?;
+        self.ensure_no_active_deploy_task(app.id).await?;
+        self.ensure_compose_app(&app)?;
+        ensure_has_enabled_targets(&self.target_node_metadata_for_app(app.id).await?)?;
+        let task_id = self
+            .tasks
+            .create_task(CreateTaskInput {
+                task_kind: action.task_kind().to_owned(),
+                title: format!("{} {}", action.title_prefix(), app.name),
+                app_id: Some(app.id),
+                node_id: None,
+                created_by: actor.to_owned(),
+            })
+            .await?;
+        let work_dir = self.runtime_fs.app_root(&app.app_key)?;
+        if !work_dir.is_dir() {
+            self.tasks
+                .fail_task(task_id, "Compose 工作目录不存在")
+                .await?;
+            return Err(AppError::InvalidInput("Compose 工作目录不存在".to_owned()));
+        }
+        let deploy_strategy = parse_deploy_strategy(&app.deploy_strategy);
+        self.tasks
+            .append_log(task_id, "system", "任务已加入后台部署队列")
+            .await?;
+        self.tasks
+            .append_log(
+                task_id,
+                "system",
+                &format!("部署策略: {}", deploy_strategy.label()),
+            )
+            .await?;
+        if let Err(err) = self.update_app_status(app.id, "deploying").await {
+            let _ = self.tasks.fail_task(task_id, err.message()).await;
+            return Err(err);
+        }
+        update_runtime_states_in_db(&RuntimeStatesUpdate {
+            db: &self.db,
+            app_id: app.id,
+            runtime_status: "deploying",
+            service_count: None,
+            active_version: None,
+            message: "任务已加入后台部署队列",
+            task_id: Some(task_id),
+            touch_deploy_time: false,
+        })
+        .await?;
+        if let Err(err) = self
+            .compose_queue
+            .enqueue(ComposeTaskJob {
+                task_id,
+                app_id: app.id,
+                app_key: app.app_key,
+                deploy_strategy,
+                action,
+            })
+            .await
+        {
+            self.tasks.fail_task(task_id, err.message()).await?;
+            self.update_app_status(app.id, "failed").await?;
+            update_runtime_states_in_db(&RuntimeStatesUpdate {
+                db: &self.db,
+                app_id: app.id,
+                runtime_status: "unhealthy",
+                service_count: None,
+                active_version: None,
+                message: err.message(),
+                task_id: Some(task_id),
+                touch_deploy_time: false,
+            })
+            .await?;
+            return Err(err);
+        }
+        Ok(task_id)
+    }
+
+    pub async fn retry_compose_task(&self, task_id: i64, actor: &str) -> Result<i64, AppError> {
+        let task = self.tasks.task_detail(task_id).await?;
+        if task.status != "failed" {
+            return Err(AppError::InvalidInput(
+                "只有失败的 Compose 任务可以重试".to_owned(),
+            ));
+        }
+        let action = ComposeTaskAction::from_task_kind(&task.task_kind).ok_or_else(|| {
+            AppError::InvalidInput("当前任务不是可重试的 Compose 部署任务".to_owned())
+        })?;
+        let app_id = task
+            .app_id
+            .ok_or_else(|| AppError::InvalidInput("任务未关联应用，无法重试".to_owned()))?;
+        let app = self.fetch_app_detail(app_id).await?;
+        ensure_app_enabled(&app)?;
+        self.run_compose_task(app_id, action, actor).await
+    }
+
+    pub async fn run_binary_task(
+        &self,
+        app_id: i64,
+        action: BinaryTaskAction,
+        actor: &str,
+    ) -> Result<i64, AppError> {
+        let app = self.fetch_app_detail(app_id).await?;
+        ensure_app_enabled(&app)?;
+        ensure_app_idle(&app)?;
+        self.ensure_no_active_deploy_task(app.id).await?;
+        self.ensure_binary_app(&app)?;
+        ensure_has_enabled_targets(&self.target_node_metadata_for_app(app.id).await?)?;
+        let config = self.load_binary_config(&app).await?;
+        if config.artifact_version.is_empty() || config.artifact_path.is_empty() {
+            return Err(AppError::InvalidInput(
+                "请先保存二进制制品版本和路径".to_owned(),
+            ));
+        }
+        let task_id = self
+            .tasks
+            .create_task(CreateTaskInput {
+                task_kind: action.task_kind().to_owned(),
+                title: format!("{} {}", action.title_prefix(), app.name),
+                app_id: Some(app.id),
+                node_id: None,
+                created_by: actor.to_owned(),
+            })
+            .await?;
+        let work_dir = self.runtime_fs.app_root(&app.app_key)?;
+        if !work_dir.is_dir() {
+            self.tasks
+                .fail_task(task_id, "二进制工作目录不存在")
+                .await?;
+            return Err(AppError::InvalidInput("二进制工作目录不存在".to_owned()));
+        }
+        let deploy_strategy = parse_deploy_strategy(&app.deploy_strategy);
+        self.tasks
+            .append_log(task_id, "system", "任务已加入后台二进制部署队列")
+            .await?;
+        self.tasks
+            .append_log(
+                task_id,
+                "system",
+                &format!("部署策略: {}", deploy_strategy.label()),
+            )
+            .await?;
+        self.tasks
+            .append_log(
+                task_id,
+                "system",
+                &format!("二进制制品版本: {}", config.artifact_version),
+            )
+            .await?;
+        if let Err(err) = self.update_app_status(app.id, "deploying").await {
+            let _ = self.tasks.fail_task(task_id, err.message()).await;
+            return Err(err);
+        }
+        update_runtime_states_in_db(&RuntimeStatesUpdate {
+            db: &self.db,
+            app_id: app.id,
+            runtime_status: "deploying",
+            service_count: None,
+            active_version: None,
+            message: "任务已加入后台二进制部署队列",
+            task_id: Some(task_id),
+            touch_deploy_time: false,
+        })
+        .await?;
+        if let Err(err) = self
+            .binary_queue
+            .enqueue(BinaryTaskJob {
+                task_id,
+                app_id: app.id,
+                app_key: app.app_key,
+                deploy_work_dir: app.work_dir,
+                unit_name: config.unit_name,
+                artifact_version: config.artifact_version,
+                artifact_path: config.artifact_path,
+                release_strategy: config.release_strategy,
+                active_slot: config.active_slot,
+                base_port: config.base_port,
+                standby_port: config.standby_port,
+                proxy_enabled: config.proxy_enabled == 1,
+                proxy_kind: config.proxy_kind,
+                proxy_domain: config.proxy_domain,
+                proxy_config_path: config.proxy_config_path,
+                deploy_strategy,
+                action,
+            })
+            .await
+        {
+            self.tasks.fail_task(task_id, err.message()).await?;
+            self.update_app_status(app.id, "failed").await?;
+            update_runtime_states_in_db(&RuntimeStatesUpdate {
+                db: &self.db,
+                app_id: app.id,
+                runtime_status: "unhealthy",
+                service_count: None,
+                active_version: None,
+                message: err.message(),
+                task_id: Some(task_id),
+                touch_deploy_time: false,
+            })
+            .await?;
+            return Err(err);
+        }
+        Ok(task_id)
+    }
+
+    async fn create_binary_task_for_config(
+        &self,
+        app: AppDetailItem,
+        config: BinaryConfigItem,
+        action: BinaryTaskAction,
+        actor: &str,
+        title_prefix: &str,
+    ) -> Result<i64, AppError> {
+        ensure_app_enabled(&app)?;
+        ensure_app_idle(&app)?;
+        self.ensure_no_active_deploy_task(app.id).await?;
+        let task_id = self
+            .tasks
+            .create_task(CreateTaskInput {
+                task_kind: action.task_kind().to_owned(),
+                title: format!("{title_prefix} {}", app.name),
+                app_id: Some(app.id),
+                node_id: None,
+                created_by: actor.to_owned(),
+            })
+            .await?;
+        let work_dir = self.runtime_fs.app_root(&app.app_key)?;
+        if !work_dir.is_dir() {
+            self.tasks
+                .fail_task(task_id, "二进制工作目录不存在")
+                .await?;
+            return Err(AppError::InvalidInput("二进制工作目录不存在".to_owned()));
+        }
+        let deploy_strategy = parse_deploy_strategy(&app.deploy_strategy);
+        self.tasks
+            .append_log(task_id, "system", "任务已加入后台二进制部署队列")
+            .await?;
+        self.tasks
+            .append_log(
+                task_id,
+                "system",
+                &format!("部署策略: {}", deploy_strategy.label()),
+            )
+            .await?;
+        self.tasks
+            .append_log(
+                task_id,
+                "system",
+                &format!("二进制制品版本: {}", config.artifact_version),
+            )
+            .await?;
+        if let Err(err) = self.update_app_status(app.id, "deploying").await {
+            let _ = self.tasks.fail_task(task_id, err.message()).await;
+            return Err(err);
+        }
+        update_runtime_states_in_db(&RuntimeStatesUpdate {
+            db: &self.db,
+            app_id: app.id,
+            runtime_status: "deploying",
+            service_count: None,
+            active_version: None,
+            message: "任务已加入后台二进制部署队列",
+            task_id: Some(task_id),
+            touch_deploy_time: false,
+        })
+        .await?;
+        if let Err(err) = self
+            .binary_queue
+            .enqueue(BinaryTaskJob {
+                task_id,
+                app_id: app.id,
+                app_key: app.app_key,
+                deploy_work_dir: app.work_dir,
+                unit_name: config.unit_name,
+                artifact_version: config.artifact_version,
+                artifact_path: config.artifact_path,
+                release_strategy: config.release_strategy,
+                active_slot: config.active_slot,
+                base_port: config.base_port,
+                standby_port: config.standby_port,
+                proxy_enabled: config.proxy_enabled == 1,
+                proxy_kind: config.proxy_kind,
+                proxy_domain: config.proxy_domain,
+                proxy_config_path: config.proxy_config_path,
+                deploy_strategy,
+                action,
+            })
+            .await
+        {
+            self.tasks.fail_task(task_id, err.message()).await?;
+            self.update_app_status(app.id, "failed").await?;
+            update_runtime_states_in_db(&RuntimeStatesUpdate {
+                db: &self.db,
+                app_id: app.id,
+                runtime_status: "unhealthy",
+                service_count: None,
+                active_version: None,
+                message: err.message(),
+                task_id: Some(task_id),
+                touch_deploy_time: false,
+            })
+            .await?;
+            return Err(err);
+        }
+        Ok(task_id)
+    }
+
+    pub async fn retry_binary_task(&self, task_id: i64, actor: &str) -> Result<i64, AppError> {
+        let task = self.tasks.task_detail(task_id).await?;
+        if task.status != "failed" {
+            return Err(AppError::InvalidInput(
+                "只有失败的二进制任务可以重试".to_owned(),
+            ));
+        }
+        let action = BinaryTaskAction::from_task_kind(&task.task_kind).ok_or_else(|| {
+            AppError::InvalidInput("当前任务不是可重试的二进制部署任务".to_owned())
+        })?;
+        let app_id = task
+            .app_id
+            .ok_or_else(|| AppError::InvalidInput("任务未关联应用，无法重试".to_owned()))?;
+        let app = self.fetch_app_detail(app_id).await?;
+        ensure_app_enabled(&app)?;
+        self.run_binary_task(app_id, action, actor).await
+    }
+
+    pub async fn set_app_status(
+        &self,
+        app_id: i64,
+        status: &str,
+    ) -> Result<AppStatusChange, AppError> {
+        let status = match status {
+            "disabled" | "ready" => status,
+            _ => return Err(AppError::InvalidInput("应用状态不支持".to_owned())),
+        };
+        let app = self.fetch_app_detail(app_id).await?;
+        if app.status == status {
+            return Ok(AppStatusChange {
+                app_id: app.id,
+                app_name: app.name,
+                previous_status: app.status.clone(),
+                status: app.status,
+            });
+        }
+        if app.status == "deploying" {
+            return Err(AppError::Conflict("部署中的应用不能停用".to_owned()));
+        }
+        update_app_status_in_db(&self.db, app.id, status).await?;
+        Ok(AppStatusChange {
+            app_id: app.id,
+            app_name: app.name,
+            previous_status: app.status,
+            status: status.to_owned(),
+        })
+    }
+
+    fn ensure_compose_app(&self, app: &AppDetailItem) -> Result<(), AppError> {
+        if app.app_type == "compose" {
+            Ok(())
+        } else {
+            Err(AppError::InvalidInput(
+                "当前应用不是 Docker Compose 应用".to_owned(),
+            ))
+        }
+    }
+
+    fn ensure_binary_app(&self, app: &AppDetailItem) -> Result<(), AppError> {
+        if app.app_type == "binary" {
+            Ok(())
+        } else {
+            Err(AppError::InvalidInput("当前应用不是二进制应用".to_owned()))
+        }
+    }
+
+    async fn fetch_app_detail(&self, app_id: i64) -> Result<AppDetailItem, AppError> {
+        sqlx::query_as::<_, AppDetailItem>(
+            r#"
+            SELECT
+                a.id,
+                a.app_key,
+                a.name,
+                a.description,
+                a.app_type,
+                a.deploy_mode,
+                a.deploy_strategy,
+                a.work_dir,
+                a.status,
+                group_concat(n.name, '、') AS target_names,
+                COUNT(n.id) AS target_count,
+                a.created_at,
+                a.updated_at
+            FROM apps a
+            LEFT JOIN app_targets t ON t.app_id = a.id
+            LEFT JOIN nodes n ON n.id = t.node_id
+            WHERE a.id = ?1
+            GROUP BY a.id
+            "#,
+        )
+        .bind(app_id)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or_else(|| AppError::InvalidInput("应用不存在".to_owned()))
+    }
+
+    async fn target_node_metadata(&self, node_ids: &[i64]) -> Result<Vec<AppTargetNode>, AppError> {
+        let mut nodes = Vec::new();
+        for node_id in dedupe_ids(node_ids) {
+            let node = sqlx::query_as::<_, AppTargetNode>(
+                r#"
+                SELECT
+                    n.id,
+                    n.node_key,
+                    n.name,
+                    n.node_type,
+                    n.status,
+                    n.address,
+                    n.ssh_port,
+                    n.ssh_user,
+                    cred.private_key_path AS credential_private_key_path,
+                    n.work_dir,
+                    COALESCE(c.caddy_available, 0) AS caddy_available,
+                    COALESCE(c.nginx_available, 0) AS nginx_available
+                FROM nodes n
+                LEFT JOIN node_credentials cred ON cred.id = n.credential_id
+                LEFT JOIN node_capabilities c ON c.node_id = n.id
+                WHERE n.id = ?1
+                  AND n.status != 'disabled'
+                "#,
+            )
+            .bind(node_id)
+            .fetch_optional(&self.db)
+            .await?
+            .ok_or_else(|| AppError::InvalidInput("目标节点不存在或已禁用".to_owned()))?;
+            nodes.push(node);
+        }
+        Ok(nodes)
+    }
+
+    async fn target_node_metadata_for_app(
+        &self,
+        app_id: i64,
+    ) -> Result<Vec<AppTargetNode>, AppError> {
+        sqlx::query_as::<_, AppTargetNode>(
+            r#"
+            SELECT
+                n.id,
+                n.node_key,
+                n.name,
+                n.node_type,
+                n.status,
+                n.address,
+                n.ssh_port,
+                n.ssh_user,
+                cred.private_key_path AS credential_private_key_path,
+                n.work_dir,
+                COALESCE(c.caddy_available, 0) AS caddy_available,
+                COALESCE(c.nginx_available, 0) AS nginx_available
+            FROM nodes n
+            JOIN app_targets t ON t.node_id = n.id
+            LEFT JOIN node_credentials cred ON cred.id = n.credential_id
+            LEFT JOIN node_capabilities c ON c.node_id = n.id
+            WHERE t.app_id = ?1
+              AND n.status != 'disabled'
+            ORDER BY n.id
+            "#,
+        )
+        .bind(app_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(AppError::from)
+    }
+
+    async fn update_app_status(&self, app_id: i64, status: &str) -> Result<(), AppError> {
+        update_app_status_in_db(&self.db, app_id, status).await?;
+        Ok(())
+    }
+
+    async fn ensure_no_active_deploy_task(&self, app_id: i64) -> Result<(), AppError> {
+        if let Some(task) = self.tasks.active_app_task(app_id).await? {
+            return Err(AppError::Conflict(format!(
+                "该应用已有活跃部署任务 #{} {}（{}，{}），请等待结束或取消后再提交",
+                task.id,
+                task.title,
+                active_task_status_label(&task.status),
+                task_phase_label(&task.phase)
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn ensure_app_enabled(app: &AppDetailItem) -> Result<(), AppError> {
+    if app.status == "disabled" {
+        Err(AppError::InvalidInput(
+            "应用已停用，不能执行变更操作".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_app_idle(app: &AppDetailItem) -> Result<(), AppError> {
+    if app.status == "deploying" {
+        Err(AppError::Conflict(
+            "应用正在部署中，请等待当前任务结束".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_has_enabled_targets(nodes: &[AppTargetNode]) -> Result<(), AppError> {
+    if nodes.is_empty() {
+        Err(AppError::InvalidInput(
+            "应用没有可用目标节点，请先启用节点或调整目标节点".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn task_phase_label(phase: &str) -> &'static str {
+    match phase {
+        "queued" => "等待入队",
+        "preflight" => "部署前预检",
+        "preparing_files" => "准备运行文件",
+        "executing" => "执行命令",
+        "healthchecking" => "健康检查",
+        "completed" => "已完成",
+        "failed" => "失败收尾",
+        "canceled" => "已取消",
+        _ => "未知阶段",
+    }
+}
+
+fn select_service_log_node<'a>(
+    nodes: &'a [AppTargetNode],
+    node_id: Option<i64>,
+    empty_message: &str,
+) -> Result<&'a AppTargetNode, AppError> {
+    let Some(node_id) = node_id else {
+        return nodes
+            .first()
+            .ok_or_else(|| AppError::InvalidInput(empty_message.to_owned()));
+    };
+    nodes
+        .iter()
+        .find(|node| node.id == node_id)
+        .ok_or_else(|| AppError::InvalidInput("目标节点不属于当前应用或已禁用".to_owned()))
+}
+
+fn service_target_node_items(
+    nodes: &[AppTargetNode],
+    states: &[AppRuntimeStateItem],
+) -> Vec<ServiceTargetNodeItem> {
+    nodes
+        .iter()
+        .map(|node| service_target_node_item(node, states))
+        .collect()
+}
+
+fn service_target_node_item(
+    node: &AppTargetNode,
+    states: &[AppRuntimeStateItem],
+) -> ServiceTargetNodeItem {
+    let state = states.iter().find(|state| state.node_id == node.id);
+    ServiceTargetNodeItem {
+        id: node.id,
+        name: node.name.clone(),
+        node_key: node.node_key.clone(),
+        runtime_status: state
+            .map(|state| state.runtime_status.clone())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        active_version: state
+            .map(|state| state.active_version.clone())
+            .unwrap_or_default(),
+        service_count: state.map(|state| state.service_count).unwrap_or(0),
+        message: state
+            .map(|state| state.message.clone())
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| "等待首次部署".to_owned()),
+        last_task_id: state.and_then(|state| state.last_task_id),
+        last_task_status: state.and_then(|state| state.last_task_status.clone()),
+        last_task_kind: state.and_then(|state| state.last_task_kind.clone()),
+        last_deploy_at: state.and_then(|state| state.last_deploy_at.clone()),
+        updated_at: state
+            .map(|state| state.updated_at.clone())
+            .unwrap_or_else(|| "未检查".to_owned()),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ServiceRuntimeOverview {
+    status: String,
+    summary: String,
+    active_version: String,
+    latest_message: String,
+    latest_checked_at: String,
+}
+
+fn service_runtime_overview(states: &[AppRuntimeStateItem]) -> ServiceRuntimeOverview {
+    if states.is_empty() {
+        return ServiceRuntimeOverview {
+            status: "unknown".to_owned(),
+            summary: "暂无节点运行记录".to_owned(),
+            active_version: String::new(),
+            latest_message: "暂无健康检查结果".to_owned(),
+            latest_checked_at: "未检查".to_owned(),
+        };
+    }
+
+    let healthy = states
+        .iter()
+        .filter(|state| state.runtime_status == "healthy")
+        .count();
+    let unhealthy = states
+        .iter()
+        .filter(|state| state.runtime_status == "unhealthy")
+        .count();
+    let deploying = states
+        .iter()
+        .filter(|state| state.runtime_status == "deploying")
+        .count();
+    let stopped = states
+        .iter()
+        .filter(|state| state.runtime_status == "stopped")
+        .count();
+    let known = healthy + unhealthy + deploying + stopped;
+    let unknown = states.len().saturating_sub(known);
+    let status = if deploying > 0 {
+        "deploying"
+    } else if unhealthy > 0 {
+        "unhealthy"
+    } else if healthy > 0 && healthy == states.len() {
+        "healthy"
+    } else if stopped > 0 && stopped == states.len() {
+        "stopped"
+    } else {
+        "unknown"
+    };
+    let active_version = common_active_version(states);
+    let (latest_message, latest_checked_at) = latest_runtime_message(states);
+
+    ServiceRuntimeOverview {
+        status: status.to_owned(),
+        summary: format_runtime_summary(healthy, unhealthy, deploying, stopped, unknown),
+        active_version,
+        latest_message,
+        latest_checked_at,
+    }
+}
+
+fn latest_runtime_message(states: &[AppRuntimeStateItem]) -> (String, String) {
+    let Some(state) = states
+        .iter()
+        .filter(|state| state.last_deploy_at.is_some() || state.runtime_status != "unknown")
+        .max_by_key(|state| state.last_deploy_at.as_deref().unwrap_or(&state.updated_at))
+    else {
+        return ("暂无健康检查结果".to_owned(), "未检查".to_owned());
+    };
+    let message = if state.message.trim().is_empty() {
+        "暂无健康检查结果".to_owned()
+    } else {
+        state.message.clone()
+    };
+    let checked_at = state
+        .last_deploy_at
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| state.updated_at.clone());
+    (message, checked_at)
+}
+
+fn health_check_detail_text(
+    config: &HealthCheckConfig,
+    binary_config: Option<&BinaryConfigItem>,
+) -> String {
+    match config.kind {
+        HealthCheckKind::None => "不执行健康检查".to_owned(),
+        HealthCheckKind::Http => format!(
+            "{} · {} 秒 · HTTP {}",
+            display_health_endpoint(&config.endpoint, "未配置地址"),
+            config.timeout_secs,
+            config.expected_status
+        ),
+        HealthCheckKind::Tcp => format!(
+            "{} · {} 秒",
+            display_health_endpoint(&config.endpoint, "未配置地址"),
+            config.timeout_secs
+        ),
+        HealthCheckKind::ComposeRunning => format!("容器运行状态 · {} 秒", config.timeout_secs),
+        HealthCheckKind::SystemdActive => {
+            let endpoint = binary_config
+                .filter(|binary| binary.release_strategy == "blue_green")
+                .map(|binary| {
+                    binary_blue_green_unit_name(
+                        &binary.unit_name,
+                        normalized_slot(&binary.active_slot),
+                    )
+                })
+                .unwrap_or_else(|| config.endpoint.clone());
+            format!(
+                "{} · {} 秒",
+                display_health_endpoint(&endpoint, "未配置 unit"),
+                config.timeout_secs
+            )
+        }
+    }
+}
+
+fn display_health_endpoint(value: &str, fallback: &'static str) -> String {
+    if value.trim().is_empty() {
+        fallback.to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
+fn common_active_version(states: &[AppRuntimeStateItem]) -> String {
+    let mut versions = states
+        .iter()
+        .map(|state| state.active_version.trim())
+        .filter(|version| !version.is_empty());
+    let Some(first) = versions.next() else {
+        return String::new();
+    };
+    if versions.all(|version| version == first) {
+        first.to_owned()
+    } else {
+        "多版本".to_owned()
+    }
+}
+
+fn format_runtime_summary(
+    healthy: usize,
+    unhealthy: usize,
+    deploying: usize,
+    stopped: usize,
+    unknown: usize,
+) -> String {
+    let parts = [
+        (healthy, "健康"),
+        (unhealthy, "异常"),
+        (deploying, "部署中"),
+        (stopped, "已停止"),
+        (unknown, "未知"),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, label)| format!("{label} {count}"))
+    .collect::<Vec<_>>();
+
+    if parts.is_empty() {
+        "暂无节点运行记录".to_owned()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+async fn update_app_status_in_db(
+    db: &SqlitePool,
+    app_id: i64,
+    status: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE apps
+        SET status = ?2,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ?1
+        "#,
+    )
+    .bind(app_id)
+    .bind(status)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComposeTaskAction {
+    Up,
+    Down,
+    Restart,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinaryTaskAction {
+    Restart,
+    Stop,
+}
+
+impl ComposeTaskAction {
+    fn from_task_kind(value: &str) -> Option<Self> {
+        match value {
+            "compose.up" => Some(Self::Up),
+            "compose.down" => Some(Self::Down),
+            "compose.restart" => Some(Self::Restart),
+            _ => None,
+        }
+    }
+
+    fn task_kind(self) -> &'static str {
+        match self {
+            Self::Up => "compose.up",
+            Self::Down => "compose.down",
+            Self::Restart => "compose.restart",
+        }
+    }
+
+    fn deploy_action(self) -> &'static str {
+        match self {
+            Self::Up => "compose_up",
+            Self::Down => "compose_down",
+            Self::Restart => "compose_restart",
+        }
+    }
+
+    fn title_prefix(self) -> &'static str {
+        match self {
+            Self::Up => "部署",
+            Self::Down => "停止",
+            Self::Restart => "重启",
+        }
+    }
+
+    fn success_status(self) -> &'static str {
+        match self {
+            Self::Up | Self::Restart => "running",
+            Self::Down => "ready",
+        }
+    }
+
+    fn runs_health_check(self) -> bool {
+        matches!(self, Self::Up | Self::Restart)
+    }
+
+    fn runtime_status(self, command_success: bool, deployment_status: &str) -> &'static str {
+        if !command_success || deployment_status == "failed" {
+            "unhealthy"
+        } else {
+            match self {
+                Self::Down => "stopped",
+                Self::Up | Self::Restart => "healthy",
+            }
+        }
+    }
+}
+
+impl BinaryTaskAction {
+    pub fn from_task_kind(value: &str) -> Option<Self> {
+        match value {
+            "binary.restart" => Some(Self::Restart),
+            "binary.stop" => Some(Self::Stop),
+            _ => None,
+        }
+    }
+
+    fn task_kind(self) -> &'static str {
+        match self {
+            Self::Restart => "binary.restart",
+            Self::Stop => "binary.stop",
+        }
+    }
+
+    fn deploy_action(self) -> &'static str {
+        match self {
+            Self::Restart => "binary_restart",
+            Self::Stop => "binary_stop",
+        }
+    }
+
+    fn title_prefix(self) -> &'static str {
+        match self {
+            Self::Restart => "重启二进制",
+            Self::Stop => "停止二进制",
+        }
+    }
+
+    fn success_status(self) -> &'static str {
+        match self {
+            Self::Restart => "running",
+            Self::Stop => "ready",
+        }
+    }
+
+    fn runs_health_check(self) -> bool {
+        matches!(self, Self::Restart)
+    }
+
+    fn syncs_runtime_files(self) -> bool {
+        matches!(self, Self::Restart)
+    }
+
+    fn runtime_status(self, command_success: bool, deployment_status: &str) -> &'static str {
+        if !command_success || deployment_status == "failed" {
+            "unhealthy"
+        } else {
+            match self {
+                Self::Restart => "healthy",
+                Self::Stop => "stopped",
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+struct AppTargetNode {
+    id: i64,
+    node_key: String,
+    name: String,
+    node_type: String,
+    status: String,
+    address: String,
+    ssh_port: i64,
+    ssh_user: String,
+    credential_private_key_path: Option<String>,
+    work_dir: String,
+    caddy_available: i64,
+    nginx_available: i64,
+}
+
+impl AppTargetNode {
+    fn ssh_target(&self) -> Result<SshTarget, AppError> {
+        let identity_file = self
+            .credential_private_key_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        SshTarget::new(&self.ssh_user, &self.address, self.ssh_port)
+            .map(|target| target.with_identity_file(identity_file))
+            .map_err(AppError::from)
+    }
+}
+
+fn normalize_key(value: &str) -> Result<String, AppError> {
+    let key = value.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return Err(AppError::InvalidInput("请输入应用标识".to_owned()));
+    }
+    if !key
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err(AppError::InvalidInput(
+            "应用标识仅支持字母、数字、短横线和下划线".to_owned(),
+        ));
+    }
+    Ok(key)
+}
+
+fn normalize_app_type(value: &str) -> Result<String, AppError> {
+    let app_type = value.trim().to_ascii_lowercase();
+    match app_type.as_str() {
+        "compose" | "binary" => Ok(app_type),
+        _ => Err(AppError::InvalidInput("应用类型不支持".to_owned())),
+    }
+}
+
+fn normalize_binary_config(
+    input: NormalizeBinaryConfigInput<'_>,
+) -> Result<BinaryConfigItem, AppError> {
+    let artifact_version = required_text(input.artifact_version, "请输入二进制制品版本")?;
+    let artifact_path = required_text(input.artifact_path, "请输入二进制制品路径")?;
+    let unit_name = normalize_unit_name(input.unit_name, input.app_key)?;
+    let service_user = input.service_user.trim();
+    let service_user = if service_user.is_empty() {
+        "deploy"
+    } else {
+        service_user
+    };
+    if !service_user
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err(AppError::InvalidInput(
+            "运行用户仅支持字母、数字、短横线和下划线".to_owned(),
+        ));
+    }
+    let release_strategy = normalize_binary_release_strategy(input.release_strategy)?;
+    let active_slot = normalize_binary_slot(input.active_slot)?;
+    let base_port = normalize_binary_port(input.base_port, "主槽端口")?;
+    let standby_port = normalize_binary_port(input.standby_port, "备用槽端口")?;
+    let (proxy_enabled, proxy_kind, proxy_domain, proxy_config_path) =
+        normalize_binary_proxy_config(
+            input.proxy_enabled,
+            input.proxy_kind,
+            input.proxy_domain,
+            input.proxy_config_path,
+            &release_strategy,
+            input.app_key,
+        )?;
+
+    Ok(BinaryConfigItem {
+        service_name: input.app_key.to_owned(),
+        artifact_version,
+        artifact_path,
+        exec_args: input.exec_args.trim().to_owned(),
+        working_dir: input.work_dir.trim().to_owned(),
+        service_user: service_user.to_owned(),
+        unit_name,
+        release_strategy,
+        active_slot,
+        base_port,
+        standby_port,
+        proxy_enabled,
+        proxy_kind,
+        proxy_domain,
+        proxy_config_path,
+        env_content: normalize_env_content(input.env_content),
+    })
+}
+
+fn normalize_binary_proxy_config(
+    enabled: bool,
+    kind: &str,
+    domain: &str,
+    config_path: &str,
+    release_strategy: &str,
+    app_key: &str,
+) -> Result<(i64, String, String, String), AppError> {
+    let kind = kind.trim().to_ascii_lowercase();
+    let kind = if kind.is_empty() {
+        "none".to_owned()
+    } else {
+        kind
+    };
+    let domain = domain.trim().to_owned();
+    let config_path = config_path.trim().replace('\\', "/");
+
+    if !enabled {
+        if !matches!(kind.as_str(), "none" | "caddy" | "nginx") {
+            return Err(AppError::InvalidInput(
+                "反向代理类型仅支持 none、caddy 或 nginx".to_owned(),
+            ));
+        }
+        return Ok((0, kind, domain, config_path));
+    }
+
+    if release_strategy != "blue_green" {
+        return Err(AppError::InvalidInput(
+            "反向代理切流仅支持 Blue/Green 发布策略".to_owned(),
+        ));
+    }
+    if !matches!(kind.as_str(), "caddy" | "nginx") {
+        return Err(AppError::InvalidInput(
+            "启用反向代理切流时请选择 caddy 或 nginx".to_owned(),
+        ));
+    }
+    if !is_valid_proxy_domain(&domain) {
+        return Err(AppError::InvalidInput(
+            "反向代理域名仅支持合法域名、IPv4 或 localhost".to_owned(),
+        ));
+    }
+    let config_path = if config_path.is_empty() {
+        default_proxy_config_path(&kind, app_key)
+    } else {
+        normalize_proxy_config_path(&config_path)?
+    };
+    Ok((1, kind, domain, config_path))
+}
+
+fn default_proxy_config_path(kind: &str, app_key: &str) -> String {
+    match kind {
+        "nginx" => format!("/etc/nginx/conf.d/{app_key}.conf"),
+        _ => format!("/etc/caddy/Caddyfile.d/{app_key}.caddy"),
+    }
+}
+
+fn normalize_proxy_config_path(value: &str) -> Result<String, AppError> {
+    if !value.starts_with('/') && !is_windows_absolute_path(value) {
+        return Err(AppError::InvalidInput(
+            "反向代理配置路径必须是绝对路径".to_owned(),
+        ));
+    }
+    if value.contains("//")
+        || value.split('/').any(|part| part == "." || part == "..")
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | ':' | '.' | '-' | '_' | '@'))
+    {
+        return Err(AppError::InvalidInput(
+            "反向代理配置路径仅支持字母、数字、斜线、盘符、点、短横线、下划线和 @".to_owned(),
+        ));
+    }
+    Ok(value.trim_end_matches('/').to_owned())
+}
+
+fn is_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
+}
+
+fn is_valid_proxy_domain(value: &str) -> bool {
+    if value.eq_ignore_ascii_case("localhost") || value.parse::<std::net::Ipv4Addr>().is_ok() {
+        return true;
+    }
+    if value.len() > 253 || value.is_empty() || value.starts_with('.') || value.ends_with('.') {
+        return false;
+    }
+    value.split('.').all(|part| {
+        !part.is_empty()
+            && part.len() <= 63
+            && !part.starts_with('-')
+            && !part.ends_with('-')
+            && part
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    })
+}
+
+fn normalize_binary_release_strategy(value: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok("restart".to_owned());
+    }
+    match value {
+        "restart" | "blue_green" => Ok(value.to_owned()),
+        _ => Err(AppError::InvalidInput(
+            "二进制发布策略仅支持 restart 或 blue_green".to_owned(),
+        )),
+    }
+}
+
+fn normalize_binary_slot(value: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok("blue".to_owned());
+    }
+    match value {
+        "blue" | "green" => Ok(value.to_owned()),
+        _ => Err(AppError::InvalidInput(
+            "当前流量槽位仅支持 blue 或 green".to_owned(),
+        )),
+    }
+}
+
+fn normalize_binary_port(port: i64, label: &str) -> Result<i64, AppError> {
+    if port == 0 || (1..=65535).contains(&port) {
+        Ok(port)
+    } else {
+        Err(AppError::InvalidInput(format!(
+            "{label}需要在 1 到 65535 之间，留空时使用 0"
+        )))
+    }
+}
+
+fn normalize_unit_name(value: &str, app_key: &str) -> Result<String, AppError> {
+    let unit_name = if value.trim().is_empty() {
+        format!("easy-deploy-{app_key}.service")
+    } else {
+        value.trim().to_owned()
+    };
+    if !unit_name.ends_with(".service") {
+        return Err(AppError::InvalidInput(
+            "systemd unit 必须以 .service 结尾".to_owned(),
+        ));
+    }
+    if !unit_name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '@'))
+    {
+        return Err(AppError::InvalidInput(
+            "systemd unit 仅支持字母、数字、短横线、下划线、点和 @".to_owned(),
+        ));
+    }
+    Ok(unit_name)
+}
+
+fn default_binary_config_for_app(app_key: &str, work_dir: &str) -> BinaryConfigItem {
+    BinaryConfigItem {
+        service_name: app_key.to_owned(),
+        artifact_version: String::new(),
+        artifact_path: String::new(),
+        exec_args: String::new(),
+        working_dir: work_dir.to_owned(),
+        service_user: "deploy".to_owned(),
+        unit_name: format!("easy-deploy-{app_key}.service"),
+        release_strategy: "restart".to_owned(),
+        active_slot: "blue".to_owned(),
+        base_port: 0,
+        standby_port: 0,
+        proxy_enabled: 0,
+        proxy_kind: "none".to_owned(),
+        proxy_domain: String::new(),
+        proxy_config_path: String::new(),
+        env_content: String::new(),
+    }
+}
+
+fn required_text(value: &str, message: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(AppError::InvalidInput(message.to_owned()))
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+fn normalize_compose_content(value: &str, app_key: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(default_compose_content(app_key));
+    }
+    let value = strip_top_level_compose_version(value);
+    if !value.contains("services:") {
+        return Err(AppError::InvalidInput(
+            "Compose 内容需要包含 services 定义".to_owned(),
+        ));
+    }
+    Ok(ensure_trailing_newline(&value))
+}
+
+fn render_runtime_metadata(
+    app: &AppDetailItem,
+    target_nodes: Vec<TargetNodeMetadata>,
+    runtime_root: &str,
+    binary: Option<&BinaryConfigItem>,
+) -> String {
+    let mut output = String::new();
+    output.push_str("app_id: ");
+    output.push_str(&app.id.to_string());
+    output.push('\n');
+    push_yaml_string(&mut output, "app_key", &app.app_key);
+    push_yaml_string(&mut output, "name", &app.name);
+    push_yaml_string(&mut output, "description", &app.description);
+    push_yaml_string(&mut output, "app_type", &app.app_type);
+    push_yaml_string(&mut output, "deploy_mode", &app.deploy_mode);
+    push_yaml_string(&mut output, "deploy_strategy", &app.deploy_strategy);
+    push_yaml_string(&mut output, "deploy_work_dir", &app.work_dir);
+    push_yaml_string(&mut output, "runtime_root", runtime_root);
+    output.push_str("target_nodes:\n");
+    for node in target_nodes {
+        output.push_str("  - node_key: \"");
+        output.push_str(&yaml_escape(&node.node_key));
+        output.push_str("\"\n");
+        output.push_str("    name: \"");
+        output.push_str(&yaml_escape(&node.name));
+        output.push_str("\"\n");
+    }
+    if let Some(binary) = binary {
+        output.push_str("binary:\n");
+        push_indented_yaml_string(&mut output, "service_name", &binary.service_name, 2);
+        push_indented_yaml_string(&mut output, "artifact_version", &binary.artifact_version, 2);
+        push_indented_yaml_string(&mut output, "artifact_path", &binary.artifact_path, 2);
+        push_indented_yaml_string(&mut output, "exec_args", &binary.exec_args, 2);
+        push_indented_yaml_string(&mut output, "working_dir", &binary.working_dir, 2);
+        push_indented_yaml_string(&mut output, "service_user", &binary.service_user, 2);
+        push_indented_yaml_string(&mut output, "unit_name", &binary.unit_name, 2);
+        push_indented_yaml_string(&mut output, "release_strategy", &binary.release_strategy, 2);
+        push_indented_yaml_string(&mut output, "active_slot", &binary.active_slot, 2);
+        output.push_str("  base_port: ");
+        output.push_str(&binary.base_port.to_string());
+        output.push('\n');
+        output.push_str("  standby_port: ");
+        output.push_str(&binary.standby_port.to_string());
+        output.push('\n');
+        output.push_str("  proxy_enabled: ");
+        output.push_str(if binary.proxy_enabled == 1 {
+            "true"
+        } else {
+            "false"
+        });
+        output.push('\n');
+        push_indented_yaml_string(&mut output, "proxy_kind", &binary.proxy_kind, 2);
+        push_indented_yaml_string(&mut output, "proxy_domain", &binary.proxy_domain, 2);
+        push_indented_yaml_string(
+            &mut output,
+            "proxy_config_path",
+            &binary.proxy_config_path,
+            2,
+        );
+        push_indented_yaml_string(
+            &mut output,
+            "unit_file",
+            &format!(".easy-deploy/systemd/{}", binary.unit_name),
+            2,
+        );
+        push_indented_yaml_string(
+            &mut output,
+            "env_file",
+            &format!(
+                ".easy-deploy/systemd/{}",
+                binary_unit_env_file_name(&binary.unit_name)
+            ),
+            2,
+        );
+        push_indented_yaml_string(
+            &mut output,
+            "release_file",
+            &format!("releases/{}/release.yaml", binary.artifact_version),
+            2,
+        );
+        push_indented_yaml_string(&mut output, "current_release_file", "current", 2);
+    }
+    output
+}
+
+fn push_yaml_string(output: &mut String, key: &str, value: &str) {
+    output.push_str(key);
+    output.push_str(": \"");
+    output.push_str(&yaml_escape(value));
+    output.push_str("\"\n");
+}
+
+fn push_indented_yaml_string(output: &mut String, key: &str, value: &str, indent: usize) {
+    output.push_str(&" ".repeat(indent));
+    push_yaml_string(output, key, value);
+}
+
+fn yaml_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn to_binary_runtime_metadata(config: &BinaryConfigItem) -> BinaryRuntimeMetadata {
+    BinaryRuntimeMetadata {
+        service_name: config.service_name.clone(),
+        artifact_version: config.artifact_version.clone(),
+        artifact_path: config.artifact_path.clone(),
+        exec_args: config.exec_args.clone(),
+        working_dir: config.working_dir.clone(),
+        service_user: config.service_user.clone(),
+        unit_name: config.unit_name.clone(),
+        release_strategy: config.release_strategy.clone(),
+        active_slot: config.active_slot.clone(),
+        base_port: config.base_port,
+        standby_port: config.standby_port,
+        proxy_enabled: config.proxy_enabled == 1,
+        proxy_kind: config.proxy_kind.clone(),
+        proxy_domain: config.proxy_domain.clone(),
+        proxy_config_path: config.proxy_config_path.clone(),
+        env_content: config.env_content.clone(),
+    }
+}
+
+fn to_binary_runtime_config(
+    app_id: i64,
+    app_key: &str,
+    name: &str,
+    config: &BinaryConfigItem,
+) -> BinaryRuntimeConfig {
+    BinaryRuntimeConfig {
+        app_key: app_key.to_owned(),
+        app_id,
+        name: name.to_owned(),
+        service_name: config.service_name.clone(),
+        artifact_version: config.artifact_version.clone(),
+        artifact_path: config.artifact_path.clone(),
+        exec_args: config.exec_args.clone(),
+        working_dir: config.working_dir.clone(),
+        service_user: config.service_user.clone(),
+        unit_name: config.unit_name.clone(),
+        release_strategy: config.release_strategy.clone(),
+        active_slot: config.active_slot.clone(),
+        base_port: config.base_port,
+        standby_port: config.standby_port,
+        proxy_enabled: config.proxy_enabled == 1,
+        proxy_kind: config.proxy_kind.clone(),
+        proxy_domain: config.proxy_domain.clone(),
+        proxy_config_path: config.proxy_config_path.clone(),
+        env_content: config.env_content.clone(),
+    }
+}
+
+fn binary_unit_env_file_name(unit_name: &str) -> String {
+    let stem = unit_name.strip_suffix(".service").unwrap_or(unit_name);
+    format!("{stem}.env")
+}
+
+fn binary_blue_green_unit_name(unit_name: &str, slot: &str) -> String {
+    let stem = unit_name.strip_suffix(".service").unwrap_or(unit_name);
+    format!("{stem}-{slot}.service")
+}
+
+fn binary_blue_green_job_plan_message(job: &BinaryTaskJob) -> String {
+    let proxy_plan = if job.proxy_enabled {
+        format!(
+            "健康检查通过后会切换 {} 反向代理，失败时保留当前槽位并停止备用槽位",
+            binary_proxy_kind_label(&job.proxy_kind)
+        )
+    } else {
+        "未启用反向代理切流，成功后只记录新槽位".to_owned()
+    };
+    format!(
+        "Blue/Green 预案: 当前槽位 {}({})，备用槽位 {}({})；本次会启动并检查备用槽位 systemd unit，{}",
+        job.active_slot,
+        display_port(job.active_port()),
+        job.target_slot(),
+        display_port(job.target_port()),
+        proxy_plan
+    )
+}
+
+fn standby_slot(active_slot: &str) -> &'static str {
+    if active_slot == "green" {
+        "blue"
+    } else {
+        "green"
+    }
+}
+
+fn normalized_slot(slot: &str) -> &'static str {
+    if slot == "green" { "green" } else { "blue" }
+}
+
+fn display_port(port: i64) -> String {
+    if port > 0 {
+        port.to_string()
+    } else {
+        "未设置端口".to_owned()
+    }
+}
+
+fn target_work_dir_path(work_dir: &str, relative_path: &str) -> String {
+    let normalized_work_dir = work_dir.replace('\\', "/");
+    let work_dir = normalized_work_dir.trim_end_matches('/');
+    if work_dir.is_empty() {
+        relative_path.to_owned()
+    } else {
+        format!("{work_dir}/{relative_path}")
+    }
+}
+
+fn replace_endpoint_port(endpoint: &str, active_port: i64, target_port: i64) -> String {
+    if active_port <= 0 || target_port <= 0 || active_port == target_port {
+        return endpoint.to_owned();
+    }
+    if let Ok(mut url) = Url::parse(endpoint) {
+        if url.port() == Some(active_port as u16) && url.set_port(Some(target_port as u16)).is_ok()
+        {
+            return url.to_string();
+        }
+        return endpoint.to_owned();
+    }
+    let Some((host, port)) = endpoint.rsplit_once(':') else {
+        return endpoint.to_owned();
+    };
+    if port.parse::<i64>().ok() != Some(active_port) {
+        return endpoint.to_owned();
+    }
+    format!("{host}:{target_port}")
+}
+
+struct ArtifactMetadataInput<'a> {
+    source: &'a str,
+    unit_name: &'a str,
+    uploaded_path: &'a str,
+    original_file_name: &'a str,
+    entry_file: &'a str,
+    sha256: &'a str,
+    size_bytes: u64,
+}
+
+fn render_artifact_metadata(input: ArtifactMetadataInput<'_>) -> String {
+    format!(
+        "{{\"source\":\"{}\",\"unit_name\":\"{}\",\"uploaded_path\":\"{}\",\"original_file_name\":\"{}\",\"entry_file\":\"{}\",\"sha256\":\"{}\",\"size_bytes\":{}}}",
+        json_escape(input.source),
+        json_escape(input.unit_name),
+        json_escape(input.uploaded_path),
+        json_escape(input.original_file_name),
+        json_escape(input.entry_file),
+        json_escape(input.sha256),
+        input.size_bytes
+    )
+}
+
+fn artifact_metadata_value(metadata: &str, key: &str) -> String {
+    serde_json::from_str::<JsonValue>(metadata)
+        .ok()
+        .and_then(|value| value.get(key).cloned())
+        .and_then(|field| match field {
+            JsonValue::String(value) => Some(value),
+            JsonValue::Number(value) => Some(value.to_string()),
+            JsonValue::Bool(value) => Some(value.to_string()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn normalize_release_id(value: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(AppError::InvalidInput(
+            "二进制版本仅支持字母、数字、短横线、下划线和点".to_owned(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn artifact_kind_from_file_name(file_name: &str) -> &'static str {
+    if file_name.ends_with(".tar.gz") || file_name.ends_with(".tgz") {
+        "tar_gz"
+    } else {
+        "binary"
+    }
+}
+
+fn normalize_entry_file(
+    entry_file: &str,
+    file_name: &str,
+    artifact_kind: &str,
+) -> Result<String, AppError> {
+    let default_entry = if artifact_kind == "tar_gz" {
+        ""
+    } else {
+        file_name
+    };
+    let value = entry_file.trim();
+    let value = if value.is_empty() {
+        default_entry
+    } else {
+        value
+    };
+    if value.is_empty() {
+        return Err(AppError::InvalidInput(
+            "tar.gz 制品需要填写入口文件，例如 bin/server".to_owned(),
+        ));
+    }
+    if value.starts_with('/')
+        || value.contains('\\')
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(AppError::InvalidInput(
+            "入口文件必须是发布目录内的相对路径".to_owned(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
+fn extract_tar_gz(path: &Path, artifact_version: &str) -> Result<(), AppError> {
+    let release_dir = path
+        .parent()
+        .ok_or_else(|| AppError::Internal("无法定位二进制发布目录".to_owned()))?
+        .to_path_buf();
+    let file = File::open(path).map_err(|err| {
+        AppError::Internal(format!(
+            "读取 tar.gz 制品 {} 失败: {err}",
+            path.to_string_lossy()
+        ))
+    })?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = Archive::new(decoder);
+    let entries = archive.entries().map_err(|err| {
+        AppError::InvalidInput(format!("解析 tar.gz 制品 {artifact_version} 失败: {err}"))
+    })?;
+    for entry in entries {
+        let mut entry = entry.map_err(|err| {
+            AppError::InvalidInput(format!("读取 tar.gz 条目 {artifact_version} 失败: {err}"))
+        })?;
+        let entry_path = entry.path().map_err(|err| {
+            AppError::InvalidInput(format!("读取 tar.gz 路径 {artifact_version} 失败: {err}"))
+        })?;
+        let sanitized = sanitize_archive_path(&entry_path)?;
+        let target = release_dir.join(sanitized);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                AppError::Internal(format!(
+                    "创建解包目录 {} 失败: {err}",
+                    parent.to_string_lossy()
+                ))
+            })?;
+        }
+        entry.unpack(&target).map_err(|err| {
+            AppError::InvalidInput(format!(
+                "解包 tar.gz 条目 {} 失败: {err}",
+                target.to_string_lossy()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn sanitize_archive_path(path: &Path) -> Result<PathBuf, AppError> {
+    let mut output = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => output.push(part),
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err(AppError::InvalidInput(
+                    "tar.gz 制品不能包含绝对路径或上级目录".to_owned(),
+                ));
+            }
+        }
+    }
+    if output.as_os_str().is_empty() {
+        return Err(AppError::InvalidInput("tar.gz 条目路径无效".to_owned()));
+    }
+    Ok(output)
+}
+
+fn default_compose_content(app_key: &str) -> String {
+    format!("services:\n  {app_key}:\n    image: nginx:alpine\n    restart: unless-stopped\n")
+}
+
+fn normalize_env_content(value: &str) -> String {
+    ensure_trailing_newline(value.trim())
+}
+
+fn strip_top_level_compose_version(value: &str) -> String {
+    let mut output = Vec::new();
+    for line in value.lines() {
+        let trimmed = line.trim_start();
+        let is_top_level = line.len() == trimmed.len();
+        if is_top_level && is_compose_version_line(trimmed) {
+            continue;
+        }
+        output.push(line);
+    }
+    output.join("\n").trim().to_owned()
+}
+
+fn is_compose_version_line(value: &str) -> bool {
+    let Some((key, rest)) = value.split_once(':') else {
+        return false;
+    };
+    key.trim() == "version" && !rest.trim().is_empty()
+}
+
+fn strip_common_error_prefix(value: &str) -> &str {
+    value
+        .strip_prefix("Error response from daemon: ")
+        .or_else(|| value.strip_prefix("error during connect: "))
+        .or_else(|| value.strip_prefix("ERROR: "))
+        .or_else(|| value.strip_prefix("Error: "))
+        .unwrap_or(value)
+}
+
+fn ensure_trailing_newline(value: &str) -> String {
+    if value.is_empty() {
+        String::new()
+    } else if value.ends_with('\n') {
+        value.to_owned()
+    } else {
+        format!("{value}\n")
+    }
+}
+
+fn json_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn dedupe_ids(ids: &[i64]) -> Vec<i64> {
+    let mut deduped = Vec::new();
+    for id in ids {
+        if !deduped.contains(id) {
+            deduped.push(*id);
+        }
+    }
+    deduped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_compose_content_strips_top_level_version() {
+        let content = normalize_compose_content(
+            "version: '3.8'\nservices:\n  web:\n    image: nginx\n",
+            "web",
+        )
+        .expect("normalize compose");
+
+        assert!(!content.contains("version: '3.8'"));
+        assert!(content.starts_with("services:\n"));
+        assert!(content.ends_with('\n'));
+    }
+
+    #[test]
+    fn normalize_compose_content_keeps_nested_version_key() {
+        let content = normalize_compose_content(
+            "services:\n  web:\n    image: nginx\n    labels:\n      version: stable\n",
+            "web",
+        )
+        .expect("normalize compose");
+
+        assert!(content.contains("      version: stable"));
+    }
+
+    #[test]
+    fn friendly_command_error_removes_common_prefixes_and_limits_lines() {
+        let message = friendly_command_error(
+            "time=\"2026-06-01\" level=warning msg=noise\nError response from daemon: Cannot connect\nERROR: invalid compose\nignored line\n",
+            "fallback",
+        );
+
+        assert_eq!(message, "Cannot connect；invalid compose；ignored line");
+    }
+
+    #[test]
+    fn friendly_command_error_uses_fallback_for_empty_output() {
+        assert_eq!(
+            friendly_command_error("\n  \n", "docker compose config 返回非 0 状态"),
+            "docker compose config 返回非 0 状态"
+        );
+    }
+
+    #[test]
+    fn parse_compose_host_ports_reads_short_and_long_syntax() {
+        let ports = parse_compose_host_ports(
+            r#"
+services:
+  web:
+    image: nginx
+    ports:
+      - "127.0.0.1:8080:80"
+      - "8443:443/tcp"
+      - "80"
+  api:
+    image: nginx
+    ports:
+      - target: 9000
+        published: "19000"
+        protocol: tcp
+"#,
+        )
+        .expect("parse ports");
+
+        assert_eq!(ports, [8080, 8443, 19000]);
+    }
+
+    #[test]
+    fn parse_compose_host_ports_ignores_dynamic_host_ports() {
+        let ports = parse_compose_host_ports(
+            r#"
+services:
+  web:
+    image: nginx
+    ports:
+      - "80"
+      - target: 9000
+"#,
+        )
+        .expect("parse ports");
+
+        assert!(ports.is_empty());
+    }
+
+    #[test]
+    fn select_uploaded_binary_release_prunes_keeps_recent_uploads_and_active_release() {
+        let rows = [
+            uploaded_binary_artifact(6, "v1.6.0"),
+            uploaded_binary_artifact(5, "v1.5.0"),
+            uploaded_binary_artifact(4, "v1.4.0"),
+            uploaded_binary_artifact(3, "v1.3.0"),
+            uploaded_binary_artifact(2, "v1.2.0"),
+            uploaded_binary_artifact(1, "v1.1.0"),
+            manual_binary_artifact(7, "manual-v1"),
+        ];
+
+        let (ids, versions) = select_uploaded_binary_release_prunes(&rows, "v1.1.0", 4);
+
+        assert_eq!(ids, [2]);
+        assert_eq!(versions, ["v1.2.0"]);
+    }
+
+    #[test]
+    fn select_uploaded_binary_release_prunes_treats_zero_as_one() {
+        let rows = [
+            uploaded_binary_artifact(3, "v1.3.0"),
+            uploaded_binary_artifact(2, "v1.2.0"),
+            uploaded_binary_artifact(1, "v1.1.0"),
+        ];
+
+        let (ids, versions) = select_uploaded_binary_release_prunes(&rows, "v1.3.0", 0);
+
+        assert_eq!(ids, [2, 1]);
+        assert_eq!(versions, ["v1.2.0", "v1.1.0"]);
+    }
+
+    #[test]
+    fn parse_compose_services_reads_image_ports_and_replicas() {
+        let services = parse_compose_services(
+            r#"
+services:
+  worker:
+    image: busybox
+  web:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+      - target: 9000
+        published: "19000"
+    deploy:
+      replicas: 2
+"#,
+        )
+        .expect("parse services");
+
+        assert_eq!(
+            services,
+            [
+                ParsedService {
+                    name: "web".to_owned(),
+                    image: "nginx:alpine".to_owned(),
+                    ports: "8080:80, 19000:9000".to_owned(),
+                    replicas: "2".to_owned(),
+                },
+                ParsedService {
+                    name: "worker".to_owned(),
+                    image: "busybox".to_owned(),
+                    ports: "未声明端口".to_owned(),
+                    replicas: "1".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn occupied_ports_detects_bound_tcp_port() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind dynamic port");
+        let port = listener.local_addr().expect("local addr").port();
+
+        assert_eq!(occupied_ports(&[port]), [port]);
+    }
+
+    #[test]
+    fn binary_blue_green_job_targets_standby_slot() {
+        let mut job = binary_task_job();
+
+        assert_eq!(job.target_slot(), "green");
+        assert_eq!(
+            job.execution_unit_name(),
+            "easy-deploy-worker-bin-green.service"
+        );
+        assert_eq!(job.target_port(), 18080);
+        assert_eq!(job.promoted_slot(true).as_deref(), Some("green"));
+
+        job.active_slot = "green".to_owned();
+        assert_eq!(job.target_slot(), "blue");
+        assert_eq!(
+            job.execution_unit_name(),
+            "easy-deploy-worker-bin-blue.service"
+        );
+        assert_eq!(job.target_port(), 8080);
+    }
+
+    #[test]
+    fn binary_blue_green_health_endpoint_uses_target_port() {
+        let mut job = binary_task_job();
+
+        assert_eq!(
+            job.slot_health_endpoint("http://127.0.0.1:8080/healthz"),
+            "http://127.0.0.1:18080/healthz"
+        );
+        assert_eq!(
+            job.slot_health_endpoint("127.0.0.1:8080"),
+            "127.0.0.1:18080"
+        );
+
+        job.active_slot = "green".to_owned();
+        assert_eq!(
+            job.slot_health_endpoint("http://127.0.0.1:18080/healthz"),
+            "http://127.0.0.1:8080/healthz"
+        );
+    }
+
+    #[test]
+    fn binary_restart_strategy_keeps_primary_unit_and_endpoint() {
+        let mut job = binary_task_job();
+        job.release_strategy = "restart".to_owned();
+
+        assert_eq!(job.execution_unit_name(), "easy-deploy-worker-bin.service");
+        assert_eq!(
+            job.slot_health_endpoint("http://127.0.0.1:8080/healthz"),
+            "http://127.0.0.1:8080/healthz"
+        );
+        assert_eq!(job.promoted_slot(true), None);
+    }
+
+    #[test]
+    fn binary_target_artifact_path_only_matches_release_file_under_deploy_dir() {
+        assert_eq!(
+            binary_target_artifact_path(
+                "/opt/easy-deploy/apps/worker-bin",
+                "/opt/easy-deploy/apps/worker-bin/releases/v1.1.0/worker-bin",
+            )
+            .as_deref(),
+            Some("/opt/easy-deploy/apps/worker-bin/releases/v1.1.0/worker-bin")
+        );
+        assert_eq!(
+            binary_target_artifact_path(
+                "/opt/easy-deploy/apps/worker-bin",
+                "/opt/easy-deploy/artifacts/worker-bin",
+            ),
+            None
+        );
+    }
+
+    fn uploaded_binary_artifact(id: i64, version: &str) -> BinaryArtifactItem {
+        binary_artifact(id, version, r#"{"source":"upload"}"#)
+    }
+
+    fn manual_binary_artifact(id: i64, version: &str) -> BinaryArtifactItem {
+        binary_artifact(id, version, r#"{"source":"manual"}"#)
+    }
+
+    fn binary_artifact(id: i64, version: &str, metadata: &str) -> BinaryArtifactItem {
+        BinaryArtifactItem {
+            id,
+            version: version.to_owned(),
+            artifact_path: format!("/tmp/{version}"),
+            artifact_kind: "file".to_owned(),
+            status: "registered".to_owned(),
+            metadata: metadata.to_owned(),
+            created_at: format!("2026-06-01T00:00:{id:02}Z"),
+        }
+    }
+
+    fn binary_task_job() -> BinaryTaskJob {
+        BinaryTaskJob {
+            task_id: 1,
+            app_id: 1,
+            app_key: "worker-bin".to_owned(),
+            deploy_work_dir: "/opt/easy-deploy/apps/worker-bin".to_owned(),
+            unit_name: "easy-deploy-worker-bin.service".to_owned(),
+            artifact_version: "v1.0.0".to_owned(),
+            artifact_path: "/opt/easy-deploy/apps/worker-bin/releases/v1.0.0/worker-bin".to_owned(),
+            release_strategy: "blue_green".to_owned(),
+            active_slot: "blue".to_owned(),
+            base_port: 8080,
+            standby_port: 18080,
+            proxy_enabled: false,
+            proxy_kind: "none".to_owned(),
+            proxy_domain: String::new(),
+            proxy_config_path: String::new(),
+            deploy_strategy: DeployStrategy::RollingStopOnFailure,
+            action: BinaryTaskAction::Restart,
+        }
+    }
+}

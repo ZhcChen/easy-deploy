@@ -1,0 +1,97 @@
+﻿{% extends "layout.html" %}
+
+{% block title %}{{ product_name }}{% endblock %}
+
+{% block content %}
+<section class="summary-grid" aria-label="平台概览">
+  {% for item in summary_items %}
+    <article class="summary-card tone-{{ item.tone }}">
+      <span>{{ item.label }}</span>
+      <strong>{{ item.value }}</strong>
+      <p>{{ item.detail }}</p>
+    </article>
+  {% endfor %}
+</section>
+
+<section class="main-grid">
+  <section class="panel panel-large" aria-labelledby="apps-title">
+    <div class="panel-header">
+      <div>
+        <h2 id="apps-title">应用</h2>
+        <p>按应用查看运行项、目标节点和最近部署状态。</p>
+      </div>
+      <a class="text-link" href="/apps">查看全部</a>
+    </div>
+
+    <div class="table-wrap">
+      <table class="dashboard-table">
+        <thead>
+          <tr>
+            <th>应用</th>
+            <th>运行项</th>
+            <th>目标节点</th>
+            <th>状态</th>
+            <th>最近更新</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for app in app_rows %}
+            <tr>
+              <td>
+                <strong>{{ app.name }}</strong>
+                <span>{{ app.stack }}</span>
+              </td>
+              <td>{{ app.services }}</td>
+              <td>{{ app.target }}</td>
+              <td><span class="badge tone-{{ app.status_tone }}">{{ app.status }}</span></td>
+              <td>{{ app.updated_at }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <aside class="side-stack">
+    <section class="panel" aria-labelledby="nodes-title">
+      <div class="panel-header compact">
+        <h2 id="nodes-title">节点</h2>
+        <a class="text-link" href="/nodes">管理</a>
+      </div>
+      <div class="node-list">
+        {% for node in node_rows %}
+          <article class="node-row">
+            <div>
+              <strong>{{ node.name }}</strong>
+              <span>{{ node.address }} · {{ node.region }}</span>
+            </div>
+            <div class="node-meta">
+              <span>{{ node.load }}</span>
+              <span class="badge tone-{{ node.status_tone }}">{{ node.status }}</span>
+            </div>
+          </article>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="tasks-title">
+      <div class="panel-header compact">
+        <h2 id="tasks-title">部署任务</h2>
+        <a class="text-link" href="/tasks">队列</a>
+      </div>
+      <div class="task-list">
+        {% for task in task_rows %}
+          <article class="task-row">
+            <div>
+              <strong>{{ task.title }}</strong>
+              <span>{{ task.target }} · {{ task.time }}</span>
+            </div>
+            <span class="badge tone-{{ task.status_tone }}">{{ task.status }}</span>
+          </article>
+        {% endfor %}
+      </div>
+    </section>
+  </aside>
+</section>
+{% endblock %}
+

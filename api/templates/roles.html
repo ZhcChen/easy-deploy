@@ -1,0 +1,259 @@
+﻿{% extends "layout.html" %}
+
+{% block title %}角色管理 - {{ product_name }}{% endblock %}
+
+{% block content %}
+<section class="summary-grid" aria-label="角色概览">
+  {% for item in summary_items %}
+    <article class="summary-card tone-{{ item.tone }}">
+      <span>{{ item.label }}</span>
+      <strong>{{ item.value }}</strong>
+      <p>{{ item.detail }}</p>
+    </article>
+  {% endfor %}
+</section>
+
+<section class="panel filter-panel" aria-labelledby="role-filter-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="role-filter-title">角色筛选</h2>
+      <p>当前条件命中 {{ filtered_count }} 个角色。</p>
+    </div>
+  </div>
+  <form class="filter-form rbac-filter-form" method="get" action="/admin/roles">
+    <label>
+      状态
+      <select name="status">
+        {% for option in status_filters %}
+          <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      权限模块
+      <select name="module">
+        {% for option in module_filters %}
+          <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      关键字
+      <input name="q" value="{{ query }}" placeholder="角色编码、名称、说明">
+    </label>
+    <div class="filter-actions">
+      <button class="primary-button compact-button" type="submit">筛选</button>
+      <a class="ghost-button compact-button" href="/admin/roles">重置</a>
+    </div>
+  </form>
+</section>
+
+<section class="main-grid">
+  <section class="panel panel-large" aria-labelledby="roles-title">
+    <div class="panel-header">
+      <div>
+        <h2 id="roles-title">角色</h2>
+        {% if can_manage %}
+          <p>维护角色状态和权限集合，账号通过角色获得页面和操作授权。</p>
+        {% else %}
+          <p>当前角色只能查看角色、权限数量和权限清单。</p>
+        {% endif %}
+      </div>
+      <div class="panel-actions">
+        {% if can_manage %}
+          <button class="primary-button" type="button" data-modal-target="create-role-modal">新建角色</button>
+        {% endif %}
+        <a class="ghost-button" href="/admin/permissions">权限清单</a>
+        <a class="ghost-button" href="/admin/accounts">账号管理</a>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>角色</th>
+            <th>说明</th>
+            <th>权限数</th>
+            <th>权限覆盖</th>
+            <th>状态</th>
+            {% if can_manage %}
+              <th>操作</th>
+            {% endif %}
+          </tr>
+        </thead>
+        <tbody>
+          {% if roles.len() == 0 %}
+            <tr>
+              <td colspan="{% if can_manage %}6{% else %}5{% endif %}">
+                <div class="empty-state">
+                  <strong>没有匹配的角色</strong>
+                  <span>调整筛选条件后再查看。</span>
+                </div>
+              </td>
+            </tr>
+          {% else %}
+            {% for role in roles %}
+              <tr>
+                <td>
+                  <strong>{{ role.role_name }}</strong>
+                  <span>{{ role.role_code }} · {{ role.system_label }}</span>
+                </td>
+                <td>{{ role.description }}</td>
+                <td>
+                  <strong>{{ role.permission_count }}</strong>
+                  <span>{{ role.action_permission_count }} 个操作权限</span>
+                </td>
+                <td>
+                  <div class="coverage-meter" aria-label="权限覆盖 {{ role.coverage_percent }}%">
+                    <span style="width: {{ role.coverage_percent }}%"></span>
+                  </div>
+                  <span>{{ role.coverage_percent }}% 权限覆盖</span>
+                </td>
+                <td><span class="badge tone-{{ role.status_tone }}">{{ role.status }}</span></td>
+                {% if can_manage %}
+                  <td>
+                    <div class="inline-actions">
+                      {% if role.is_system %}
+                        <span class="muted-text">系统内置角色由平台版本维护</span>
+                      {% else %}
+                        <form method="post" action="/admin/roles/status">
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                          <input type="hidden" name="role_id" value="{{ role.id }}">
+                          <input type="hidden" name="status" value="{% if role.status == "启用" %}disabled{% else %}active{% endif %}">
+                          <button class="text-button" type="submit">{{ role.toggle_label }}</button>
+                        </form>
+                        <button class="text-button" type="button" data-modal-target="role-permissions-{{ role.id }}">权限</button>
+                      {% endif %}
+                    </div>
+                  </td>
+                {% endif %}
+              </tr>
+            {% endfor %}
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <aside class="side-stack">
+    <section class="panel" aria-labelledby="permission-matrix-title">
+      <div class="panel-header compact">
+        <h2 id="permission-matrix-title">权限矩阵</h2>
+      </div>
+      <div class="detail-list">
+        <div>
+          <span>模块</span>
+          <strong>{{ permission_groups.len() }}</strong>
+        </div>
+        <div>
+          <span>策略</span>
+          <strong>页面权限控制入口，操作权限控制按钮和提交动作。</strong>
+        </div>
+      </div>
+    </section>
+
+    {% for group in permission_groups %}
+      <section class="panel" aria-labelledby="perm-{{ group.id }}">
+        <div class="panel-header compact">
+          <h2 id="perm-{{ group.id }}">{{ group.module }}</h2>
+        </div>
+        <div class="permission-list">
+          {% for permission in group.permissions %}
+            <article class="permission-row">
+              <div>
+                <strong>{{ permission.name }}</strong>
+                <span>{{ permission.key }}</span>
+                <p>{{ permission.description }}</p>
+              </div>
+              <span class="badge tone-{{ permission.resource_tone }}">{{ permission.resource_type }}</span>
+            </article>
+          {% endfor %}
+        </div>
+      </section>
+    {% endfor %}
+  </aside>
+</section>
+{% if can_manage %}
+  {% for role in roles %}
+    {% if !role.is_system %}
+      <dialog class="modal-dialog wide-modal" id="role-permissions-{{ role.id }}" aria-labelledby="role-permissions-title-{{ role.id }}">
+        <section class="modal-card">
+          <div class="modal-header">
+            <div>
+              <h2 id="role-permissions-title-{{ role.id }}">角色权限</h2>
+              <p>{{ role.role_name }} · {{ role.role_code }}</p>
+            </div>
+            <button class="modal-close" type="button" data-modal-close aria-label="关闭">×</button>
+          </div>
+          <form class="panel-form" method="post" action="/admin/roles/permissions">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="role_id" value="{{ role.id }}">
+            <span class="field-hint">勾选操作权限时，会自动带上所需页面权限；保存后相关账号会重新登录后生效。</span>
+            <div class="checkbox-list compact-checkbox-list">
+              {% for group in role.permission_groups %}
+                <div class="form-group-label">{{ group.module }}</div>
+                {% for permission in group.permissions %}
+                  <label>
+                    <input type="checkbox" name="permission_ids" value="{{ permission.id }}" data-permission-key="{{ permission.key }}" {% if permission.checked %}checked{% endif %}>
+                    {{ permission.name }}
+                    <span>{{ permission.key }}</span>
+                  </label>
+                {% endfor %}
+              {% endfor %}
+            </div>
+            <button class="primary-button compact-button" type="submit">保存权限</button>
+          </form>
+        </section>
+      </dialog>
+    {% endif %}
+  {% endfor %}
+
+  <dialog class="modal-dialog wide-modal" id="create-role-modal" aria-labelledby="create-role-title">
+    <section class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2 id="create-role-title">新建角色</h2>
+          <p>创建角色并设置初始权限，后续仍可在列表中继续调整。</p>
+        </div>
+        <button class="modal-close" type="button" data-modal-close aria-label="关闭">×</button>
+      </div>
+      <form class="panel-form" method="post" action="/admin/roles">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>
+          角色编码
+          <input name="role_code" placeholder="release_manager" required>
+        </label>
+        <label>
+          角色名称
+          <input name="role_name" placeholder="发布管理员" required>
+        </label>
+        <label>
+          说明
+          <input name="description" placeholder="负责指定应用的发布和回滚">
+        </label>
+        <div class="form-group-label">初始权限</div>
+        <span class="field-hint">操作权限依赖对应页面入口，勾选后会自动补齐。</span>
+        <div class="checkbox-list compact-checkbox-list">
+          {% for group in permission_groups %}
+            <div class="form-group-label">{{ group.module }}</div>
+            {% for permission in group.permissions %}
+              <label>
+                <input type="checkbox" name="permission_ids" value="{{ permission.id }}" data-permission-key="{{ permission.key }}">
+                {{ permission.name }}
+                <span>{{ permission.key }}</span>
+              </label>
+            {% endfor %}
+          {% endfor %}
+        </div>
+        <span class="field-hint">创建后仍可在角色列表中继续调整权限。</span>
+        <button class="primary-button" type="submit">创建角色</button>
+      </form>
+    </section>
+  </dialog>
+{% endif %}
+{% endblock %}
+
+{% block before_scripts %}
+<script type="application/json" id="permission-dependencies">{{ permission_dependencies_json|safe }}</script>
+{% endblock %}
+

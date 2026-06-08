@@ -1,0 +1,230 @@
+﻿{% extends "layout.html" %}
+
+{% block title %}账号管理 - {{ product_name }}{% endblock %}
+
+{% block content %}
+{% if let Some(message) = notice %}
+  <div class="alert alert-success">{{ message }}</div>
+{% endif %}
+
+<section class="summary-grid" aria-label="账号概览">
+  {% for item in summary_items %}
+    <article class="summary-card tone-{{ item.tone }}">
+      <span>{{ item.label }}</span>
+      <strong>{{ item.value }}</strong>
+      <p>{{ item.detail }}</p>
+    </article>
+  {% endfor %}
+</section>
+
+<section class="panel filter-panel" aria-labelledby="account-filter-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="account-filter-title">账号筛选</h2>
+      <p>当前条件命中 {{ filtered_count }} 个账号。</p>
+    </div>
+  </div>
+  <form class="filter-form rbac-filter-form" method="get" action="/admin/accounts">
+    <label>
+      状态
+      <select name="status">
+        {% for option in status_filters %}
+          <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      角色
+      <select name="role">
+        {% for option in role_filters %}
+          <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      关键字
+      <input name="q" value="{{ query }}" placeholder="用户名、显示名称、角色">
+    </label>
+    <div class="filter-actions">
+      <button class="primary-button compact-button" type="submit">筛选</button>
+      <a class="ghost-button compact-button" href="/admin/accounts">重置</a>
+    </div>
+  </form>
+</section>
+
+<section class="main-grid">
+  <section class="panel panel-large" aria-labelledby="accounts-title">
+    <div class="panel-header">
+      <div>
+        <h2 id="accounts-title">账号</h2>
+        {% if can_manage %}
+          <p>创建账号、启停账号、重置密码和分配角色。</p>
+        {% else %}
+          <p>当前角色只能查看账号和角色分配。</p>
+        {% endif %}
+      </div>
+      <div class="panel-actions">
+        {% if can_manage %}
+          <button class="primary-button" type="button" data-modal-target="create-account-modal">新建账号</button>
+        {% endif %}
+        <a class="ghost-button" href="/admin/roles">角色管理</a>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>账号</th>
+            <th>角色</th>
+            <th>状态</th>
+            <th>安全状态</th>
+            <th>活跃会话</th>
+            <th>最近登录</th>
+            {% if can_manage %}
+              <th>操作</th>
+            {% endif %}
+          </tr>
+        </thead>
+        <tbody>
+          {% if accounts.len() == 0 %}
+            <tr>
+              <td colspan="{% if can_manage %}7{% else %}6{% endif %}">
+                <div class="empty-state">
+                  <strong>没有匹配的账号</strong>
+                  <span>调整筛选条件后再查看。</span>
+                </div>
+              </td>
+            </tr>
+          {% else %}
+            {% for account in accounts %}
+              <tr>
+                <td>
+                  <strong>{{ account.display_name }}</strong>
+                  <span>{{ account.username }}</span>
+                </td>
+                <td>{{ account.roles }}</td>
+                <td><span class="badge tone-{{ account.status_tone }}">{{ account.status }}</span></td>
+                <td><span class="badge tone-{{ account.security_tone }}">{{ account.security }}</span></td>
+                <td>
+                  <strong>{{ account.active_session_count }}</strong>
+                  <span>个可续期会话</span>
+                </td>
+                <td>{{ account.last_login_at }}</td>
+                {% if can_manage %}
+                  <td>
+                    <div class="inline-actions">
+                      {% if account.is_current %}
+                        <span class="muted-text">当前账号请在个人中心维护密码和会话</span>
+                      {% else %}
+                        <form method="post" action="/admin/accounts/status">
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                          <input type="hidden" name="account_id" value="{{ account.id }}">
+                          <input type="hidden" name="status" value="{{ account.toggle_status }}">
+                          <button class="text-button" type="submit">{{ account.toggle_label }}</button>
+                        </form>
+                        <button class="text-button" type="button" data-modal-target="account-roles-{{ account.id }}">角色</button>
+                        <button class="text-button" type="button" data-modal-target="account-password-{{ account.id }}">重置密码</button>
+                      {% endif %}
+                    </div>
+                  </td>
+                {% endif %}
+              </tr>
+            {% endfor %}
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+</section>
+{% if can_manage %}
+  {% for account in accounts %}
+    {% if !account.is_current %}
+      <dialog class="modal-dialog" id="account-roles-{{ account.id }}" aria-labelledby="account-roles-title-{{ account.id }}">
+        <section class="modal-card">
+          <div class="modal-header">
+            <div>
+              <h2 id="account-roles-title-{{ account.id }}">分配角色</h2>
+              <p>{{ account.display_name }} · {{ account.username }}</p>
+            </div>
+            <button class="modal-close" type="button" data-modal-close aria-label="关闭">×</button>
+          </div>
+          <form class="panel-form" method="post" action="/admin/accounts/roles">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="account_id" value="{{ account.id }}">
+            <div class="checkbox-list">
+              {% for role in account.role_choices %}
+                <label>
+                  <input type="checkbox" name="role_ids" value="{{ role.id }}" {% if role.checked %}checked{% endif %}>
+                  {{ role.name }}
+                </label>
+              {% endfor %}
+            </div>
+            <button class="primary-button compact-button" type="submit">保存角色</button>
+          </form>
+        </section>
+      </dialog>
+
+      <dialog class="modal-dialog" id="account-password-{{ account.id }}" aria-labelledby="account-password-title-{{ account.id }}">
+        <section class="modal-card">
+          <div class="modal-header">
+            <div>
+              <h2 id="account-password-title-{{ account.id }}">重置密码</h2>
+              <p>{{ account.display_name }} · {{ account.username }}</p>
+            </div>
+            <button class="modal-close" type="button" data-modal-close aria-label="关闭">×</button>
+          </div>
+          <form class="panel-form" method="post" action="/admin/accounts/password">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="account_id" value="{{ account.id }}">
+            <label>
+              新密码
+              <input name="password" type="password" placeholder="至少 8 位" required>
+            </label>
+            <button class="primary-button compact-button" type="submit">保存密码</button>
+          </form>
+        </section>
+      </dialog>
+    {% endif %}
+  {% endfor %}
+
+  <dialog class="modal-dialog" id="create-account-modal" aria-labelledby="create-account-title">
+    <section class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2 id="create-account-title">新建账号</h2>
+          <p>创建后台账号并分配初始角色。</p>
+        </div>
+        <button class="modal-close" type="button" data-modal-close aria-label="关闭">×</button>
+      </div>
+      <form class="panel-form" method="post" action="/admin/accounts">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>
+          用户名
+          <input name="username" placeholder="deploy_user" required>
+        </label>
+        <label>
+          显示名称
+          <input name="display_name" placeholder="部署人员">
+        </label>
+        <label>
+          初始密码
+          <input name="password" type="password" placeholder="至少 8 位" required>
+        </label>
+        <div class="form-group-label">角色</div>
+        <div class="checkbox-list">
+          {% for role in role_options %}
+            <label>
+              <input type="checkbox" name="role_ids" value="{{ role.id }}">
+              {{ role.name }}
+              <span>{{ role.code }}</span>
+            </label>
+          {% endfor %}
+        </div>
+        <button class="primary-button" type="submit">创建账号</button>
+      </form>
+    </section>
+  </dialog>
+{% endif %}
+{% endblock %}
+

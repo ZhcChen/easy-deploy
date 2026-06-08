@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% if bootstrap_required %}初始化管理员{% else %}登录{% endif %} - {{ product_name }}</title>
+    <link rel="icon" href="/favicon.svg?v={{ asset_version }}" type="image/svg+xml">
+    <style>{{ css|safe }}</style>
+  </head>
+  <body class="auth-body">
+    <main class="auth-shell">
+      <section class="auth-panel" aria-labelledby="auth-title">
+        <div class="auth-brand">
+          <img class="brand-logo" src="/assets/logo.svg?v={{ asset_version }}" alt="" width="46" height="46">
+          <div>
+            <strong>{{ product_name }}</strong>
+            <span>{{ release_version }}</span>
+          </div>
+        </div>
+
+        <div class="auth-copy">
+          <p class="eyebrow">{% if bootstrap_required %}首次启动{% else %}安全登录{% endif %}</p>
+          <h1 id="auth-title">{% if bootstrap_required %}初始化超级管理员{% else %}登录部署控制台{% endif %}</h1>
+          <p>
+            {% if bootstrap_required %}
+              当前还没有管理员账号，请先创建超级管理员。
+            {% else %}
+              使用管理员账号进入 Easy Deploy。
+            {% endif %}
+          </p>
+        </div>
+
+        {% if let Some(message) = error_message %}
+          <div class="alert">{{ message }}</div>
+        {% endif %}
+
+        <form class="auth-form" method="post" action="/login">
+          {% if bootstrap_required %}
+            <input type="hidden" name="username" value="admin">
+            <label>
+              用户名
+              <input value="admin" autocomplete="username" readonly>
+              <span class="field-hint">首次初始化固定创建超级管理员账号 admin。</span>
+            </label>
+          {% else %}
+            <label>
+              用户名
+              <input name="username" autocomplete="username" placeholder="admin" required>
+            </label>
+          {% endif %}
+
+          {% if bootstrap_required %}
+            <input type="hidden" name="display_name" value="管理员">
+          {% endif %}
+
+          <label>
+            密码
+            <span class="password-field">
+              <input
+                id="auth-password"
+                name="password"
+                type="password"
+                autocomplete="{% if bootstrap_required %}new-password{% else %}current-password{% endif %}"
+                placeholder="至少 8 个字符"
+                required
+              >
+              {% if bootstrap_required %}
+                <button class="ghost-button compact-button" type="button" data-password-generator data-target="auth-password">
+                  随机密码
+                </button>
+              {% endif %}
+            </span>
+          </label>
+
+          <button class="primary-button auth-submit" type="submit">
+            {% if bootstrap_required %}创建并进入{% else %}登录{% endif %}
+          </button>
+        </form>
+      </section>
+    </main>
+    {% if bootstrap_required %}
+      <script>
+        (() => {
+          const button = document.querySelector("[data-password-generator]");
+          if (!button) return;
+
+          const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*_-+=";
+          button.addEventListener("click", () => {
+            const target = document.getElementById(button.dataset.target);
+            if (!target) return;
+
+            const bytes = new Uint32Array(24);
+            window.crypto.getRandomValues(bytes);
+            target.value = Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join("");
+            target.type = "text";
+            target.focus();
+            target.select();
+          });
+        })();
+      </script>
+    {% endif %}
+  </body>
+</html>

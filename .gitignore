@@ -1,0 +1,16 @@
+/target/
+/tmp/
+tmp/
+.context/
+.playwright-mcp/
+test-results/
+.compound-engineering/*.local.yaml
+/.easy-deploy/
+/easy-deploy.db
+*.db
+*.db-shm
+*.db-wal
+*.tmp
+tmp_*.png
+*.log
+.DS_Store

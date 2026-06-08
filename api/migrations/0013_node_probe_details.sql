@@ -1,0 +1,8 @@
+ALTER TABLE node_checks
+ADD COLUMN os_info TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE node_checks
+ADD COLUMN disk_info TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE node_checks
+ADD COLUMN systemd_version TEXT NOT NULL DEFAULT '';

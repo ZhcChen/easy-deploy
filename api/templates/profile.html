@@ -1,0 +1,55 @@
+﻿{% extends "layout.html" %}
+
+{% block title %}个人中心 - {{ product_name }}{% endblock %}
+
+{% block content %}
+<section class="main-grid">
+  <section class="panel" aria-labelledby="profile-title">
+    <div class="panel-header">
+      <div>
+        <h2 id="profile-title">账号信息</h2>
+        <p>当前登录账号和角色快照。</p>
+      </div>
+    </div>
+    <div class="detail-list">
+      <div>
+        <span>用户名</span>
+        <strong>{{ username }}</strong>
+      </div>
+      <div>
+        <span>显示名称</span>
+        <strong>{{ display_name }}</strong>
+      </div>
+      <div>
+        <span>角色</span>
+        <strong>
+          {% for role_code in role_codes %}
+            {{ role_code }}{% if !loop.last %}、{% endif %}
+          {% endfor %}
+        </strong>
+      </div>
+    </div>
+  </section>
+
+  <aside class="side-stack">
+    <section class="panel" aria-labelledby="password-title">
+      <div class="panel-header compact">
+        <h2 id="password-title">修改密码</h2>
+      </div>
+      <form class="panel-form" method="post" action="/profile/password">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>
+          当前密码
+          <input name="current_password" type="password" autocomplete="current-password" required>
+        </label>
+        <label>
+          新密码
+          <input name="new_password" type="password" autocomplete="new-password" placeholder="至少 8 位" required>
+        </label>
+        <button class="primary-button" type="submit">保存密码</button>
+      </form>
+    </section>
+  </aside>
+</section>
+{% endblock %}
+

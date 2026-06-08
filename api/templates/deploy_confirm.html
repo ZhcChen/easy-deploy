@@ -1,0 +1,296 @@
+﻿{% extends "layout.html" %}
+
+{% block title %}部署确认 - {{ product_name }}{% endblock %}
+
+{% block topbar_actions %}
+<a class="ghost-button" href="/apps/{{ app_id }}">返回应用</a>
+          
+{% endblock %}
+
+{% block content %}
+<section class="summary-grid" aria-label="部署确认概览">
+  <article class="summary-card tone-neutral">
+    <span>应用标识</span>
+    <strong>{{ app_key }}</strong>
+    <p>#{{ app_id }} · {{ app_type }}</p>
+  </article>
+  <article class="summary-card tone-neutral">
+    <span>目标节点</span>
+    <strong>{{ target_count }}</strong>
+    <p>{{ deploy_strategy }}</p>
+  </article>
+  <article class="summary-card tone-{{ action_tone }}">
+    <span>部署动作</span>
+    <strong>{{ action_label }}</strong>
+    <p>{{ action_description }}</p>
+  </article>
+  <article class="summary-card tone-neutral">
+    <span>部署目录</span>
+    <strong>{{ work_dir }}</strong>
+    <p>执行前请确认目标目录正确</p>
+  </article>
+</section>
+
+<section class="main-grid">
+  <section class="panel panel-large" aria-labelledby="confirm-diff-title">
+    <div class="panel-header">
+      <div>
+        <h2 id="confirm-diff-title">配置差异</h2>
+        <p>{{ deploy_diff.baseline }}</p>
+      </div>
+      <span class="badge tone-{{ deploy_diff.status_tone }}">{{ deploy_diff.status }}</span>
+    </div>
+    <div class="deploy-risk-summary tone-{{ deploy_diff.status_tone }}">
+      <div>
+        <span>部署前风险</span>
+        <strong>{{ deploy_diff.risk_title }}</strong>
+        <p>{{ deploy_diff.risk_detail }}</p>
+      </div>
+      <span class="badge tone-{{ deploy_diff.status_tone }}">{{ deploy_diff.changed_count }} 项变化</span>
+    </div>
+    {% if deploy_diff.rows.len() == 0 %}
+      <div class="empty-state">
+        <strong>{{ deploy_diff.empty_title }}</strong>
+        <span>{{ deploy_diff.empty_message }}</span>
+      </div>
+    {% else %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>配置项</th>
+              <th>当前配置</th>
+              <th>上次部署</th>
+              <th>状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in deploy_diff.rows %}
+              <tr>
+                <td><strong>{{ row.label }}</strong></td>
+                <td>{{ row.current_summary }}</td>
+                <td>{{ row.baseline_summary }}</td>
+                <td><span class="badge tone-{{ row.status_tone }}">{{ row.status }}</span></td>
+              </tr>
+              {% if row.has_detail %}
+                <tr class="diff-preview-row">
+                  <td colspan="4">
+                    <div class="diff-preview-grid">
+                      <div>
+                        <span>当前配置片段</span>
+                        <pre class="code-block diff-preview-block">{{ row.current_preview }}</pre>
+                      </div>
+                      <div>
+                        <span>上次部署片段</span>
+                        <pre class="code-block diff-preview-block">{{ row.baseline_preview }}</pre>
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              {% endif %}
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </section>
+
+  <aside class="side-stack">
+    <section class="panel" aria-labelledby="confirm-preflight-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="confirm-preflight-title">预检预览</h2>
+          <p>基于最近一次节点探测提前判断，真正提交后仍会执行任务级预检。</p>
+        </div>
+        <span class="badge tone-{{ preflight_summary_tone }}">{{ preflight_summary }}</span>
+      </div>
+      <div class="preflight-preview-list">
+        {% for row in preflight_rows %}
+          <article class="preflight-preview-row">
+            <div class="preflight-preview-heading">
+              <div>
+                <strong>{{ row.node_name }}</strong>
+                <span>{{ row.node_key }} · {{ row.summary }}</span>
+              </div>
+              <span class="badge tone-{{ row.status_tone }}">{{ row.status }}</span>
+            </div>
+            <div class="preflight-check-list">
+              {% for check in row.checks %}
+                <div>
+                  <span>{{ check.label }}</span>
+                  <strong class="tone-text-{{ check.tone }}">{{ check.result }}</strong>
+                  <small>{{ check.detail }}</small>
+                </div>
+              {% endfor %}
+            </div>
+            {% if row.actions.len() > 0 %}
+              <div class="preflight-action-list">
+                {% for action in row.actions %}
+                  {% if action.action_kind == "check" %}
+                    {% if can_manage_nodes %}
+                      <form method="post" action="/nodes/check">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <input type="hidden" name="node_id" value="{{ row.node_id }}">
+                        <input type="hidden" name="return_to" value="{{ post_action }}/confirm">
+                        <button class="ghost-button compact-button" type="submit">{{ action.label }}</button>
+                      </form>
+                    {% else %}
+                      <a class="ghost-button compact-button" href="/nodes/{{ row.node_id }}">查看节点详情</a>
+                    {% endif %}
+                  {% else if action.action_kind == "install" %}
+                    {% if can_install_nodes %}
+                      <form method="post" action="/nodes/install">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <input type="hidden" name="node_id" value="{{ row.node_id }}">
+                        <input type="hidden" name="component" value="{{ action.component }}">
+                        <input type="hidden" name="return_to" value="{{ post_action }}/confirm">
+                        <button class="ghost-button compact-button" type="submit">{{ action.label }}</button>
+                      </form>
+                    {% else %}
+                      <a class="ghost-button compact-button" href="/nodes/{{ row.node_id }}">{{ action.label }}</a>
+                    {% endif %}
+                  {% else %}
+                    <a class="ghost-button compact-button" href="/nodes/{{ row.node_id }}">{{ action.label }}</a>
+                  {% endif %}
+                {% endfor %}
+              </div>
+            {% endif %}
+          </article>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="confirm-plan-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="confirm-plan-title">部署计划</h2>
+          <p>按当前配置生成，提交后由后台任务逐节点执行。</p>
+        </div>
+      </div>
+      <div class="detail-list">
+        <div>
+          <span>节点顺序</span>
+          <strong>{{ plan_node_order }}</strong>
+        </div>
+        <div>
+          <span>失败处理</span>
+          <strong>{{ plan_failure_policy }}</strong>
+        </div>
+      </div>
+      <div class="deploy-plan-list">
+        {% for step in deploy_plan_steps %}
+          <div class="deploy-plan-step tone-{{ step.tone }}">
+            <span></span>
+            <div>
+              <strong>{{ step.label }}</strong>
+              <p>{{ step.detail }}</p>
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+      <div class="deploy-plan-files">
+        {% for file in deploy_plan_files %}
+          <div>
+            <span>{{ file.label }}</span>
+            <strong>{{ file.path }}</strong>
+            <small>{{ file.detail }}</small>
+          </div>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="confirm-target-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="confirm-target-title">执行目标</h2>
+          <p>确认后会创建部署任务，由后台队列执行。</p>
+        </div>
+      </div>
+      <div class="detail-list">
+        <div>
+          <span>应用</span>
+          <strong>{{ app_name }}</strong>
+        </div>
+        <div>
+          <span>操作</span>
+          <strong><span class="badge tone-{{ action_tone }}">{{ action_label }}</span></strong>
+        </div>
+        <div>
+          <span>目标节点</span>
+          <strong>{{ targets }}</strong>
+        </div>
+        <div>
+          <span>部署策略</span>
+          <strong>{{ deploy_strategy }}</strong>
+        </div>
+        <div>
+          <span>部署目录</span>
+          <strong>{{ work_dir }}</strong>
+        </div>
+      </div>
+      <div class="node-list">
+        {% for node in target_nodes %}
+          <div class="node-row">
+            <div>
+              <strong>{{ node.name }}</strong>
+              <span>{{ node.node_key }} · {{ node.node_type }} · {{ node.docker_status }}</span>
+              <span>{{ node.preflight_hint }}</span>
+            </div>
+            <span class="badge tone-{{ node.status_tone }}">{{ node.status }}</span>
+          </div>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="confirm-health-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="confirm-health-title">健康检查策略</h2>
+          <p>部署或重启成功后按当前配置验证。</p>
+        </div>
+      </div>
+      <div class="detail-list">
+        <div>
+          <span>检查方式</span>
+          <strong>{{ health_check_label }}</strong>
+        </div>
+        <div>
+          <span>检查地址</span>
+          <strong>{{ health_endpoint }}</strong>
+        </div>
+        <div>
+          <span>超时时间</span>
+          <strong>{{ health_timeout_secs }} 秒</strong>
+        </div>
+        <div>
+          <span>HTTP 状态</span>
+          <strong>{{ health_expected_status }}</strong>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="confirm-submit-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="confirm-submit-title">提交任务</h2>
+          <p>{{ preflight_submit_message }}</p>
+        </div>
+      </div>
+      <form class="panel-form" method="post" action="{{ post_action }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="confirmed" value="1">
+        {% if preflight_can_submit %}
+          <button class="primary-button compact-button" type="submit">确认提交</button>
+        {% else %}
+          <button class="primary-button compact-button" type="submit" disabled>确认提交</button>
+        {% endif %}
+        {% if !preflight_can_submit %}
+          <a class="ghost-button compact-button" href="/nodes">去处理节点</a>
+        {% endif %}
+        <a class="ghost-button compact-button" href="/apps/{{ app_id }}">返回应用详情</a>
+      </form>
+    </section>
+  </aside>
+</section>
+{% endblock %}
+

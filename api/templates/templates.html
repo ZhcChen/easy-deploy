@@ -1,0 +1,158 @@
+﻿{% extends "layout.html" %}
+
+{% block title %}部署模板 - {{ product_name }}{% endblock %}
+
+{% block content %}
+<section class="main-grid">
+  <section class="panel panel-large{% if can_create %} panel-full{% endif %}" aria-labelledby="template-list-title">
+    <div class="panel-header">
+      <div>
+        <h2 id="template-list-title">内置 Compose 模板</h2>
+        <p>模板只负责生成初始 compose.yaml 和 .env，不限制后续手动编辑。</p>
+      </div>
+      {% if can_create %}
+        <div class="panel-actions">
+          <button class="primary-button" type="button" data-modal-target="create-template-app-modal">从模板创建</button>
+        </div>
+      {% endif %}
+    </div>
+    <div class="template-grid">
+      {% for template in templates %}
+        <article class="template-card">
+          <div>
+            <strong>{{ template.name }}</strong>
+            <span>{{ template.description }}</span>
+          </div>
+          <div class="template-meta">
+            <span>{{ template.image }}</span>
+            <span>默认端口 {{ template.default_port }}</span>
+            <span>{{ template.env_hint }}</span>
+          </div>
+        </article>
+      {% endfor %}
+    </div>
+  </section>
+
+  {% if !can_create %}
+    <aside class="side-stack">
+      <section class="panel" aria-labelledby="template-readonly-title">
+        <div class="panel-header">
+          <div>
+            <h2 id="template-readonly-title">只读权限</h2>
+            <p>当前账号可以查看模板，但不能创建应用。</p>
+          </div>
+        </div>
+      </section>
+    </aside>
+  {% endif %}
+</section>
+{% if can_create %}
+  <dialog class="modal-dialog" id="create-template-app-modal" aria-labelledby="new-template-title">
+    <section class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2 id="new-template-title">从模板创建</h2>
+          <p>选择内置 Compose 模板生成初始应用配置。</p>
+        </div>
+        <button class="modal-close" type="button" data-modal-close aria-label="关闭">×</button>
+      </div>
+      <form class="panel-form" method="post" action="/templates">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>
+          模板
+          <select id="template-key" name="template_key" required>
+            {% for template in templates %}
+              <option value="{{ template.key }}" data-default-port="{{ template.default_port }}">{{ template.name }} - {{ template.image }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          应用标识
+          <input id="template-app-key" name="app_key" placeholder="redis-cache" required>
+        </label>
+        <label>
+          应用名称
+          <input name="name" placeholder="Redis 缓存" required>
+        </label>
+        <label>
+          部署目录
+          <input id="template-work-dir" name="work_dir" value="{{ default_app_work_dir }}" data-work-dir-template="{{ default_app_work_dir_template }}">
+        </label>
+        <label>
+          部署策略
+          <select name="deploy_strategy">
+            <option value="rolling_stop_on_failure">滚动部署，失败停止</option>
+            <option value="rolling_continue">逐节点继续，最终汇总失败</option>
+          </select>
+        </label>
+        <label>
+          主机端口
+          <input id="template-port" name="port" type="number" min="1" max="65535" value="{{ default_template_port }}" required>
+        </label>
+        <label>
+          描述
+          <input name="description" placeholder="模板创建的 Compose 应用">
+        </label>
+        <div class="form-group-label">目标节点</div>
+        <div class="checkbox-list">
+          {% for node in node_choices %}
+            <label>
+              <input type="checkbox" name="target_node_ids" value="{{ node.id }}">
+              {{ node.label }}
+              <span>{{ node.detail }}</span>
+            </label>
+          {% endfor %}
+        </div>
+        <button class="primary-button compact-button" type="submit">创建应用</button>
+      </form>
+    </section>
+  </dialog>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if can_create %}
+  <script>
+    (() => {
+      const templateKey = document.getElementById("template-key");
+      const portInput = document.getElementById("template-port");
+      const appKeyInput = document.getElementById("template-app-key");
+      const workDirInput = document.getElementById("template-work-dir");
+      if (!templateKey || !portInput) {
+        return;
+      }
+      const workDirTemplate = workDirInput?.dataset.workDirTemplate || "/opt/easy-deploy/apps/{app_key}";
+      const workDirFor = (appKey) => workDirTemplate.replaceAll("{app_key}", appKey);
+      let lastKey = appKeyInput?.value || "redis-cache";
+      const slug = (value) =>
+        (value || "app")
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9_-]+/g, "-")
+          .replace(/^-+|-+$/g, "") || "app";
+      const syncPort = () => {
+        const selected = templateKey.options[templateKey.selectedIndex];
+        const port = selected?.dataset.defaultPort;
+        if (port) {
+          portInput.value = port;
+        }
+      };
+      const syncWorkDir = () => {
+        if (!appKeyInput || !workDirInput) {
+          return;
+        }
+        const appKey = slug(appKeyInput.value);
+        if (!workDirInput.value || workDirInput.value === workDirFor(lastKey)) {
+          workDirInput.value = workDirFor(appKey);
+        }
+        lastKey = appKey;
+      };
+      templateKey.addEventListener("change", syncPort);
+      appKeyInput?.addEventListener("input", syncWorkDir);
+      syncPort();
+      syncWorkDir();
+    })();
+  </script>
+{% endif %}
+{% endblock %}
+

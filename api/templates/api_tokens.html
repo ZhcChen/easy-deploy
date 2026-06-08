@@ -1,0 +1,135 @@
+{% extends "layout.html" %}
+
+{% block title %}API Token - {{ product_name }}{% endblock %}
+
+{% block content %}
+{% if let Some(message) = notice %}
+  <div class="alert alert-success">{{ message }}</div>
+{% endif %}
+
+{% if let Some(token) = created_token %}
+  <section class="panel token-created-panel" aria-labelledby="created-token-title">
+    <div class="panel-header">
+      <div>
+        <h2 id="created-token-title">Token 已生成</h2>
+        <p>明文只在当前页面显示一次，请立即保存到调用方密钥管理中。</p>
+      </div>
+      <span class="badge tone-success">一次性显示</span>
+    </div>
+    <div class="token-created-body">
+      <div>
+        <span>来源</span>
+        <strong>{% if let Some(source) = created_source %}{{ source }}{% endif %}</strong>
+      </div>
+      <div>
+        <span>前缀</span>
+        <strong class="mono-cell">{% if let Some(prefix) = created_prefix %}{{ prefix }}...{% endif %}</strong>
+      </div>
+      <div class="token-value-row">
+        <span>Token</span>
+        <textarea id="created-api-token" readonly rows="3">{{ token }}</textarea>
+        <button class="primary-button compact-button" type="button" data-copy-target="created-api-token" data-copy-done="已复制">复制 Token</button>
+      </div>
+    </div>
+  </section>
+{% endif %}
+
+<section class="summary-grid" aria-label="API Token 概览">
+  {% for item in summary_items %}
+    <article class="summary-card tone-{{ item.tone }}">
+      <span>{{ item.label }}</span>
+      <strong>{{ item.value }}</strong>
+      <p>{{ item.detail }}</p>
+    </article>
+  {% endfor %}
+</section>
+
+<section class="panel panel-large panel-full" aria-labelledby="api-tokens-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="api-tokens-title">API Token</h2>
+      <p>用于 OpenAPI、开发者脚本和 AI 部署调用，列表最多展示最近 100 条。</p>
+    </div>
+    <div class="panel-actions">
+      <a class="ghost-button" href="/docs/openapi" target="_blank" rel="noreferrer">接口文档</a>
+      {% if can_manage %}
+        <button class="primary-button" type="button" data-modal-target="create-api-token-modal">生成 Token</button>
+      {% endif %}
+    </div>
+  </div>
+
+  {% if tokens.len() == 0 %}
+    <div class="empty-state">
+      <strong>暂无 API Token</strong>
+      <span>生成后即可用 Bearer Token 调用 /api/v1 接口。</span>
+    </div>
+  {% else %}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>来源</th>
+            <th>前缀</th>
+            <th>创建者</th>
+            <th>状态</th>
+            <th>最近使用</th>
+            <th>创建时间</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for token in tokens %}
+            <tr>
+              <td>
+                <strong>{{ token.source }}</strong>
+                <span>#{{ token.id }}</span>
+              </td>
+              <td><span class="mono-cell">{{ token.token_prefix }}...</span></td>
+              <td>{{ token.account }}</td>
+              <td><span class="badge tone-{{ token.status_tone }}">{{ token.status }}</span></td>
+              <td>
+                <strong>{{ token.last_used_at }}</strong>
+                <span>{{ token.last_used_ip }}</span>
+              </td>
+              <td>{{ token.created_at }}</td>
+              <td>
+                {% if token.can_revoke %}
+                  <form method="post" action="/admin/api-tokens/revoke">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="token_id" value="{{ token.id }}">
+                    <button class="text-button" type="submit">吊销</button>
+                  </form>
+                {% else %}
+                  <span class="label">{{ token.revoked_at }}</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</section>
+
+{% if can_manage %}
+  <dialog class="modal-dialog" id="create-api-token-modal" aria-labelledby="create-api-token-title">
+    <section class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2 id="create-api-token-title">生成 API Token</h2>
+          <p>给每个调用方单独生成 Token，并用来源标注责任边界。</p>
+        </div>
+        <button class="modal-close" type="button" data-modal-close aria-label="关闭">×</button>
+      </div>
+      <form class="panel-form" method="post" action="/admin/api-tokens">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>
+          来源
+          <input name="source" maxlength="80" placeholder="ci-github-actions / ai-agent-prod / local-script" required>
+        </label>
+        <button class="primary-button compact-button" type="submit">生成</button>
+      </form>
+    </section>
+  </dialog>
+{% endif %}
+{% endblock %}

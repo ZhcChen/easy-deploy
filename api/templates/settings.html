@@ -1,0 +1,117 @@
+﻿{% extends "layout.html" %}
+
+{% block title %}平台设置 - {{ product_name }}{% endblock %}
+
+{% block content %}
+<section class="summary-grid" aria-label="设置概览">
+  {% for item in summary_items %}
+    <article class="summary-card tone-{{ item.tone }}">
+      <span>{{ item.label }}</span>
+      <strong>{{ item.value }}</strong>
+      <p>{{ item.detail }}</p>
+    </article>
+  {% endfor %}
+</section>
+
+<section class="main-grid">
+  <section class="panel panel-large" aria-labelledby="runtime-title">
+    <div class="panel-header">
+      <div>
+        <h2 id="runtime-title">运行时配置</h2>
+        <p>这些启动参数需要通过环境变量或命令行调整，调整后重启 API 生效。</p>
+      </div>
+    </div>
+    <div class="detail-list settings-list">
+      {% for row in runtime_rows %}
+        <div>
+          <span>{{ row.label }}</span>
+          <strong>
+            <span class="path-cell">{{ row.value }}</span>
+            <small>{{ row.detail }}</small>
+          </strong>
+        </div>
+      {% endfor %}
+    </div>
+
+    <div class="panel-header">
+      <div>
+        <h2>存储与运行文件</h2>
+        <p>平台数据库只保存索引和历史，应用部署文件以数据目录为真实来源。</p>
+      </div>
+    </div>
+    <div class="detail-list settings-list">
+      {% for row in storage_rows %}
+        <div>
+          <span>{{ row.label }}</span>
+          <strong>
+            <span class="path-cell">{{ row.value }}</span>
+            <small>{{ row.detail }}</small>
+          </strong>
+        </div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <aside class="side-stack">
+    <section class="panel" aria-labelledby="auth-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="auth-title">认证与授权</h2>
+          <p>当前账号、角色、权限和会话管理共用这套授权边界。</p>
+        </div>
+      </div>
+      <div class="detail-list settings-list compact-detail-list">
+        {% for row in auth_rows %}
+          <div>
+            <span>{{ row.label }}</span>
+            <strong>
+              <span class="path-cell">{{ row.value }}</span>
+              <small>{{ row.detail }}</small>
+            </strong>
+          </div>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="deploy-defaults-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="deploy-defaults-title">部署默认值</h2>
+          <p>这些默认值会保存到平台配置，并在新建应用、模板应用和节点时立即生效。</p>
+        </div>
+      </div>
+      {% if can_update %}
+        <form class="panel-form" method="post" action="/settings">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label>
+            默认应用部署目录
+            <input name="default_app_work_dir" value="{{ default_app_work_dir }}" required>
+            <span class="field-hint">必须包含 {app_key} 占位符，例如 /opt/easy-deploy/apps/{app_key}</span>
+          </label>
+          <label>
+            默认节点工作目录
+            <input name="default_node_work_dir" value="{{ default_node_work_dir }}" required>
+          </label>
+          <label>
+            上传制品保留数
+            <input name="uploaded_binary_releases_to_keep" type="number" min="1" max="30" value="{{ uploaded_binary_releases_to_keep }}" required>
+          </label>
+          <button class="primary-button compact-button" type="submit">保存设置</button>
+        </form>
+      {% endif %}
+      <div class="detail-list settings-list compact-detail-list">
+        {% for row in deploy_rows %}
+          <div>
+            <span>{{ row.label }}</span>
+            <strong>
+              <span class="path-cell">{{ row.value }}</span>
+              <small>{{ row.detail }}</small>
+            </strong>
+          </div>
+        {% endfor %}
+      </div>
+    </section>
+  </aside>
+</section>
+{% endblock %}
+
