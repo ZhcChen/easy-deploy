@@ -9244,7 +9244,6 @@ fn openapi_docs_html() -> String {
       --ed-bg: #f5f7fb;
       --ed-panel: #ffffff;
       --ed-border: #eef0f3;
-      --ed-border-strong: #dbe2ea;
       --ed-text: #172033;
       --ed-muted: #64748b;
       --ed-strong: #334155;
@@ -9254,7 +9253,7 @@ fn openapi_docs_html() -> String {
       --ed-danger-soft: #fff6f4;
       --ed-code: #111827;
       --ed-radius: 8px;
-      --ed-shadow: 0 18px 48px rgba(15, 23, 42, 0.08);
+      --ed-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
     }
 
     * { box-sizing: border-box; }
@@ -9270,7 +9269,7 @@ fn openapi_docs_html() -> String {
     a { color: var(--ed-accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
     h1, h2, h3 { margin: 0; line-height: 1.25; color: #0f172a; }
-    h1 { font-size: 22px; letter-spacing: 0; }
+    h1 { font-size: 20px; letter-spacing: 0; }
     h2 { font-size: 20px; }
     h3 { font-size: 15px; }
     p, ul, ol { margin-top: 0; }
@@ -9311,38 +9310,33 @@ fn openapi_docs_html() -> String {
       width: min(1440px, 100%);
       margin: 0 auto;
     }
-    .openapi-docs-embed__shell {
-      overflow: hidden;
-      border: 1px solid var(--ed-border);
-      border-radius: var(--ed-radius);
-      background: var(--ed-panel);
+    .panel-card {
+      margin-bottom: 0;
+      border-radius: 10px;
+      border: 1px solid #eef0f3;
+      background: #ffffff;
       box-shadow: var(--ed-shadow);
     }
-    .openapi-docs-embed__toolbar {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 16px 18px;
-      border-bottom: 1px solid var(--ed-border);
-      background: #ffffff;
-    }
-    .openapi-docs-embed__title {
+    .panel-card__head {
+      min-height: 56px;
       display: flex;
       align-items: center;
-      gap: 10px;
-      margin-bottom: 6px;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 20px;
+      border-bottom: 1px solid #eef0f3;
     }
-    .openapi-docs-embed__mark {
-      width: 28px;
-      height: 28px;
-      display: inline-grid;
-      place-items: center;
-      border-radius: 6px;
-      background: linear-gradient(135deg, #111827 0%, #3154d4 58%, #0ea5e9 100%);
-      color: #ffffff;
-      font-size: 12px;
-      font-weight: 800;
+    .panel-card__body {
+      padding: 16px 24px 20px;
+    }
+    .openapi-docs-embed__shell {
+      overflow: hidden;
+    }
+    .openapi-docs-embed__heading {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
     }
     .openapi-docs-embed__tag {
       display: inline-flex;
@@ -9357,7 +9351,7 @@ fn openapi_docs_html() -> String {
       font-weight: 700;
     }
     .openapi-docs-embed__summary {
-      max-width: 860px;
+      max-width: 920px;
       margin: 0;
       color: var(--ed-muted);
       font-size: 14px;
@@ -9373,9 +9367,8 @@ fn openapi_docs_html() -> String {
       min-height: 34px;
       display: inline-flex;
       align-items: center;
-      gap: 7px;
       padding: 6px 12px;
-      border: 1px solid var(--ed-border-strong);
+      border: 1px solid #dbe2ea;
       border-radius: 6px;
       background: #ffffff;
       color: #334155;
@@ -9402,8 +9395,6 @@ fn openapi_docs_html() -> String {
       grid-template-columns: 300px minmax(0, 1fr);
       gap: 16px;
       min-height: min(760px, calc(100vh - 210px));
-      padding: 16px;
-      background: #fbfcfe;
     }
     .openapi-docs-embed__nav,
     .openapi-docs-embed__content {
@@ -9582,12 +9573,11 @@ fn openapi_docs_html() -> String {
 
     @media (max-width: 992px) {
       .openapi-docs-page { padding: 12px; }
-      .openapi-docs-embed__toolbar { flex-direction: column; }
+      .panel-card__head { flex-direction: column; align-items: flex-start; }
       .openapi-docs-embed__actions { justify-content: flex-start; }
       .openapi-docs-embed__layout {
         grid-template-columns: 1fr;
         min-height: auto;
-        padding: 12px;
       }
       .openapi-docs-embed__nav { max-height: 320px; }
       .openapi-docs-embed__article { max-height: none; }
@@ -9599,13 +9589,12 @@ fn openapi_docs_html() -> String {
 <body>
   <div class="openapi-docs-page">
     <section class="openapi-docs-embed">
-      <div class="openapi-docs-embed__shell">
-        <header class="openapi-docs-embed__toolbar">
+      <div class="panel-card openapi-docs-embed__shell">
+        <header class="panel-card__head">
           <div>
-            <div class="openapi-docs-embed__title">
-              <span class="openapi-docs-embed__mark">ED</span>
+            <div class="openapi-docs-embed__heading">
               <h1>Easy Deploy OpenAPI 接入文档</h1>
-              <span class="openapi-docs-embed__tag">Public Docs</span>
+              <span class="openapi-docs-embed__tag">接口文档</span>
             </div>
             <p class="openapi-docs-embed__summary">面向开发者、CI 脚本和其他项目中的 AI。AI 读取本文后，应能完成：识别服务、创建应用、写入部署配置、上传版本包、触发部署、轮询任务和定位失败步骤。</p>
           </div>
@@ -9615,8 +9604,8 @@ fn openapi_docs_html() -> String {
             <a class="openapi-docs-embed__button openapi-docs-embed__button--primary" href="/openapi.json" download="easy-deploy-openapi.json">下载 JSON</a>
           </div>
         </header>
-
-        <div class="openapi-docs-embed__layout">
+        <div class="panel-card__body">
+          <div class="openapi-docs-embed__layout">
           <aside class="openapi-docs-embed__nav" aria-label="接口文档目录">
             <div class="openapi-docs-embed__navHead">目录</div>
             <ul class="openapi-docs-embed__tree">
@@ -9820,6 +9809,7 @@ orders-api-prod_version_1_2_3.tar.gz</code></pre>
               </section>
             </article>
           </main>
+        </div>
         </div>
       </div>
     </section>
