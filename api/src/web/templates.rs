@@ -43,6 +43,7 @@ pub struct AppsTemplate<'a> {
     pub apps: &'a [AppPageRow<'a>],
     pub node_choices: &'a [AppNodeChoiceRow<'a>],
     pub selected_type: &'a str,
+    pub selected_environment: &'a str,
     pub selected_status: &'a str,
     pub query: &'a str,
     pub filtered_count: usize,
@@ -75,6 +76,9 @@ pub struct AppDetailTemplate<'a> {
     pub app_key: &'a str,
     pub description: &'a str,
     pub app_type: &'a str,
+    pub environment: &'a str,
+    pub environment_label: &'a str,
+    pub environment_tone: &'a str,
     pub is_binary_app: bool,
     pub deploy_strategy: &'a str,
     pub deploy_strategy_label: &'a str,
@@ -133,7 +137,7 @@ pub struct AppDetailTemplate<'a> {
     pub target_choices: &'a [AppTargetChoiceRow],
     pub binary_releases: &'a [BinaryReleaseRow],
     pub can_manage: bool,
-    pub can_upload_artifact: bool,
+    pub can_view_artifacts: bool,
     pub can_deploy: bool,
     pub can_logs: bool,
     pub compose_result: Option<ComposeResultView>,
@@ -487,6 +491,26 @@ pub struct AuditTemplate<'a> {
 }
 
 #[derive(Template)]
+#[template(path = "events.html")]
+pub struct EventsTemplate<'a> {
+    pub product_name: &'a str,
+    pub css: &'a str,
+    pub asset_version: &'a str,
+    pub release_version: &'a str,
+    pub current_user: &'a str,
+    pub csrf_token: &'a str,
+    pub nav_sections: &'a [NavSection<'a>],
+    pub logs: &'a [EventLogRow<'a>],
+    pub event_type_filters: &'a [AuditFilterOptionRow],
+    pub target_filters: &'a [AuditFilterOptionRow],
+    pub selected_event_type: &'a str,
+    pub selected_level: &'a str,
+    pub selected_target_type: &'a str,
+    pub query: &'a str,
+    pub filtered_count: usize,
+}
+
+#[derive(Template)]
 #[template(path = "tasks.html")]
 pub struct TasksTemplate<'a> {
     pub product_name: &'a str,
@@ -518,11 +542,6 @@ pub struct TemplatesTemplate<'a> {
     pub csrf_token: &'a str,
     pub nav_sections: &'a [NavSection<'a>],
     pub templates: &'a [TemplateCardRow<'a>],
-    pub node_choices: &'a [AppNodeChoiceRow<'a>],
-    pub default_app_work_dir: &'a str,
-    pub default_app_work_dir_template: &'a str,
-    pub default_template_port: u16,
-    pub can_create: bool,
 }
 
 #[derive(Template)]
@@ -537,11 +556,13 @@ pub struct ArtifactsTemplate<'a> {
     pub nav_sections: &'a [NavSection<'a>],
     pub summary_items: &'a [SummaryItem],
     pub artifacts: &'a [ArtifactPageRow],
+    pub binary_apps: &'a [ArtifactAppOptionRow],
     pub selected_status: &'a str,
     pub selected_kind: &'a str,
     pub selected_source: &'a str,
     pub query: &'a str,
     pub uploaded_binary_releases_to_keep: usize,
+    pub can_upload: bool,
 }
 
 #[derive(Template)]
@@ -558,6 +579,7 @@ pub struct TaskDetailTemplate<'a> {
     pub execution_guide: TaskExecutionGuideView,
     pub return_action: TaskReturnActionView,
     pub phases: &'a [TaskPhaseStepRow],
+    pub steps: &'a [TaskStepRow<'a>],
     pub node_results: &'a [TaskNodeResultRow<'a>],
     pub logs: &'a [TaskLogRow<'a>],
     pub can_retry: bool,
@@ -707,6 +729,19 @@ pub struct AuditFilterOptionRow {
     pub selected: bool,
 }
 
+pub struct EventLogRow<'a> {
+    pub id: i64,
+    pub event_type: &'a str,
+    pub level: &'a str,
+    pub level_tone: &'static str,
+    pub target: String,
+    pub title: &'a str,
+    pub summary: &'a str,
+    pub detail: &'a str,
+    pub created_at: &'a str,
+    pub has_detail: bool,
+}
+
 pub struct SummaryItem {
     pub label: &'static str,
     pub value: String,
@@ -730,14 +765,13 @@ pub struct AppPageRow<'a> {
     pub app_key: &'a str,
     pub description: &'a str,
     pub app_type: &'a str,
-    pub deploy_strategy: &'a str,
-    pub work_dir: &'a str,
-    pub status: &'a str,
-    pub status_tone: &'a str,
-    pub targets: &'a str,
-    pub target_count: i64,
+    pub environment: &'a str,
+    pub environment_tone: &'a str,
+    pub runtime_status: &'a str,
+    pub runtime_status_tone: &'a str,
+    pub enabled_status: &'a str,
+    pub enabled_status_tone: &'a str,
     pub updated_at: &'a str,
-    pub created_at: &'a str,
     pub toggle_status: &'static str,
     pub toggle_label: &'static str,
 }
@@ -762,15 +796,21 @@ pub struct AppDeploymentRunRow {
     pub status: &'static str,
     pub status_tone: &'static str,
     pub message: String,
+    pub config_revision: String,
+    pub artifact_version: String,
     pub started_at: String,
     pub finished_at: String,
 }
 
 pub struct AppConfigSnapshotRow {
     pub id: i64,
+    pub revision: String,
     pub kind: &'static str,
     pub compose_summary: String,
     pub env_summary: String,
+    pub binary_summary: String,
+    pub artifact_version: String,
+    pub config_hash: String,
     pub created_at: String,
     pub can_restore: bool,
 }
@@ -818,6 +858,7 @@ pub struct AppRuntimeStateRow {
 pub struct BinaryReleaseRow {
     pub id: i64,
     pub version: String,
+    pub version_code: i64,
     pub artifact_kind: String,
     pub status: &'static str,
     pub status_tone: &'static str,
@@ -825,8 +866,9 @@ pub struct BinaryReleaseRow {
     pub sha256: String,
     pub size: String,
     pub entry_file: String,
+    pub published_at: String,
     pub created_at: String,
-    pub can_rollback: bool,
+    pub can_deploy: bool,
 }
 
 pub struct ArtifactPageRow {
@@ -835,6 +877,7 @@ pub struct ArtifactPageRow {
     pub app_name: String,
     pub app_key: String,
     pub version: String,
+    pub version_code: i64,
     pub artifact_kind: String,
     pub status: &'static str,
     pub status_tone: &'static str,
@@ -843,7 +886,14 @@ pub struct ArtifactPageRow {
     pub size: String,
     pub entry_file: String,
     pub source: String,
+    pub published_at: String,
     pub created_at: String,
+}
+
+pub struct ArtifactAppOptionRow {
+    pub id: i64,
+    pub label: String,
+    pub detail: String,
 }
 
 pub struct ServicePageRow<'a> {
@@ -983,6 +1033,7 @@ pub struct ApiTokenPageRow<'a> {
     pub created_at: &'a str,
     pub revoked_at: &'a str,
     pub can_revoke: bool,
+    pub can_delete: bool,
 }
 
 pub struct NodeCapabilityGuideRow {
@@ -1141,6 +1192,21 @@ pub struct TaskPhaseStepRow {
     pub label: &'static str,
     pub state: &'static str,
     pub tone: &'static str,
+}
+
+pub struct TaskStepRow<'a> {
+    pub step_no: i64,
+    pub title: &'a str,
+    pub node_name: &'a str,
+    pub status: &'a str,
+    pub status_tone: &'static str,
+    pub command: &'a str,
+    pub exit_code: String,
+    pub started_at: &'a str,
+    pub finished_at: &'a str,
+    pub logs: Vec<TaskLogRow<'a>>,
+    pub has_logs: bool,
+    pub is_open: bool,
 }
 
 pub struct TaskNodeResultRow<'a> {

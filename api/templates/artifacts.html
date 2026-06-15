@@ -1,9 +1,9 @@
 ﻿{% extends "layout.html" %}
 
-{% block title %}制品管理 - {{ product_name }}{% endblock %}
+{% block title %}发布版本 - {{ product_name }}{% endblock %}
 
 {% block content %}
-<section class="summary-grid" aria-label="制品概览">
+<section class="summary-grid" aria-label="发布版本概览">
   {% for item in summary_items %}
     <article class="summary-card tone-{{ item.tone }}">
       <span>{{ item.label }}</span>
@@ -13,11 +13,66 @@
   {% endfor %}
 </section>
 
+{% if can_upload %}
+<section class="panel panel-large artifacts-upload-panel" aria-labelledby="artifact-upload-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="artifact-upload-title">上传版本包</h2>
+      <p>版本包会关联到选择的二进制应用。</p>
+    </div>
+  </div>
+  {% if binary_apps.len() == 0 %}
+    <div class="empty-state">
+      <strong>暂无可关联应用</strong>
+      <span>先创建二进制应用，再上传版本包。</span>
+    </div>
+  {% else %}
+    <form class="panel-form artifact-upload-form" method="post" action="/artifacts/upload" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="form-grid artifact-upload-grid">
+        <label>
+          关联应用
+          <select name="app_id" required>
+            {% for app in binary_apps %}
+              <option value="{{ app.id }}">{{ app.label }} · {{ app.detail }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          发布版本
+          <input name="artifact_version" placeholder="v1.2.3" required>
+        </label>
+        <label>
+          versionCode
+          <input name="versionCode" type="number" min="1" placeholder="1002003">
+        </label>
+        <label>
+          发布时间
+          <input name="publishedAt" placeholder="2026-06-09T10:00:00Z">
+        </label>
+        <label>
+          入口文件
+          <input name="entry_file" placeholder="tar.gz 填 bin/server，单文件可留空">
+        </label>
+        <label class="form-span-all">
+          版本包文件
+          <input name="artifact_file" type="file" required>
+        </label>
+      </div>
+      <div class="form-footer-inline">
+        <button class="primary-button compact-button" type="submit">上传版本包</button>
+        <span class="field-hint">OpenAPI 同样使用服务标识上传，页面上传只负责手动补充版本包。</span>
+      </div>
+    </form>
+  {% endif %}
+</section>
+{% endif %}
+
 <section class="panel panel-large" aria-labelledby="artifacts-title">
   <div class="panel-header">
     <div>
-      <h2 id="artifacts-title">最近制品</h2>
-      <p>展示最近 100 条二进制制品；上传制品默认保留最近 {{ uploaded_binary_releases_to_keep }} 个版本。</p>
+      <h2 id="artifacts-title">最近发布版本</h2>
+      <p>展示最近 100 条二进制发布版本；上传版本包默认保留最近 {{ uploaded_binary_releases_to_keep }} 个版本。</p>
     </div>
   </div>
   <form class="filter-form artifacts-filter-form" method="get" action="/artifacts">
@@ -57,8 +112,8 @@
   </form>
   {% if artifacts.len() == 0 %}
     <div class="empty-state">
-      <strong>暂无制品</strong>
-      <span>创建二进制应用、登记路径或上传制品后会出现在这里。</span>
+      <strong>暂无发布版本</strong>
+      <span>创建二进制应用、登记路径或上传版本包后会出现在这里。</span>
     </div>
   {% else %}
     <div class="table-wrap">
@@ -67,12 +122,13 @@
           <tr>
             <th>应用</th>
             <th>版本</th>
+            <th>versionCode</th>
             <th>类型</th>
             <th>大小</th>
             <th>sha256</th>
             <th>入口文件</th>
-            <th>制品路径</th>
-            <th>创建时间</th>
+            <th>部署文件路径</th>
+            <th>发布时间</th>
           </tr>
         </thead>
         <tbody>
@@ -86,6 +142,7 @@
                 <strong>{{ artifact.version }}</strong>
                 <span class="badge tone-{{ artifact.status_tone }}">{{ artifact.status }}</span>
               </td>
+              <td>{{ artifact.version_code }}</td>
               <td>
                 <strong>{{ artifact.artifact_kind }}</strong>
                 <span>{{ artifact.source }}</span>
@@ -94,7 +151,10 @@
               <td><span class="mono-cell">sha256 {{ artifact.sha256 }}</span></td>
               <td><span class="path-cell">{{ artifact.entry_file }}</span></td>
               <td><span class="path-cell">{{ artifact.artifact_path }}</span></td>
-              <td>{{ artifact.created_at }}</td>
+              <td>
+                <strong>{{ artifact.published_at }}</strong>
+                <span>登记 {{ artifact.created_at }}</span>
+              </td>
             </tr>
           {% endfor %}
         </tbody>

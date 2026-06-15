@@ -1,6 +1,8 @@
 # easy-deploy
 
-一个使用 Rust 构建的轻量部署平台。当前仓库先初始化为多模块 Cargo workspace，首期模块包括：
+一个使用 Rust 构建的轻量部署平台。平台自身按单机部署设计：`api` 服务、SQLite 主库和本地数据目录由同一个控制台实例管理，不支持多副本控制台或多实例同时写库。平台可以管理多节点部署目标，但控制台服务本身只建议运行一个实例。
+
+当前仓库先初始化为多模块 Cargo workspace，首期模块包括：
 
 - `api`：主服务模块，承载 Axum Web/API、SQLite 迁移、服务端 HTML 模板和静态资源。
 - `e2e`：验收测试模块，用真实 HTTP 服务启动方式验证主服务基础行为。
@@ -39,12 +41,56 @@
 cargo run -p api -- --bind 127.0.0.1:9066 --database-url sqlite://easy-deploy.db
 ```
 
+服务启动时会自动执行待执行 SQL 迁移。生产部署时保留 SQLite 数据库文件和 `EASY_DEPLOY_DATA_DIR` 数据目录，按“停止旧实例 -> 替换二进制 -> 启动新实例”的单实例流程发布，避免多个 `api` 实例同时迁移或写入同一个 SQLite 数据库。
+
+生产环境推荐用 systemd 直接托管二进制，减少运行时依赖。部署目录和脚本说明见 [systemd 单机部署手册](docs/runbooks/systemd-deploy.md)。
+
 可用环境变量：
 
 - `EASY_DEPLOY_BIND`
 - `EASY_DEPLOY_DATABASE_URL`
 - `EASY_DEPLOY_DATA_DIR`
 - `EASY_DEPLOY_COOKIE_SECURE`：生产 HTTPS 场景建议设为 `true`
+
+## 业务项目部署脚本
+
+仓库根目录提供了一个命名参数风格的 `deploy.sh`，可复制到业务项目使用，也可以直接在本仓库调试 OpenAPI 发布流程。
+
+```bash
+cp .deploy.env.example .deploy.env
+```
+
+在 `.deploy.env` 中配置远程别名：
+
+```bash
+EASY_DEPLOY_LOCAL_URL=http://127.0.0.1:9066
+EASY_DEPLOY_LOCAL_TOKEN=你的 API Token
+
+EASY_DEPLOY_PROD_URL=https://deploy.example.com
+EASY_DEPLOY_PROD_TOKEN=生产 API Token
+```
+
+常用命令：
+
+```bash
+./deploy.sh --remote local --app orders-api-prod --file dist/orders-api-prod_version_1_2_3.tar.gz
+./deploy.sh --remote prod --app orders-api-prod --file dist/orders-api-prod_version_1_2_3.tar.gz --deploy
+./deploy.sh --remote prod --app orders-api-prod --deploy --action binary_restart
+```
+
+版本包命名必须符合：
+
+```text
+<service_key>_version_<x_y_z>.tar.gz
+```
+
+示例：
+
+```text
+orders-api-prod_version_1_2_3.tar.gz
+```
+
+平台会校验包名前缀必须匹配 `--app` 的服务标识，并从包名解析 `version` 与 `versionCode`。
 
 ## 测试
 

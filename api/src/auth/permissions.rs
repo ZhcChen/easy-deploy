@@ -35,8 +35,10 @@ pub struct PermissionView {
 
 pub const DASHBOARD_VIEW: &str = "dashboard.view";
 pub const APPS_VIEW: &str = "apps.view";
+pub const APPS_UPDATE: &str = "apps.update";
 pub const APPS_STATUS: &str = "apps.status";
 pub const SERVICES_VIEW: &str = "services.view";
+pub const SERVICES_DEPLOY: &str = "services.deploy";
 pub const SERVICES_LOGS: &str = "services.logs";
 pub const TASKS_RETRY: &str = "tasks.retry";
 pub const NODES_VIEW: &str = "nodes.view";
@@ -110,11 +112,11 @@ pub fn all_permissions() -> &'static [PermissionDef] {
             module: "服务",
         },
         PermissionDef {
-            key: "services.deploy",
+            key: SERVICES_DEPLOY,
             name: "部署服务",
             description: "发起服务部署任务。",
             resource_type: PermissionResourceType::Action,
-            resource_key: "services.deploy",
+            resource_key: SERVICES_DEPLOY,
             module: "服务",
         },
         PermissionDef {
@@ -207,19 +209,19 @@ pub fn all_permissions() -> &'static [PermissionDef] {
         },
         PermissionDef {
             key: ARTIFACTS_VIEW,
-            name: "查看制品",
-            description: "查看构建制品和版本。",
+            name: "查看发布版本",
+            description: "查看版本包和发布版本。",
             resource_type: PermissionResourceType::Page,
             resource_key: "artifacts",
-            module: "制品",
+            module: "发布版本",
         },
         PermissionDef {
             key: ARTIFACTS_UPLOAD,
-            name: "上传制品",
-            description: "上传二进制制品并登记新版本。",
+            name: "上传版本包",
+            description: "上传二进制版本包并登记发布版本。",
             resource_type: PermissionResourceType::Action,
             resource_key: ARTIFACTS_UPLOAD,
-            module: "制品",
+            module: "发布版本",
         },
         PermissionDef {
             key: RBAC_ACCOUNTS_VIEW,
@@ -339,7 +341,7 @@ pub fn all_permissions() -> &'static [PermissionDef] {
 pub fn permission_dependencies(permission_key: &str) -> &'static [&'static str] {
     match permission_key {
         "apps.create" | "apps.update" | APPS_STATUS => &[APPS_VIEW],
-        "services.deploy" | "services.rollback" => &[APPS_VIEW, SERVICES_VIEW, TASKS_VIEW],
+        SERVICES_DEPLOY | "services.rollback" => &[APPS_VIEW, SERVICES_VIEW, TASKS_VIEW],
         SERVICES_LOGS => &[SERVICES_VIEW],
         NODES_MANAGE => &[NODES_VIEW],
         NODES_INSTALL => &[NODES_VIEW, TASKS_VIEW],
@@ -374,6 +376,7 @@ pub fn nav_permission(path: &str) -> Option<&'static str> {
         "/profile" => Some(PROFILE_VIEW),
         "/settings" => Some(SETTINGS_VIEW),
         "/audit" => Some(AUDIT_VIEW),
+        "/events" => Some(AUDIT_VIEW),
         _ => None,
     }
 }

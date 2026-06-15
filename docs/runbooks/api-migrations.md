@@ -2,7 +2,7 @@
 
 ## 适用范围
 
-本手册适用于 easy-deploy 的 SQLite 主库迁移。当前项目只有一个业务库，迁移文件统一放在：
+本手册适用于 easy-deploy 的 SQLite 主库迁移。easy-deploy 控制台自身按单机部署设计，只有一个业务库，迁移文件统一放在：
 
 ```text
 api/migrations/
@@ -73,7 +73,7 @@ NNNN_snake_case.sql
 -> 执行 smoke / e2e 验收
 ```
 
-当前服务启动时仍会自动执行 pending migration。这是为了保持单机部署工具简单易用。后续如果部署平台自身要做多实例高可用，再把启动自动迁移改成显式发布步骤。
+当前服务启动时会自动执行 pending migration。这是为了保持单机部署工具简单易用。发布时必须保证同一时间只有一个 `api` 实例连接并迁移同一个 SQLite 数据库；不要用多副本控制台或多实例滚动发布 easy-deploy 自身。
 
 ## 数据修复边界
 

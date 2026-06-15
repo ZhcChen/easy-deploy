@@ -1,0 +1,143 @@
+{% extends "layout.html" %}
+
+{% block title %}事件日志 - {{ product_name }}{% endblock %}
+
+{% block content %}
+<section class="panel filter-panel" aria-labelledby="events-filter-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="events-filter-title">事件筛选</h2>
+      <p>当前条件命中 {{ filtered_count }} 条，列表最多展示最近 100 条。</p>
+    </div>
+  </div>
+  <form class="filter-form events-filter-form" method="get" action="/events">
+    <label>
+      类型
+      <select name="event_type">
+        <option value=""{% if selected_event_type == "" %} selected{% endif %}>全部类型</option>
+        {% for option in event_type_filters %}
+          <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      级别
+      <select name="level">
+        <option value=""{% if selected_level == "" %} selected{% endif %}>全部级别</option>
+        <option value="info"{% if selected_level == "info" %} selected{% endif %}>信息</option>
+        <option value="warning"{% if selected_level == "warning" %} selected{% endif %}>警告</option>
+        <option value="error"{% if selected_level == "error" %} selected{% endif %}>错误</option>
+        <option value="debug"{% if selected_level == "debug" %} selected{% endif %}>调试</option>
+      </select>
+    </label>
+    <label>
+      目标
+      <select name="target_type">
+        <option value=""{% if selected_target_type == "" %} selected{% endif %}>全部目标</option>
+        {% for option in target_filters %}
+          <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      关键字
+      <input name="q" value="{{ query }}" placeholder="节点名、摘要、命令输出">
+    </label>
+    <div class="filter-actions">
+      <button class="primary-button compact-button" type="submit">筛选</button>
+      <a class="ghost-button compact-button" href="/events">重置</a>
+    </div>
+  </form>
+</section>
+
+<section class="panel" aria-labelledby="events-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="events-title">最近事件</h2>
+      <p>系统运行事件按发生时间倒序展示，节点探测会保留命令、退出码和输出。</p>
+    </div>
+    <div class="panel-actions">
+      <button class="ghost-button compact-button" type="button" data-copy-target="events-copy-all" data-copy-done="已复制">复制当前结果</button>
+    </div>
+  </div>
+  <textarea id="events-copy-all" class="event-copy-buffer" readonly>事件日志
+筛选条件:
+- 类型: {% if selected_event_type == "" %}全部{% else %}{{ selected_event_type }}{% endif %}
+- 级别: {% if selected_level == "" %}全部{% else %}{{ selected_level }}{% endif %}
+- 目标: {% if selected_target_type == "" %}全部{% else %}{{ selected_target_type }}{% endif %}
+- 关键词: {% if query == "" %}无{% else %}{{ query }}{% endif %}
+- 当前展示: {{ logs.len() }} / {{ filtered_count }}
+
+{% for log in logs %}
+---
+#{{ log.id }}
+时间: {{ log.created_at }}
+级别: {{ log.level }}
+类型: {{ log.event_type }}
+目标: {{ log.target }}
+事件: {{ log.title }}
+摘要: {{ log.summary }}
+详情:
+{{ log.detail }}
+{% endfor %}</textarea>
+  <div class="table-wrap event-table-wrap">
+    <table class="event-table">
+      <thead>
+        <tr>
+          <th>时间</th>
+          <th>级别</th>
+          <th>类型</th>
+          <th>目标</th>
+          <th>事件</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% if logs.len() == 0 %}
+          <tr>
+            <td colspan="5">
+              <div class="empty-state">
+                <strong>没有匹配的事件日志</strong>
+                <span>执行节点探测或调整筛选条件后再查看。</span>
+              </div>
+            </td>
+          </tr>
+        {% else %}
+          {% for log in logs %}
+            <tr>
+              <td>
+                <strong>#{{ log.id }}</strong>
+                <span>{{ log.created_at }}</span>
+              </td>
+              <td><span class="badge tone-{{ log.level_tone }}">{{ log.level }}</span></td>
+              <td><span class="mono-cell">{{ log.event_type }}</span></td>
+              <td>{{ log.target }}</td>
+              <td>
+                <strong>{{ log.title }}</strong>
+                <span>{{ log.summary }}</span>
+                <textarea id="event-copy-{{ log.id }}" class="event-copy-buffer" readonly>#{{ log.id }}
+时间: {{ log.created_at }}
+级别: {{ log.level }}
+类型: {{ log.event_type }}
+目标: {{ log.target }}
+事件: {{ log.title }}
+摘要: {{ log.summary }}
+详情:
+{{ log.detail }}</textarea>
+                <div class="event-row-actions">
+                  <button class="ghost-button compact-button" type="button" data-copy-target="event-copy-{{ log.id }}" data-copy-done="已复制">复制事件</button>
+                </div>
+                {% if log.has_detail %}
+                  <details class="event-log-details">
+                    <summary>查看详情</summary>
+                    <pre class="code-block">{{ log.detail }}</pre>
+                  </details>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

@@ -224,13 +224,12 @@ fn normalize_work_dir(
 }
 
 fn normalize_releases_to_keep(value: &str) -> Result<usize, PlatformConfigError> {
-    let parsed = value
-        .trim()
-        .parse::<usize>()
-        .map_err(|_| PlatformConfigError::InvalidInput("上传制品保留数量必须是数字".to_owned()))?;
+    let parsed = value.trim().parse::<usize>().map_err(|_| {
+        PlatformConfigError::InvalidInput("上传版本包保留数量必须是数字".to_owned())
+    })?;
     if !(1..=30).contains(&parsed) {
         return Err(PlatformConfigError::InvalidInput(
-            "上传制品保留数量必须在 1 到 30 之间".to_owned(),
+            "上传版本包保留数量必须在 1 到 30 之间".to_owned(),
         ));
     }
     Ok(parsed)

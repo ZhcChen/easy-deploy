@@ -99,6 +99,12 @@
                     <input type="hidden" name="token_id" value="{{ token.id }}">
                     <button class="text-button" type="submit">吊销</button>
                   </form>
+                {% else if token.can_delete %}
+                  <form method="post" action="/admin/api-tokens/delete">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="token_id" value="{{ token.id }}">
+                    <button class="text-button danger" type="submit">删除</button>
+                  </form>
                 {% else %}
                   <span class="label">{{ token.revoked_at }}</span>
                 {% endif %}

@@ -6,6 +6,7 @@ use sqlx::{Executor, Row, SqlitePool};
 const BUSINESS_TABLES: &[&str] = &[
     "admin_sessions",
     "admin_audit_logs",
+    "event_logs",
     "operation_task_node_results",
     "operation_task_logs",
     "deployment_runs",

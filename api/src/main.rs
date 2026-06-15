@@ -6,7 +6,8 @@ use api::{
     apps::AppService,
     auth::{AuthService, MemorySessionStore},
     build_router,
-    deploy::{ComposeExecutor, SystemdExecutor, TokioCommandRunner},
+    deploy::{ComposeExecutor, SystemdExecutor, TokioCommandRunner, ssh_known_hosts_file},
+    events::EventLogService,
     maintenance::{CleanDemoDataOptions, clean_demo_data},
     migrations::{self, MigrationCommand},
     node_credentials::NodeCredentialService,
@@ -144,19 +145,21 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
     auth.sync_permission_registry()
         .await
         .context("sync permission registry")?;
-    let nodes = NodeService::new(db.clone(), command_runner.clone());
+    let nodes =
+        NodeService::new_with_data_dir(db.clone(), command_runner.clone(), &settings.data_dir);
     let node_credentials = NodeCredentialService::new(db.clone(), settings.data_dir.clone());
     let tasks = TaskService::new(db.clone());
     let platform = PlatformConfigService::new(db.clone());
+    let events = EventLogService::new(db.clone());
     let apps = AppService::new(
         db.clone(),
         RuntimeFs::new(settings.data_dir.clone()),
         ComposeExecutor::new(command_runner.clone()),
-        SystemdExecutor::new(command_runner),
+        SystemdExecutor::new(command_runner.clone())
+            .with_ssh_known_hosts_file(ssh_known_hosts_file(&settings.data_dir)),
         tasks.clone(),
         platform.clone(),
     );
-
     let listener = TcpListener::bind(settings.bind)
         .await
         .with_context(|| format!("bind {}", settings.bind))?;
@@ -171,6 +174,7 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
             apps,
             tasks,
             platform,
+            events,
         },
     ));
 

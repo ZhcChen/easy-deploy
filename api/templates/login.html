@@ -78,6 +78,22 @@
         </form>
       </section>
     </main>
+    <script>
+      (() => {
+        const form = document.querySelector(".auth-form");
+        if (!form) return;
+
+        form.addEventListener("submit", () => {
+          const button = form.querySelector(".auth-submit");
+          if (!button || button.disabled) return;
+
+          button.textContent = "{% if bootstrap_required %}处理中...{% else %}登录中...{% endif %}";
+          button.disabled = true;
+          button.setAttribute("aria-busy", "true");
+          button.classList.add("is-loading");
+        });
+      })();
+    </script>
     {% if bootstrap_required %}
       <script>
         (() => {

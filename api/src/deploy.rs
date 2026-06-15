@@ -1,7 +1,12 @@
-use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use tokio::{process::Command, time::timeout};
+use tokio::{fs, io::AsyncWriteExt, process::Command, time::timeout};
 
 use crate::settings::DEFAULT_COMMAND_TIMEOUT_SECS;
 
@@ -122,11 +127,13 @@ pub struct ComposeExecutor {
 #[derive(Clone)]
 pub struct SystemdExecutor {
     runner: DynCommandRunner,
+    ssh_known_hosts_file: Option<PathBuf>,
 }
 
 #[derive(Clone)]
 pub struct SshExecutor {
     runner: DynCommandRunner,
+    known_hosts_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +153,17 @@ pub struct ComposeCommandOutput {
 }
 
 pub type CommandOutput = ComposeCommandOutput;
+
+#[derive(Clone, Debug)]
+pub struct SshKnownHostResult {
+    pub lookup_key: String,
+    pub known_hosts_file: PathBuf,
+    pub added: bool,
+}
+
+pub fn ssh_known_hosts_file(data_dir: impl AsRef<Path>) -> PathBuf {
+    data_dir.as_ref().join("ssh").join("known_hosts")
+}
 
 impl ComposeExecutor {
     pub fn new(runner: DynCommandRunner) -> Self {
@@ -297,11 +315,23 @@ impl ComposeExecutor {
 
 impl SystemdExecutor {
     pub fn new(runner: DynCommandRunner) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            ssh_known_hosts_file: None,
+        }
+    }
+
+    pub fn with_ssh_known_hosts_file(mut self, known_hosts_file: impl Into<PathBuf>) -> Self {
+        self.ssh_known_hosts_file = Some(known_hosts_file.into());
+        self
     }
 
     pub fn ssh_executor(&self) -> SshExecutor {
-        SshExecutor::new(self.runner.clone())
+        let mut executor = SshExecutor::new(self.runner.clone());
+        if let Some(known_hosts_file) = &self.ssh_known_hosts_file {
+            executor = executor.with_known_hosts_file(known_hosts_file.clone());
+        }
+        executor
     }
 
     pub async fn daemon_reload(&self, work_dir: PathBuf) -> Result<CommandOutput, DeployError> {
@@ -528,7 +558,15 @@ impl SystemdExecutor {
 
 impl SshExecutor {
     pub fn new(runner: DynCommandRunner) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            known_hosts_file: None,
+        }
+    }
+
+    pub fn with_known_hosts_file(mut self, known_hosts_file: impl Into<PathBuf>) -> Self {
+        self.known_hosts_file = Some(known_hosts_file.into());
+        self
     }
 
     pub async fn mkdir_all(
@@ -559,8 +597,10 @@ impl SshExecutor {
                 local_path.to_string_lossy()
             )));
         }
+        self.ensure_target_known_host(target).await?;
         let remote_path = normalize_remote_absolute_path(remote_path)?;
         let mut args = vec!["-P".to_owned(), target.port.to_string()];
+        append_ssh_known_hosts_args(&mut args, self.known_hosts_file.as_deref());
         if let Some(identity_file) = target.identity_file_arg() {
             args.push("-i".to_owned());
             args.push(identity_file);
@@ -962,7 +1002,9 @@ impl SshExecutor {
         local_work_dir: PathBuf,
         remote_args: Vec<String>,
     ) -> Result<CommandOutput, DeployError> {
+        self.ensure_target_known_host(target).await?;
         let mut args = vec!["-p".to_owned(), target.port.to_string()];
+        append_ssh_known_hosts_args(&mut args, self.known_hosts_file.as_deref());
         if let Some(identity_file) = target.identity_file_arg() {
             args.push("-i".to_owned());
             args.push(identity_file);
@@ -972,6 +1014,19 @@ impl SshExecutor {
         args.push(target.destination());
         args.extend(remote_args);
         self.run_command("ssh", local_work_dir, args).await
+    }
+
+    async fn ensure_target_known_host(&self, target: &SshTarget) -> Result<(), DeployError> {
+        if let Some(known_hosts_file) = &self.known_hosts_file {
+            ensure_ssh_known_host(
+                &self.runner,
+                known_hosts_file,
+                target.address(),
+                i64::from(target.port()),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn run_command(
@@ -1032,6 +1087,14 @@ impl SshTarget {
         self.identity_file.as_ref()
     }
 
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     fn destination(&self) -> String {
         format!("{}@{}", self.user, self.address)
     }
@@ -1041,6 +1104,186 @@ impl SshTarget {
             .as_ref()
             .map(|path| path.to_string_lossy().to_string())
     }
+}
+
+pub async fn ensure_ssh_known_host(
+    runner: &DynCommandRunner,
+    known_hosts_file: &Path,
+    address: &str,
+    port: i64,
+) -> Result<SshKnownHostResult, DeployError> {
+    let address = normalize_ssh_address(address)?;
+    let port = if (1..=65535).contains(&port) {
+        port as u16
+    } else {
+        return Err(DeployError::InvalidInput(
+            "SSH 端口需要在 1 到 65535 之间".to_owned(),
+        ));
+    };
+    let lookup_key = ssh_known_host_lookup_key(&address, port);
+    ensure_known_hosts_parent(known_hosts_file).await?;
+    ensure_known_hosts_file(known_hosts_file).await?;
+    if known_host_entry_exists(runner, known_hosts_file, &lookup_key).await? {
+        return Ok(SshKnownHostResult {
+            lookup_key,
+            known_hosts_file: known_hosts_file.to_path_buf(),
+            added: false,
+        });
+    }
+    append_known_host_entry(runner, known_hosts_file, &address, port).await?;
+    if !known_host_entry_exists(runner, known_hosts_file, &lookup_key).await? {
+        return Err(DeployError::Command(format!(
+            "已采集 SSH 主机指纹，但未能写入 known_hosts: {lookup_key}"
+        )));
+    }
+    Ok(SshKnownHostResult {
+        lookup_key,
+        known_hosts_file: known_hosts_file.to_path_buf(),
+        added: true,
+    })
+}
+
+pub fn ssh_known_host_lookup_key(address: &str, port: u16) -> String {
+    if port == 22 {
+        address.to_owned()
+    } else {
+        format!("[{address}]:{port}")
+    }
+}
+
+pub fn append_ssh_known_hosts_args(args: &mut Vec<String>, known_hosts_file: Option<&Path>) {
+    if let Some(known_hosts_file) = known_hosts_file {
+        args.push("-o".to_owned());
+        args.push(format!(
+            "UserKnownHostsFile={}",
+            known_hosts_file.to_string_lossy()
+        ));
+        args.push("-o".to_owned());
+        args.push("StrictHostKeyChecking=yes".to_owned());
+    }
+}
+
+async fn ensure_known_hosts_parent(path: &Path) -> Result<(), DeployError> {
+    let Some(parent) = path.parent() else {
+        return Err(DeployError::InvalidInput(
+            "known_hosts 路径必须包含父目录".to_owned(),
+        ));
+    };
+    fs::create_dir_all(parent).await.map_err(|err| {
+        DeployError::Command(format!(
+            "创建 SSH known_hosts 目录 {} 失败: {err}",
+            parent.to_string_lossy()
+        ))
+    })
+}
+
+async fn ensure_known_hosts_file(path: &Path) -> Result<(), DeployError> {
+    if fs::metadata(path).await.is_ok() {
+        return Ok(());
+    }
+    fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .await
+        .map(|_| ())
+        .or_else(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(DeployError::Command(format!(
+                    "创建 SSH known_hosts 文件 {} 失败: {err}",
+                    path.to_string_lossy()
+                )))
+            }
+        })
+}
+
+async fn known_host_entry_exists(
+    runner: &DynCommandRunner,
+    known_hosts_file: &Path,
+    lookup_key: &str,
+) -> Result<bool, DeployError> {
+    let result = runner
+        .run(CommandSpec {
+            program: "ssh-keygen".to_owned(),
+            args: vec![
+                "-F".to_owned(),
+                lookup_key.to_owned(),
+                "-f".to_owned(),
+                known_hosts_file.to_string_lossy().to_string(),
+            ],
+            current_dir: PathBuf::from("."),
+        })
+        .await?;
+    Ok(result.success())
+}
+
+async fn append_known_host_entry(
+    runner: &DynCommandRunner,
+    known_hosts_file: &Path,
+    address: &str,
+    port: u16,
+) -> Result<(), DeployError> {
+    let result = runner
+        .run(CommandSpec {
+            program: "ssh-keyscan".to_owned(),
+            args: vec![
+                "-p".to_owned(),
+                port.to_string(),
+                "-T".to_owned(),
+                "10".to_owned(),
+                "-H".to_owned(),
+                address.to_owned(),
+            ],
+            current_dir: PathBuf::from("."),
+        })
+        .await?;
+    if !result.success() {
+        let output = result.combined_output();
+        return Err(DeployError::Command(if output.trim().is_empty() {
+            format!("采集 SSH 主机指纹失败: {address}:{port}")
+        } else {
+            format!("采集 SSH 主机指纹失败: {output}")
+        }));
+    }
+    let entries = result
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return Err(DeployError::Command(format!(
+            "采集 SSH 主机指纹失败: {address}:{port} 没有返回有效指纹"
+        )));
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(known_hosts_file)
+        .await
+        .map_err(|err| {
+            DeployError::Command(format!(
+                "打开 SSH known_hosts 文件 {} 失败: {err}",
+                known_hosts_file.to_string_lossy()
+            ))
+        })?;
+    for entry in entries {
+        file.write_all(entry.as_bytes()).await.map_err(|err| {
+            DeployError::Command(format!(
+                "写入 SSH known_hosts 文件 {} 失败: {err}",
+                known_hosts_file.to_string_lossy()
+            ))
+        })?;
+        file.write_all(b"\n").await.map_err(|err| {
+            DeployError::Command(format!(
+                "写入 SSH known_hosts 文件 {} 失败: {err}",
+                known_hosts_file.to_string_lossy()
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 fn render_command(program: &str, args: &[String]) -> String {
@@ -1232,10 +1475,33 @@ mod tests {
     #[async_trait]
     impl CommandRunner for RecordingRunner {
         async fn run(&self, spec: CommandSpec) -> Result<CommandResult, DeployError> {
+            let (status_code, stdout) = match spec.program.as_str() {
+                "ssh-keygen" => {
+                    let known_hosts_file = spec
+                        .args
+                        .windows(2)
+                        .find(|window| window[0] == "-f")
+                        .map(|window| PathBuf::from(&window[1]));
+                    let exists = known_hosts_file
+                        .as_ref()
+                        .and_then(|path| std::fs::read_to_string(path).ok())
+                        .is_some_and(|content| content.contains("ssh-ed25519"));
+                    (
+                        if exists { Some(0) } else { Some(1) },
+                        if exists {
+                            "10.0.2.11 ssh-ed25519 AAAA\n"
+                        } else {
+                            ""
+                        },
+                    )
+                }
+                "ssh-keyscan" => (Some(0), "10.0.2.11 ssh-ed25519 AAAA\n"),
+                _ => (Some(0), "ok\n"),
+            };
             self.specs.lock().expect("lock specs").push(spec);
             Ok(CommandResult {
-                status_code: Some(0),
-                stdout: "ok\n".to_owned(),
+                status_code,
+                stdout: stdout.to_owned(),
                 stderr: String::new(),
             })
         }
@@ -1543,6 +1809,37 @@ mod tests {
             ]
         );
         assert_eq!(specs[0].current_dir, work_dir.path());
+    }
+
+    #[tokio::test]
+    async fn ssh_executor_uses_managed_known_hosts_when_configured() {
+        let work_dir = tempdir().expect("temp dir");
+        let known_hosts_file = work_dir.path().join("ssh").join("known_hosts");
+        let runner = Arc::new(RecordingRunner::default());
+        let executor =
+            SshExecutor::new(runner.clone()).with_known_hosts_file(known_hosts_file.clone());
+        let target = SshTarget::new("deploy", "10.0.2.11", 22).expect("valid ssh target");
+
+        executor
+            .restart(&target, work_dir.path().to_path_buf(), "orders-api.service")
+            .await
+            .expect("run remote restart");
+
+        let specs = runner.specs.lock().expect("lock specs");
+        assert_eq!(specs[0].program, "ssh-keygen");
+        assert_eq!(specs[1].program, "ssh-keyscan");
+        assert_eq!(specs[2].program, "ssh-keygen");
+        assert_eq!(specs[3].program, "ssh");
+        assert!(specs[3].args.iter().any(
+            |arg| arg == &format!("UserKnownHostsFile={}", known_hosts_file.to_string_lossy())
+        ));
+        assert!(
+            specs[3]
+                .args
+                .contains(&"StrictHostKeyChecking=yes".to_owned())
+        );
+        let known_hosts = std::fs::read_to_string(&known_hosts_file).expect("known hosts");
+        assert!(known_hosts.contains("ssh-ed25519"));
     }
 
     #[tokio::test]

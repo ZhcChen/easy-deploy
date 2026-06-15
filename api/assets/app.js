@@ -1,5 +1,109 @@
 (() => {
   const MODAL_CLOSING_CLASS = "is-closing";
+  const APP_CONFIG_KIND = "easy-deploy.app-config";
+  const APP_CONFIG_BASE_FIELDS = ["work_dir", "deploy_strategy"];
+  const APP_CONFIG_COMPOSE_FIELDS = ["compose_content", "env_content"];
+  const APP_CONFIG_HEALTH_FIELDS = [
+    "health_check_kind",
+    "health_endpoint",
+    "health_timeout_secs",
+    "health_expected_status",
+  ];
+  const APP_CONFIG_BINARY_FIELDS = [
+    "binary_artifact_version",
+    "binary_artifact_path",
+    "binary_exec_args",
+    "binary_service_user",
+    "binary_unit_name",
+    "binary_release_strategy",
+    "binary_active_slot",
+    "binary_base_port",
+    "binary_standby_port",
+    "binary_proxy_kind",
+    "binary_proxy_domain",
+    "binary_proxy_config_path",
+  ];
+  const APP_CONFIG_BOOLEAN_FIELDS = ["binary_proxy_enabled"];
+  const APP_CONFIG_NUMBER_FIELDS = new Set([
+    "health_timeout_secs",
+    "health_expected_status",
+    "binary_base_port",
+    "binary_standby_port",
+  ]);
+  const APP_CONFIG_FIELD_NAMES = new Set([
+    ...APP_CONFIG_BASE_FIELDS,
+    ...APP_CONFIG_COMPOSE_FIELDS,
+    ...APP_CONFIG_HEALTH_FIELDS,
+    ...APP_CONFIG_BINARY_FIELDS,
+    ...APP_CONFIG_BOOLEAN_FIELDS,
+  ]);
+  const UTC_TIMESTAMP_TEXT_PATTERN =
+    /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/;
+  const UTC_TIMESTAMP_REPLACE_PATTERN =
+    /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/g;
+  const TIMESTAMP_SKIP_SELECTOR =
+    "script, style, textarea, input, select, option, code, pre, kbd, samp";
+  const configStatusTimers = new WeakMap();
+
+  const padTimePart = (value) => String(value).padStart(2, "0");
+
+  const formatEast8Timestamp = (value) => {
+    const timestamp = Date.parse(value);
+    if (!Number.isFinite(timestamp)) return value;
+
+    const east8 = new Date(timestamp + 8 * 60 * 60 * 1000);
+    return [
+      east8.getUTCFullYear(),
+      padTimePart(east8.getUTCMonth() + 1),
+      padTimePart(east8.getUTCDate()),
+    ].join("-") + " " + [
+      padTimePart(east8.getUTCHours()),
+      padTimePart(east8.getUTCMinutes()),
+      padTimePart(east8.getUTCSeconds()),
+    ].join(":");
+  };
+
+  const shouldFormatTimestampNode = (node) => {
+    const parent = node.parentElement;
+    return parent && !parent.isContentEditable && !parent.closest(TIMESTAMP_SKIP_SELECTOR);
+  };
+
+  const formatTimestampTextNode = (node) => {
+    const value = node.nodeValue || "";
+    if (!UTC_TIMESTAMP_TEXT_PATTERN.test(value) || !shouldFormatTimestampNode(node)) return;
+
+    node.nodeValue = value.replace(UTC_TIMESTAMP_REPLACE_PATTERN, formatEast8Timestamp);
+  };
+
+  const formatEast8Timestamps = (root = document.body) => {
+    if (!root) return;
+
+    if (root.nodeType === Node.TEXT_NODE) {
+      formatTimestampTextNode(root);
+      return;
+    }
+
+    if (!(root instanceof Element) && root !== document.body) return;
+    if (root instanceof Element && root.closest(TIMESTAMP_SKIP_SELECTOR)) return;
+
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    while (walker.nextNode()) {
+      nodes.push(walker.currentNode);
+    }
+    nodes.forEach(formatTimestampTextNode);
+  };
+
+  const observeEast8Timestamps = () => {
+    formatEast8Timestamps();
+
+    const observer = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => {
+        mutation.addedNodes.forEach(formatEast8Timestamps);
+      });
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+  };
 
   const openModal = (button) => {
     const target = button.getAttribute("data-modal-target");
@@ -67,6 +171,36 @@
     return copied;
   };
 
+  const writeClipboardText = async (value) => {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return;
+    }
+
+    const textarea = document.createElement("textarea");
+    textarea.value = value;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.top = "-1000px";
+    textarea.style.left = "-1000px";
+    document.body.appendChild(textarea);
+    try {
+      if (!fallbackCopy(textarea)) {
+        throw new Error("copy failed");
+      }
+    } finally {
+      textarea.remove();
+    }
+  };
+
+  const readClipboardText = async () => {
+    if (navigator.clipboard?.readText) {
+      return navigator.clipboard.readText();
+    }
+
+    return window.prompt("浏览器不允许直接读取剪贴板，请粘贴配置 JSON", "") || "";
+  };
+
   const copyTarget = async (button) => {
     const targetId = button.getAttribute("data-copy-target");
     if (!targetId) return;
@@ -82,11 +216,7 @@
       const value = textForCopy(target).trim();
       if (!value) return;
 
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(value);
-      } else if (!fallbackCopy(target)) {
-        throw new Error("copy failed");
-      }
+      await writeClipboardText(value);
 
       button.textContent = doneText;
     } catch (_err) {
@@ -95,6 +225,343 @@
       window.setTimeout(() => {
         button.textContent = originalText;
       }, 1400);
+    }
+  };
+
+  const namedControls = (root, name) =>
+    Array.from(root.querySelectorAll("input, textarea, select")).filter(
+      (control) => control.name === name,
+    );
+
+  const isHiddenControl = (control) =>
+    control.hidden ||
+    (control instanceof HTMLInputElement && control.type === "hidden");
+
+  const preferredControl = (controls) =>
+    controls.find((control) => !isHiddenControl(control)) || controls[0];
+
+  const toBoolean = (value) => {
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") return value !== 0;
+    return ["1", "true", "on", "yes"].includes(String(value).trim().toLowerCase());
+  };
+
+  const normalizeFieldValue = (name, value) => {
+    if (APP_CONFIG_BOOLEAN_FIELDS.includes(name)) {
+      return toBoolean(value);
+    }
+
+    if (APP_CONFIG_NUMBER_FIELDS.has(name)) {
+      const trimmed = String(value ?? "").trim();
+      if (trimmed === "") return "";
+      const parsed = Number(trimmed);
+      return Number.isFinite(parsed) ? parsed : trimmed;
+    }
+
+    return value ?? "";
+  };
+
+  const readFieldValue = (root, name) => {
+    const control = preferredControl(namedControls(root, name));
+    if (!control) {
+      if (name === "work_dir") return root.getAttribute("data-app-work-dir") || "";
+      if (name === "deploy_strategy") {
+        return root.getAttribute("data-app-deploy-strategy") || "";
+      }
+      return "";
+    }
+
+    if (control instanceof HTMLInputElement && control.type === "checkbox") {
+      return control.checked;
+    }
+
+    return normalizeFieldValue(name, control.value);
+  };
+
+  const fieldSnapshot = (root, fields) =>
+    fields.reduce((snapshot, name) => {
+      snapshot[name] = readFieldValue(root, name);
+      return snapshot;
+    }, {});
+
+  const collectAppDeployConfig = (root) => ({
+    kind: APP_CONFIG_KIND,
+    version: 1,
+    exported_at: new Date().toISOString(),
+    app: {
+      id: root.getAttribute("data-app-id") || "",
+      name: root.getAttribute("data-app-name") || "",
+      key: root.getAttribute("data-app-key") || "",
+      type: root.getAttribute("data-app-type") || "",
+    },
+    config: {
+      ...fieldSnapshot(root, APP_CONFIG_BASE_FIELDS),
+      ...fieldSnapshot(root, APP_CONFIG_COMPOSE_FIELDS),
+      health_check: {
+        kind: readFieldValue(root, "health_check_kind"),
+        endpoint: readFieldValue(root, "health_endpoint"),
+        timeout_secs: readFieldValue(root, "health_timeout_secs"),
+        expected_status: readFieldValue(root, "health_expected_status"),
+      },
+      binary: {
+        artifact_version: readFieldValue(root, "binary_artifact_version"),
+        artifact_path: readFieldValue(root, "binary_artifact_path"),
+        exec_args: readFieldValue(root, "binary_exec_args"),
+        service_user: readFieldValue(root, "binary_service_user"),
+        unit_name: readFieldValue(root, "binary_unit_name"),
+        release_strategy: readFieldValue(root, "binary_release_strategy"),
+        active_slot: readFieldValue(root, "binary_active_slot"),
+        base_port: readFieldValue(root, "binary_base_port"),
+        standby_port: readFieldValue(root, "binary_standby_port"),
+        proxy_enabled: readFieldValue(root, "binary_proxy_enabled"),
+        proxy_kind: readFieldValue(root, "binary_proxy_kind"),
+        proxy_domain: readFieldValue(root, "binary_proxy_domain"),
+        proxy_config_path: readFieldValue(root, "binary_proxy_config_path"),
+      },
+    },
+  });
+
+  const setConfigTransferStatus = (root, message, tone = "neutral") => {
+    const status = root.querySelector("[data-config-transfer-status]");
+    if (!status) return;
+
+    const timer = configStatusTimers.get(status);
+    if (timer) {
+      window.clearTimeout(timer);
+    }
+
+    status.textContent = message;
+    status.className = `config-transfer-status is-${tone}`;
+
+    if (message) {
+      configStatusTimers.set(
+        status,
+        window.setTimeout(() => {
+          status.textContent = "";
+          status.className = "config-transfer-status";
+        }, 3600),
+      );
+    }
+  };
+
+  const isAppConfigControl = (target) =>
+    (target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement ||
+      target instanceof HTMLSelectElement) &&
+    APP_CONFIG_FIELD_NAMES.has(target.name);
+
+  const setControlValue = (control, value) => {
+    if (control instanceof HTMLInputElement && control.type === "checkbox") {
+      control.checked = toBoolean(value);
+      return;
+    }
+
+    if (APP_CONFIG_BOOLEAN_FIELDS.includes(control.name)) {
+      control.value = toBoolean(value) ? "true" : "false";
+      return;
+    }
+
+    control.value = String(value ?? "");
+  };
+
+  const controlExportValue = (control) => {
+    if (control instanceof HTMLInputElement && control.type === "checkbox") {
+      return control.checked;
+    }
+
+    return normalizeFieldValue(control.name, control.value);
+  };
+
+  const syncAppConfigControl = (control) => {
+    const root = control.closest("[data-app-config-transfer]");
+    if (!root) return;
+
+    const value = controlExportValue(control);
+    namedControls(root, control.name).forEach((target) => {
+      if (target !== control) {
+        setControlValue(target, value);
+      }
+    });
+  };
+
+  const assignIfPresent = (target, key, value) => {
+    if (value !== undefined && value !== null) {
+      target[key] = value;
+    }
+  };
+
+  const normalizeImportedAppConfig = (payload) => {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      throw new Error("invalid config payload");
+    }
+
+    if (payload.kind && payload.kind !== APP_CONFIG_KIND) {
+      throw new Error("config kind mismatch");
+    }
+
+    const source =
+      payload.config && typeof payload.config === "object" ? payload.config : payload;
+    const health =
+      source.health_check && typeof source.health_check === "object"
+        ? source.health_check
+        : {};
+    const binary =
+      source.binary && typeof source.binary === "object" ? source.binary : {};
+    const config = {};
+
+    [...APP_CONFIG_BASE_FIELDS, ...APP_CONFIG_COMPOSE_FIELDS].forEach((key) => {
+      assignIfPresent(config, key, source[key]);
+    });
+
+    assignIfPresent(config, "health_check_kind", source.health_check_kind ?? health.kind);
+    assignIfPresent(config, "health_endpoint", source.health_endpoint ?? health.endpoint);
+    assignIfPresent(
+      config,
+      "health_timeout_secs",
+      source.health_timeout_secs ?? health.timeout_secs,
+    );
+    assignIfPresent(
+      config,
+      "health_expected_status",
+      source.health_expected_status ?? health.expected_status,
+    );
+
+    assignIfPresent(
+      config,
+      "binary_artifact_version",
+      source.binary_artifact_version ?? binary.artifact_version,
+    );
+    assignIfPresent(
+      config,
+      "binary_artifact_path",
+      source.binary_artifact_path ?? binary.artifact_path,
+    );
+    assignIfPresent(config, "binary_exec_args", source.binary_exec_args ?? binary.exec_args);
+    assignIfPresent(
+      config,
+      "binary_service_user",
+      source.binary_service_user ?? binary.service_user,
+    );
+    assignIfPresent(config, "binary_unit_name", source.binary_unit_name ?? binary.unit_name);
+    assignIfPresent(
+      config,
+      "binary_release_strategy",
+      source.binary_release_strategy ?? binary.release_strategy,
+    );
+    assignIfPresent(
+      config,
+      "binary_active_slot",
+      source.binary_active_slot ?? binary.active_slot,
+    );
+    assignIfPresent(config, "binary_base_port", source.binary_base_port ?? binary.base_port);
+    assignIfPresent(
+      config,
+      "binary_standby_port",
+      source.binary_standby_port ?? binary.standby_port,
+    );
+    assignIfPresent(
+      config,
+      "binary_proxy_enabled",
+      source.binary_proxy_enabled ?? binary.proxy_enabled,
+    );
+    assignIfPresent(config, "binary_proxy_kind", source.binary_proxy_kind ?? binary.proxy_kind);
+    assignIfPresent(
+      config,
+      "binary_proxy_domain",
+      source.binary_proxy_domain ?? binary.proxy_domain,
+    );
+    assignIfPresent(
+      config,
+      "binary_proxy_config_path",
+      source.binary_proxy_config_path ?? binary.proxy_config_path,
+    );
+
+    return config;
+  };
+
+  const applyAppDeployConfig = (root, config) => {
+    let applied = 0;
+    Object.entries(config).forEach(([name, value]) => {
+      if (!APP_CONFIG_FIELD_NAMES.has(name)) return;
+
+      const controls = namedControls(root, name);
+      if (controls.length === 0) return;
+
+      const normalized = normalizeFieldValue(name, value);
+      controls.forEach((control) => {
+        setControlValue(control, normalized);
+        control.dispatchEvent(new Event("input", { bubbles: true }));
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      applied += 1;
+    });
+
+    return applied;
+  };
+
+  const setButtonTextTemporarily = (button, text) => {
+    const originalText = button.textContent;
+    button.textContent = text;
+    window.setTimeout(() => {
+      button.textContent = originalText;
+    }, 1400);
+  };
+
+  const handleAppConfigExport = async (button) => {
+    const root = button.closest("[data-app-config-transfer]");
+    if (!root) return;
+
+    if (button instanceof HTMLButtonElement) {
+      button.disabled = true;
+    }
+
+    try {
+      const configPackage = collectAppDeployConfig(root);
+      await writeClipboardText(JSON.stringify(configPackage, null, 2));
+      setButtonTextTemporarily(button, "已复制");
+      setConfigTransferStatus(root, "配置已复制到剪贴板", "success");
+    } catch (_err) {
+      setButtonTextTemporarily(button, "复制失败");
+      setConfigTransferStatus(root, "复制失败，请检查浏览器剪贴板权限", "error");
+    } finally {
+      if (button instanceof HTMLButtonElement) {
+        button.disabled = false;
+      }
+    }
+  };
+
+  const handleAppConfigImport = async (button) => {
+    const root = button.closest("[data-app-config-transfer]");
+    if (!root) return;
+
+    if (button instanceof HTMLButtonElement) {
+      button.disabled = true;
+    }
+
+    try {
+      const text = (await readClipboardText()).trim();
+      if (!text) {
+        setConfigTransferStatus(root, "剪贴板没有可导入内容", "error");
+        return;
+      }
+
+      const payload = JSON.parse(text);
+      const config = normalizeImportedAppConfig(payload);
+      const applied = applyAppDeployConfig(root, config);
+      if (applied === 0) {
+        setConfigTransferStatus(root, "没有找到可导入的部署配置", "error");
+        return;
+      }
+
+      setButtonTextTemporarily(button, "已导入");
+      setConfigTransferStatus(root, "已导入到页面，确认后保存", "success");
+    } catch (_err) {
+      setButtonTextTemporarily(button, "导入失败");
+      setConfigTransferStatus(root, "导入失败，剪贴板内容不是有效配置", "error");
+    } finally {
+      if (button instanceof HTMLButtonElement) {
+        button.disabled = false;
+      }
     }
   };
 
@@ -267,6 +734,20 @@
       return;
     }
 
+    const exportButton = target.closest("[data-app-config-export]");
+    if (exportButton) {
+      event.preventDefault();
+      handleAppConfigExport(exportButton);
+      return;
+    }
+
+    const importButton = target.closest("[data-app-config-import]");
+    if (importButton) {
+      event.preventDefault();
+      handleAppConfigImport(importButton);
+      return;
+    }
+
     const openButton = target.closest("[data-modal-target]");
     if (openButton) {
       event.preventDefault();
@@ -289,6 +770,10 @@
 
   document.addEventListener("input", (event) => {
     const input = event.target;
+    if (isAppConfigControl(input)) {
+      syncAppConfigControl(input);
+    }
+
     if (!(input instanceof HTMLInputElement)) return;
     if (!input.matches("[data-searchable-select-input]")) return;
 
@@ -296,6 +781,13 @@
     if (!select) return;
 
     filterSearchableSelect(select);
+  });
+
+  document.addEventListener("change", (event) => {
+    const input = event.target;
+    if (isAppConfigControl(input)) {
+      syncAppConfigControl(input);
+    }
   });
 
   document.addEventListener("submit", (event) => {
@@ -408,6 +900,7 @@
   });
 
   window.addEventListener("hashchange", openHashModal);
+  observeEast8Timestamps();
   initSearchableSelects();
   openHashModal();
 })();

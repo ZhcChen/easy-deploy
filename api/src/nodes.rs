@@ -1,10 +1,17 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use sqlx::SqlitePool;
 use tracing::warn;
 
 use crate::{
-    deploy::{CommandSpec, DeployError, DynCommandRunner},
+    deploy::{
+        CommandSpec, DeployError, DynCommandRunner, append_ssh_known_hosts_args,
+        ensure_ssh_known_host, ssh_known_hosts_file,
+    },
+    events::{EventLogInput, insert_event_log},
     tasks::{TaskNodeResultInput, TaskService},
 };
 
@@ -12,6 +19,7 @@ use crate::{
 pub struct NodeService {
     db: SqlitePool,
     runner: DynCommandRunner,
+    ssh_known_hosts_file: PathBuf,
 }
 
 #[cfg(test)]
@@ -43,13 +51,34 @@ mod tests {
     #[async_trait]
     impl CommandRunner for ProbeRunner {
         async fn run(&self, spec: CommandSpec) -> Result<CommandResult, DeployError> {
-            let stdout = match (spec.program.as_str(), spec.args.as_slice()) {
+            let (status_code, stdout) = match (spec.program.as_str(), spec.args.as_slice()) {
+                ("ssh-keygen", args) => {
+                    let known_hosts_file = args
+                        .windows(2)
+                        .find(|window| window[0] == "-f")
+                        .map(|window| PathBuf::from(&window[1]));
+                    let exists = known_hosts_file
+                        .as_ref()
+                        .and_then(|path| std::fs::read_to_string(path).ok())
+                        .is_some_and(|content| content.contains("ssh-ed25519"));
+                    (
+                        if exists { Some(0) } else { Some(1) },
+                        if exists {
+                            "10.0.2.11 ssh-ed25519 AAAA\n"
+                        } else {
+                            ""
+                        },
+                    )
+                }
+                ("ssh-keyscan", _) => (Some(0), "10.0.2.11 ssh-ed25519 AAAA\n"),
                 ("ssh", args)
                     if args
                         .last()
                         .is_some_and(|arg| arg.contains("ED_PROBE_STATUS")) =>
                 {
-                    "\
+                    (
+                        Some(0),
+                        "\
 ED_PROBE_STATUS=ok
 ED_PROBE_FIELD=work_dir
 /opt/easy-deploy/apps
@@ -88,25 +117,27 @@ ED_PROBE_STATUS=missing
 ED_PROBE_FIELD=nginx_version
 nginx: command not found
 ED_PROBE_END=nginx_version
-"
+",
+                    )
                 }
-                ("uname", _) => "Linux 6.1 x86_64 GNU/Linux\n",
-                ("df", _) => {
-                    "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        40G  12G   28G  31% /\n"
-                }
-                ("systemctl", _) => "systemd 252\n+PAM +AUDIT\n",
-                ("docker", args) if args == ["--version"] => "Docker version 26.1.0\n",
-                ("docker", args) if args == ["info"] => "Server Version: 26.1.0\n",
+                ("uname", _) => (Some(0), "Linux 6.1 x86_64 GNU/Linux\n"),
+                ("df", _) => (
+                    Some(0),
+                    "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        40G  12G   28G  31% /\n",
+                ),
+                ("systemctl", _) => (Some(0), "systemd 252\n+PAM +AUDIT\n"),
+                ("docker", args) if args == ["--version"] => (Some(0), "Docker version 26.1.0\n"),
+                ("docker", args) if args == ["info"] => (Some(0), "Server Version: 26.1.0\n"),
                 ("docker", args) if args == ["compose", "version"] => {
-                    "Docker Compose version v2.27.0\n"
+                    (Some(0), "Docker Compose version v2.27.0\n")
                 }
-                ("caddy", args) if args == ["version"] => "2.8.4\n",
-                ("nginx", args) if args == ["-v"] => "nginx version: nginx/1.24.0\n",
-                _ => "ok\n",
+                ("caddy", args) if args == ["version"] => (Some(0), "2.8.4\n"),
+                ("nginx", args) if args == ["-v"] => (Some(0), "nginx version: nginx/1.24.0\n"),
+                _ => (Some(0), "ok\n"),
             };
             self.specs.lock().expect("lock specs").push(spec);
             Ok(CommandResult {
-                status_code: Some(0),
+                status_code,
                 stdout: stdout.to_owned(),
                 stderr: String::new(),
             })
@@ -132,7 +163,10 @@ ED_PROBE_END=nginx_version
             .await
             .expect("set local work dir");
         let runner = Arc::new(ProbeRunner::new());
-        (NodeService::new(db, runner.clone()), runner)
+        (
+            NodeService::new_with_data_dir(db, runner.clone(), work_dir),
+            runner,
+        )
     }
 
     #[tokio::test]
@@ -196,7 +230,7 @@ ED_PROBE_END=nginx_version
                 fingerprint,
                 status
             )
-            VALUES ('test-key', '测试密钥', 'ssh-ed25519 AAAA', ?1, 'SHA256:test', 'active')
+            VALUES ('test-key', '娴嬭瘯瀵嗛挜', 'ssh-ed25519 AAAA', ?1, 'SHA256:test', 'active')
             "#,
         )
         .bind(identity_file.to_string_lossy().to_string())
@@ -207,7 +241,7 @@ ED_PROBE_END=nginx_version
         service
             .create_node(CreateNodeInput {
                 node_key: "prod-a".to_owned(),
-                name: "生产节点 A".to_owned(),
+                name: "鐢熶骇鑺傜偣 A".to_owned(),
                 node_type: "ssh".to_owned(),
                 address: "10.0.2.11".to_owned(),
                 ssh_port: 22,
@@ -223,6 +257,16 @@ ED_PROBE_END=nginx_version
         service.check_node(2).await.expect("check ssh node");
 
         let specs = runner.specs.lock().expect("lock specs");
+        let keygen_specs = specs
+            .iter()
+            .filter(|spec| spec.program == "ssh-keygen")
+            .collect::<Vec<_>>();
+        assert_eq!(keygen_specs.len(), 2);
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.program == "ssh-keyscan" && spec.args.contains(&"-H".to_owned()))
+        );
         let ssh_specs = specs
             .iter()
             .filter(|spec| spec.program == "ssh")
@@ -232,22 +276,50 @@ ED_PROBE_END=nginx_version
         let identity_arg = identity_file.to_string_lossy().to_string();
         assert_eq!(first_ssh.args[0], "-p");
         assert_eq!(first_ssh.args[1], "22");
-        assert_eq!(first_ssh.args[2], "-o");
-        assert_eq!(first_ssh.args[3], "BatchMode=yes");
-        assert_eq!(first_ssh.args[4], "-o");
-        assert_eq!(first_ssh.args[5], "ConnectTimeout=10");
-        assert_eq!(first_ssh.args[6], "-o");
-        assert_eq!(first_ssh.args[7], "ConnectionAttempts=3");
-        assert_eq!(first_ssh.args[8], "-i");
-        assert_eq!(first_ssh.args[9], identity_arg);
-        assert_eq!(first_ssh.args[10], "-o");
-        assert_eq!(first_ssh.args[11], "IdentitiesOnly=yes");
-        assert_eq!(first_ssh.args[12], "deploy@10.0.2.11");
-        assert_eq!(first_ssh.args[13], "sh");
-        assert_eq!(first_ssh.args[14], "-lc");
-        assert!(first_ssh.args[15].starts_with('\''));
-        assert!(first_ssh.args[15].ends_with('\''));
-        assert!(first_ssh.args[15].contains("/opt/easy-deploy/apps"));
+        assert!(first_ssh.args.contains(&"BatchMode=yes".to_owned()));
+        assert!(first_ssh.args.contains(&"ConnectTimeout=10".to_owned()));
+        assert!(first_ssh.args.contains(&"ConnectionAttempts=3".to_owned()));
+        assert!(
+            first_ssh
+                .args
+                .contains(&"StrictHostKeyChecking=yes".to_owned())
+        );
+        assert!(
+            first_ssh
+                .args
+                .iter()
+                .any(|arg| arg.starts_with("UserKnownHostsFile="))
+        );
+        assert!(first_ssh.args.contains(&identity_arg));
+        assert!(first_ssh.args.contains(&"IdentitiesOnly=yes".to_owned()));
+        assert!(first_ssh.args.contains(&"deploy@10.0.2.11".to_owned()));
+        assert!(first_ssh.args.contains(&"sh".to_owned()));
+        assert!(first_ssh.args.contains(&"-lc".to_owned()));
+        let script = first_ssh.args.last().expect("ssh script");
+        assert!(script.starts_with('\''));
+        assert!(script.ends_with('\''));
+        assert!(script.contains("/opt/easy-deploy/apps"));
+
+        let event = sqlx::query_as::<_, (String, String, String, String)>(
+            r#"
+            SELECT event_type, level, target_id, detail
+            FROM event_logs
+            WHERE event_type = 'node.check'
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&service.db)
+        .await
+        .expect("read node check event");
+        assert_eq!(event.0, "node.check");
+        assert_eq!(event.1, "info");
+        assert_eq!(event.2, "2");
+        assert!(event.3.contains("destination=deploy@10.0.2.11"));
+        assert!(event.3.contains("known_host_added=true"));
+        assert!(event.3.contains("StrictHostKeyChecking=yes"));
+        assert!(event.3.contains("IdentitiesOnly=yes"));
+        assert!(event.3.contains("compose_version: status=ok"));
     }
 }
 
@@ -283,7 +355,7 @@ impl From<sqlx::Error> for NodeError {
         {
             return Self::Conflict("节点标识已存在".to_owned());
         }
-        Self::Internal(format!("节点数据操作失败: {value}"))
+        Self::Internal(format!("鑺傜偣鏁版嵁鎿嶄綔澶辫触: {value}"))
     }
 }
 
@@ -389,7 +461,7 @@ impl NodeInstallComponent {
     pub fn label(self) -> &'static str {
         match self {
             Self::Docker => "Docker Engine",
-            Self::Compose => "Docker Compose 插件",
+            Self::Compose => "Docker Compose 鎻掍欢",
             Self::Caddy => "Caddy",
             Self::Nginx => "Nginx",
         }
@@ -406,6 +478,7 @@ pub struct NodeInstallResult {
 pub struct NodeCheckResult {
     pub status: String,
     pub message: String,
+    pub probe_log: String,
     pub docker_version: String,
     pub compose_version: String,
     pub os_info: String,
@@ -467,7 +540,19 @@ pub struct NodeTaskItem {
 
 impl NodeService {
     pub fn new(db: SqlitePool, runner: DynCommandRunner) -> Self {
-        Self { db, runner }
+        Self::new_with_data_dir(db, runner, ".easy-deploy")
+    }
+
+    pub fn new_with_data_dir(
+        db: SqlitePool,
+        runner: DynCommandRunner,
+        data_dir: impl AsRef<Path>,
+    ) -> Self {
+        Self {
+            db,
+            runner,
+            ssh_known_hosts_file: ssh_known_hosts_file(data_dir),
+        }
     }
 
     pub async fn list_nodes(&self) -> Result<Vec<NodeListItem>, NodeError> {
@@ -522,7 +607,7 @@ impl NodeService {
         let node_key = normalize_key(&input.node_key)?;
         let name = required_text(&input.name, "请输入节点名称")?;
         let node_type = normalize_node_type(&input.node_type)?;
-        let address = required_text(&input.address, "请输入节点地址")?;
+        let address = required_text(&input.address, "璇疯緭鍏ヨ妭鐐瑰湴鍧€")?;
         let ssh_port = if node_type == "ssh" {
             validate_ssh_port(input.ssh_port)?
         } else {
@@ -667,7 +752,7 @@ impl NodeService {
     pub async fn update_node(&self, input: UpdateNodeInput) -> Result<(), NodeError> {
         let name = required_text(&input.name, "请输入节点名称")?;
         let node_type = normalize_node_type(&input.node_type)?;
-        let address = required_text(&input.address, "请输入节点地址")?;
+        let address = required_text(&input.address, "璇疯緭鍏ヨ妭鐐瑰湴鍧€")?;
         let ssh_port = if node_type == "ssh" {
             validate_ssh_port(input.ssh_port)?
         } else {
@@ -727,7 +812,7 @@ impl NodeService {
     ) -> Result<NodeStatusChange, NodeError> {
         let status = match status {
             "disabled" | "unknown" => status,
-            _ => return Err(NodeError::InvalidInput("节点状态不支持".to_owned())),
+            _ => return Err(NodeError::InvalidInput("鑺傜偣鐘舵€佷笉鏀寔".to_owned())),
         };
         let node = self.fetch_node(node_id).await?;
         if node.status == status {
@@ -768,13 +853,13 @@ impl NodeService {
         let node = self.fetch_node(node_id).await?;
         if node.status == "disabled" {
             return Err(NodeError::InvalidInput(
-                "节点已禁用，不能安装组件".to_owned(),
+                "鑺傜偣宸茬鐢紝涓嶈兘瀹夎缁勪欢".to_owned(),
             ));
         }
         let task_id = tasks
             .create_task(crate::tasks::CreateTaskInput {
                 task_kind: format!("node.install.{}", component.as_str()),
-                title: format!("安装 {} 到 {}", component.label(), node.name),
+                title: format!("瀹夎 {} 鍒?{}", component.label(), node.name),
                 app_id: None,
                 node_id: Some(node.id),
                 created_by: actor.to_owned(),
@@ -809,14 +894,20 @@ impl NodeService {
         node: NodeListItem,
         component: NodeInstallComponent,
     ) {
-        let command = node_install_command(&node, component);
+        let command = node_install_command(&node, component, Some(&self.ssh_known_hosts_file));
         let Ok(should_run) = tasks.mark_running(task_id, &command, "executing").await else {
             return;
         };
         if !should_run {
             return;
         }
-        let output = run_node_install_command(&self.runner, &node, component).await;
+        let output = run_node_install_command(
+            &self.runner,
+            &node,
+            component,
+            Some(&self.ssh_known_hosts_file),
+        )
+        .await;
         let (status, message, command_count) = match output {
             Ok(output) => {
                 let command_count = 1;
@@ -864,14 +955,14 @@ impl NodeService {
         let node = self.fetch_node(node_id).await?;
         if node.status == "disabled" {
             return Err(NodeError::InvalidInput(
-                "节点已禁用，不能执行探测".to_owned(),
+                "鑺傜偣宸茬鐢紝涓嶈兘鎵ц鎺㈡祴".to_owned(),
             ));
         }
 
         let result = if node.node_type == "local" {
             check_local_node(&self.runner, &node).await
         } else {
-            check_ssh_node(&self.runner, &node).await
+            check_ssh_node(&self.runner, &node, Some(&self.ssh_known_hosts_file)).await
         };
 
         let node_status = if result.status == "passed" {
@@ -930,6 +1021,13 @@ impl NodeService {
         .await?;
         upsert_node_capabilities(&mut tx, node_id, &result).await?;
         tx.commit().await?;
+        if let Err(err) = record_node_check_event(&self.db, &node, &result).await {
+            warn!(
+                node_id = node.id,
+                error = %err,
+                "failed to record node check event"
+            );
+        }
 
         Ok(result)
     }
@@ -988,6 +1086,10 @@ async fn check_local_node(runner: &DynCommandRunner, node: &NodeListItem) -> Nod
         return NodeCheckResult {
             status: "failed".to_owned(),
             message: format!("本机工作目录不可用: {}，{err}", work_dir.to_string_lossy()),
+            probe_log: format!(
+                "node_type=local\nwork_dir={}\nerror=create_dir_all failed: {err}",
+                work_dir.to_string_lossy()
+            ),
             docker_version: String::new(),
             compose_version: String::new(),
             os_info: String::new(),
@@ -1001,19 +1103,27 @@ async fn check_local_node(runner: &DynCommandRunner, node: &NodeListItem) -> Nod
     run_node_probe(
         NodeProbeTarget::Local {
             work_dir,
-            executor_label: "本机",
+            executor_label: "鏈満",
         },
         runner,
     )
     .await
 }
 
-async fn check_ssh_node(runner: &DynCommandRunner, node: &NodeListItem) -> NodeCheckResult {
+async fn check_ssh_node(
+    runner: &DynCommandRunner,
+    node: &NodeListItem,
+    known_hosts_file: Option<&Path>,
+) -> NodeCheckResult {
     let remote_work_dir = node.work_dir.trim();
     if !remote_work_dir.starts_with('/') {
         return NodeCheckResult {
             status: "failed".to_owned(),
             message: "SSH 节点工作目录必须是绝对路径".to_owned(),
+            probe_log: format!(
+                "node_type=ssh\naddress={}\nport={}\nuser={}\nwork_dir={remote_work_dir}\nerror=remote work dir must be an absolute path",
+                node.address, node.ssh_port, node.ssh_user
+            ),
             docker_version: String::new(),
             compose_version: String::new(),
             ..NodeCheckResult::default()
@@ -1022,7 +1132,11 @@ async fn check_ssh_node(runner: &DynCommandRunner, node: &NodeListItem) -> NodeC
     if !is_safe_remote_probe_path(remote_work_dir) {
         return NodeCheckResult {
             status: "failed".to_owned(),
-            message: "SSH 节点工作目录包含不支持的字符".to_owned(),
+            message: "SSH 鑺傜偣宸ヤ綔鐩綍鍖呭惈涓嶆敮鎸佺殑瀛楃".to_owned(),
+            probe_log: format!(
+                "node_type=ssh\naddress={}\nport={}\nuser={}\nwork_dir={remote_work_dir}\nerror=remote work dir contains unsupported characters",
+                node.address, node.ssh_port, node.ssh_user
+            ),
             docker_version: String::new(),
             compose_version: String::new(),
             ..NodeCheckResult::default()
@@ -1034,9 +1148,11 @@ async fn check_ssh_node(runner: &DynCommandRunner, node: &NodeListItem) -> NodeC
         SshProbeTarget {
             local_work_dir: PathBuf::from("."),
             destination,
+            address: node.address.clone(),
             port: node.ssh_port,
             identity_file: node_identity_file(node),
             remote_work_dir: remote_work_dir.to_owned(),
+            known_hosts_file: known_hosts_file.map(PathBuf::from),
         },
     )
     .await
@@ -1149,71 +1265,57 @@ enum NodeProbeTarget {
 struct SshProbeTarget {
     local_work_dir: PathBuf,
     destination: String,
+    address: String,
     port: i64,
     identity_file: Option<PathBuf>,
     remote_work_dir: String,
+    known_hosts_file: Option<PathBuf>,
 }
 
 async fn run_node_probe(target: NodeProbeTarget, runner: &DynCommandRunner) -> NodeCheckResult {
     let executor_label = target.executor_label();
+    let mut probe_log = ProbeLog::new();
+    probe_log.line("node_type=local");
+    probe_log.line(format!("executor={executor_label}"));
+    probe_log.line(format!("work_dir={}", target.work_dir()));
     if let Err(err) = prepare_probe_work_dir(runner, &target).await {
+        probe_log.section("prepare_work_dir", &err);
         return NodeCheckResult {
             status: "failed".to_owned(),
             message: err,
+            probe_log: probe_log.finish(),
             docker_version: String::new(),
             compose_version: String::new(),
             ..NodeCheckResult::default()
         };
     }
 
-    let os_info = probe_command(runner, &target, &["uname", "-srmo"])
+    let os_info = probe_command(runner, &target, &["uname", "-srmo"], &mut probe_log)
         .await
-        .unwrap_or_else(|err| format!("OS 探测失败: {err}"));
-    let disk_info = probe_command(runner, &target, &["df", "-h", target.work_dir()])
-        .await
-        .unwrap_or_else(|err| format!("磁盘探测失败: {err}"));
-    let systemd_version = probe_command(runner, &target, &["systemctl", "--version"])
-        .await
-        .map(|output| first_non_empty_line(&output))
-        .unwrap_or_else(|err| format!("systemd 探测失败: {err}"));
+        .unwrap_or_else(|err| format!("OS 鎺㈡祴澶辫触: {err}"));
+    let disk_info = probe_command(
+        runner,
+        &target,
+        &["df", "-h", target.work_dir()],
+        &mut probe_log,
+    )
+    .await
+    .unwrap_or_else(|err| format!("纾佺洏鎺㈡祴澶辫触: {err}"));
+    let systemd_version =
+        probe_command(runner, &target, &["systemctl", "--version"], &mut probe_log)
+            .await
+            .map(|output| first_non_empty_line(&output))
+            .unwrap_or_else(|err| format!("systemd 鎺㈡祴澶辫触: {err}"));
 
-    let docker_version = match probe_command(runner, &target, &["docker", "--version"]).await {
-        Ok(output) => output,
-        Err(err) => {
-            return NodeCheckResult {
-                status: "failed".to_owned(),
-                message: format!("{executor_label} Docker CLI 不可用: {err}"),
-                docker_version: String::new(),
-                compose_version: String::new(),
-                os_info,
-                disk_info,
-                systemd_version,
-                caddy_version: String::new(),
-                nginx_version: String::new(),
-            };
-        }
-    };
-    if let Err(err) = probe_command(runner, &target, &["docker", "info"]).await {
-        return NodeCheckResult {
-            status: "failed".to_owned(),
-            message: format!("{executor_label} Docker daemon 不可用: {err}"),
-            docker_version,
-            compose_version: String::new(),
-            os_info,
-            disk_info,
-            systemd_version,
-            caddy_version: String::new(),
-            nginx_version: String::new(),
-        };
-    }
-    let compose_version =
-        match probe_command(runner, &target, &["docker", "compose", "version"]).await {
+    let docker_version =
+        match probe_command(runner, &target, &["docker", "--version"], &mut probe_log).await {
             Ok(output) => output,
             Err(err) => {
                 return NodeCheckResult {
                     status: "failed".to_owned(),
-                    message: format!("{executor_label} Docker Compose 不可用: {err}"),
-                    docker_version,
+                    message: format!("{executor_label} Docker CLI 涓嶅彲鐢? {err}"),
+                    probe_log: probe_log.finish(),
+                    docker_version: String::new(),
                     compose_version: String::new(),
                     os_info,
                     disk_info,
@@ -1223,12 +1325,53 @@ async fn run_node_probe(target: NodeProbeTarget, runner: &DynCommandRunner) -> N
                 };
             }
         };
-    let caddy_version = optional_probe_version(runner, &target, &["caddy", "version"]).await;
-    let nginx_version = optional_probe_version(runner, &target, &["nginx", "-v"]).await;
+    if let Err(err) = probe_command(runner, &target, &["docker", "info"], &mut probe_log).await {
+        return NodeCheckResult {
+            status: "failed".to_owned(),
+            message: format!("{executor_label} Docker daemon 涓嶅彲鐢? {err}"),
+            probe_log: probe_log.finish(),
+            docker_version,
+            compose_version: String::new(),
+            os_info,
+            disk_info,
+            systemd_version,
+            caddy_version: String::new(),
+            nginx_version: String::new(),
+        };
+    }
+    let compose_version = match probe_command(
+        runner,
+        &target,
+        &["docker", "compose", "version"],
+        &mut probe_log,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => {
+            return NodeCheckResult {
+                status: "failed".to_owned(),
+                message: format!("{executor_label} Docker Compose 涓嶅彲鐢? {err}"),
+                probe_log: probe_log.finish(),
+                docker_version,
+                compose_version: String::new(),
+                os_info,
+                disk_info,
+                systemd_version,
+                caddy_version: String::new(),
+                nginx_version: String::new(),
+            };
+        }
+    };
+    let caddy_version =
+        optional_probe_version(runner, &target, &["caddy", "version"], &mut probe_log).await;
+    let nginx_version =
+        optional_probe_version(runner, &target, &["nginx", "-v"], &mut probe_log).await;
 
     NodeCheckResult {
         status: "passed".to_owned(),
-        message: format!("{executor_label} 节点探测通过，Docker 与 Compose 可用"),
+        message: format!("{executor_label} 鑺傜偣鎺㈡祴閫氳繃锛孌ocker 涓?Compose 鍙敤"),
+        probe_log: probe_log.finish(),
         docker_version,
         compose_version,
         os_info,
@@ -1241,8 +1384,49 @@ async fn run_node_probe(target: NodeProbeTarget, runner: &DynCommandRunner) -> N
 
 async fn run_ssh_node_probe(runner: &DynCommandRunner, target: SshProbeTarget) -> NodeCheckResult {
     let script = ssh_probe_script(&target.remote_work_dir);
+    let destination = target.destination.clone();
+    let identity_file = target.identity_file.clone();
+    let known_hosts_file = target.known_hosts_file.clone();
+    let mut probe_log = ProbeLog::new();
+    probe_log.line("node_type=ssh");
+    probe_log.line(format!("destination={destination}"));
+    probe_log.line(format!("port={}", target.port));
+    probe_log.line(format!("remote_work_dir={}", target.remote_work_dir));
+    probe_log.line(format!(
+        "identity_file={}",
+        identity_file
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "not configured".to_owned())
+    ));
+    if let Some(known_hosts_file) = &known_hosts_file {
+        probe_log.line(format!(
+            "known_hosts_file={}",
+            known_hosts_file.to_string_lossy()
+        ));
+        match ensure_ssh_known_host(runner, known_hosts_file, &target.address, target.port).await {
+            Ok(result) => {
+                probe_log.line(format!("known_host={}", result.lookup_key));
+                probe_log.line(format!("known_host_added={}", result.added));
+            }
+            Err(err) => {
+                probe_log.section("known_host_error", &deploy_error_message(&err));
+                return NodeCheckResult {
+                    status: "failed".to_owned(),
+                    message: format!("SSH 主机指纹处理失败: {}", deploy_error_message(&err)),
+                    probe_log: probe_log.finish(),
+                    docker_version: String::new(),
+                    compose_version: String::new(),
+                    ..NodeCheckResult::default()
+                };
+            }
+        }
+    } else {
+        probe_log.line("known_hosts_file=system default");
+    }
     let mut args = vec!["-p".to_owned(), target.port.to_string()];
     append_ssh_probe_options(&mut args);
+    append_ssh_known_hosts_args(&mut args, known_hosts_file.as_deref());
     append_ssh_identity_args(&mut args, target.identity_file.as_ref());
     args.extend([
         target.destination,
@@ -1251,6 +1435,7 @@ async fn run_ssh_node_probe(runner: &DynCommandRunner, target: SshProbeTarget) -
         shell_quote(&script),
     ]);
     let rendered_command = render_probe_command("ssh", &args);
+    probe_log.line(format!("command={rendered_command}"));
     let result = match runner
         .run(CommandSpec {
             program: "ssh".to_owned(),
@@ -1261,31 +1446,40 @@ async fn run_ssh_node_probe(runner: &DynCommandRunner, target: SshProbeTarget) -
     {
         Ok(result) => result,
         Err(err) => {
+            probe_log.section("runner_error", &deploy_error_message(&err));
             return NodeCheckResult {
                 status: "failed".to_owned(),
-                message: format!("SSH 连接失败: {}", deploy_error_message(&err)),
+                message: format!("SSH 杩炴帴澶辫触: {}", deploy_error_message(&err)),
+                probe_log: probe_log.finish(),
                 docker_version: String::new(),
                 compose_version: String::new(),
                 ..NodeCheckResult::default()
             };
         }
     };
+    probe_log.line(format!("exit_code={:?}", result.status_code));
+    probe_log.section("combined_output", &result.combined_output());
     if !result.success() {
         let output = result.combined_output();
         return NodeCheckResult {
             status: "failed".to_owned(),
             message: if output.is_empty() {
-                format!("{rendered_command} 退出码 {:?}", result.status_code)
+                format!("{rendered_command} 閫€鍑虹爜 {:?}", result.status_code)
             } else {
                 format!("{rendered_command}: {output}")
             },
+            probe_log: probe_log.finish(),
             docker_version: String::new(),
             compose_version: String::new(),
             ..NodeCheckResult::default()
         };
     }
 
-    ssh_probe_result_from_output(&result.combined_output())
+    let combined_output = result.combined_output();
+    let mut check_result = ssh_probe_result_from_output(&combined_output);
+    probe_log.section("parsed_sections", &ssh_probe_sections_log(&combined_output));
+    check_result.probe_log = probe_log.finish();
+    check_result
 }
 
 fn ssh_probe_result_from_output(output: &str) -> NodeCheckResult {
@@ -1294,6 +1488,7 @@ fn ssh_probe_result_from_output(output: &str) -> NodeCheckResult {
         return NodeCheckResult {
             status: "failed".to_owned(),
             message: err,
+            probe_log: String::new(),
             docker_version: String::new(),
             compose_version: String::new(),
             ..NodeCheckResult::default()
@@ -1311,7 +1506,8 @@ fn ssh_probe_result_from_output(output: &str) -> NodeCheckResult {
         Err(err) => {
             return NodeCheckResult {
                 status: "failed".to_owned(),
-                message: format!("SSH Docker CLI 不可用: {err}"),
+                message: format!("SSH Docker CLI 涓嶅彲鐢? {err}"),
+                probe_log: String::new(),
                 docker_version: String::new(),
                 compose_version: String::new(),
                 os_info,
@@ -1325,7 +1521,8 @@ fn ssh_probe_result_from_output(output: &str) -> NodeCheckResult {
     if let Err(err) = require_probe_section(&sections, "docker_info") {
         return NodeCheckResult {
             status: "failed".to_owned(),
-            message: format!("SSH Docker daemon 不可用: {err}"),
+            message: format!("SSH Docker daemon 涓嶅彲鐢? {err}"),
+            probe_log: String::new(),
             docker_version,
             compose_version: String::new(),
             os_info,
@@ -1340,7 +1537,8 @@ fn ssh_probe_result_from_output(output: &str) -> NodeCheckResult {
         Err(err) => {
             return NodeCheckResult {
                 status: "failed".to_owned(),
-                message: format!("SSH Docker Compose 不可用: {err}"),
+                message: format!("SSH Docker Compose 涓嶅彲鐢? {err}"),
+                probe_log: String::new(),
                 docker_version,
                 compose_version: String::new(),
                 os_info,
@@ -1360,7 +1558,8 @@ fn ssh_probe_result_from_output(output: &str) -> NodeCheckResult {
 
     NodeCheckResult {
         status: "passed".to_owned(),
-        message: "SSH 节点探测通过，Docker 与 Compose 可用".to_owned(),
+        message: "SSH 鑺傜偣鎺㈡祴閫氳繃锛孌ocker 涓?Compose 鍙敤".to_owned(),
+        probe_log: String::new(),
         docker_version,
         compose_version,
         os_info,
@@ -1398,11 +1597,12 @@ async fn probe_command(
     runner: &DynCommandRunner,
     target: &NodeProbeTarget,
     command: &[&str],
+    probe_log: &mut ProbeLog,
 ) -> Result<String, String> {
     let (program, args, current_dir) = match target {
         NodeProbeTarget::Local { work_dir, .. } => {
             let Some((program, args)) = command.split_first() else {
-                return Err("探测命令为空".to_owned());
+                return Err("鎺㈡祴鍛戒护涓虹┖".to_owned());
             };
             (
                 (*program).to_owned(),
@@ -1412,6 +1612,7 @@ async fn probe_command(
         }
     };
     let rendered_command = render_probe_command(&program, &args);
+    probe_log.line(format!("$ {rendered_command}"));
     let result = runner
         .run(CommandSpec {
             program,
@@ -1419,7 +1620,13 @@ async fn probe_command(
             current_dir,
         })
         .await
-        .map_err(|err| deploy_error_message(&err))?;
+        .map_err(|err| {
+            let message = deploy_error_message(&err);
+            probe_log.section("runner_error", &message);
+            message
+        })?;
+    probe_log.line(format!("exit_code={:?}", result.status_code));
+    probe_log.section("output", &result.combined_output());
     if result.success() {
         let output = result.combined_output();
         Ok(if output.is_empty() {
@@ -1430,7 +1637,7 @@ async fn probe_command(
     } else {
         let output = result.combined_output();
         Err(if output.is_empty() {
-            format!("{rendered_command} 退出码 {:?}", result.status_code)
+            format!("{rendered_command} 閫€鍑虹爜 {:?}", result.status_code)
         } else {
             format!("{rendered_command}: {output}")
         })
@@ -1441,13 +1648,14 @@ async fn run_node_install_command(
     runner: &DynCommandRunner,
     node: &NodeListItem,
     component: NodeInstallComponent,
+    known_hosts_file: Option<&Path>,
 ) -> Result<crate::deploy::CommandResult, DeployError> {
     let script = node_install_script(component);
     if node.node_type == "local" {
         let work_dir = PathBuf::from(node.work_dir.trim());
         tokio::fs::create_dir_all(&work_dir)
             .await
-            .map_err(|err| DeployError::Command(format!("准备本机工作目录失败: {err}")))?;
+            .map_err(|err| DeployError::Command(format!("鍑嗗鏈満宸ヤ綔鐩綍澶辫触: {err}")))?;
         return runner
             .run(CommandSpec {
                 program: "sh".to_owned(),
@@ -1457,9 +1665,13 @@ async fn run_node_install_command(
             .await;
     }
 
+    if let Some(known_hosts_file) = known_hosts_file {
+        ensure_ssh_known_host(runner, known_hosts_file, &node.address, node.ssh_port).await?;
+    }
     let destination = format!("{}@{}", node.ssh_user, node.address);
     let mut args = vec!["-p".to_owned(), node.ssh_port.to_string()];
     append_ssh_probe_options(&mut args);
+    append_ssh_known_hosts_args(&mut args, known_hosts_file);
     append_ssh_identity_args(&mut args, node_identity_file(node).as_ref());
     args.extend([
         destination,
@@ -1476,11 +1688,16 @@ async fn run_node_install_command(
         .await
 }
 
-fn node_install_command(node: &NodeListItem, component: NodeInstallComponent) -> String {
+fn node_install_command(
+    node: &NodeListItem,
+    component: NodeInstallComponent,
+    known_hosts_file: Option<&Path>,
+) -> String {
     let script = node_install_script(component);
     if node.node_type == "ssh" {
         let mut args = vec!["-p".to_owned(), node.ssh_port.to_string()];
         append_ssh_probe_options(&mut args);
+        append_ssh_known_hosts_args(&mut args, known_hosts_file);
         append_ssh_identity_args(&mut args, node_identity_file(node).as_ref());
         args.extend([
             format!("{}@{}", node.ssh_user, node.address),
@@ -1542,18 +1759,21 @@ fn node_install_summary(
     output: &crate::deploy::CommandResult,
 ) -> String {
     if output.success() {
-        return format!("{} 安装命令执行成功，请重新探测节点能力", component.label());
+        return format!(
+            "{} 瀹夎鍛戒护鎵ц鎴愬姛锛岃閲嶆柊鎺㈡祴鑺傜偣鑳藉姏",
+            component.label()
+        );
     }
     let combined_output = output.combined_output();
     if combined_output.trim().is_empty() {
         format!(
-            "{} 安装命令失败，退出码 {:?}",
+            "{} 瀹夎鍛戒护澶辫触锛岄€€鍑虹爜 {:?}",
             component.label(),
             output.status_code
         )
     } else {
         format!(
-            "{} 安装命令失败: {}",
+            "{} 瀹夎鍛戒护澶辫触: {}",
             component.label(),
             first_non_empty_line(&combined_output)
         )
@@ -1564,11 +1784,91 @@ async fn optional_probe_version(
     runner: &DynCommandRunner,
     target: &NodeProbeTarget,
     command: &[&str],
+    probe_log: &mut ProbeLog,
 ) -> String {
-    probe_command(runner, target, command)
+    probe_command(runner, target, command, probe_log)
         .await
         .map(|output| first_non_empty_line(&output))
         .unwrap_or_default()
+}
+
+struct ProbeLog {
+    lines: Vec<String>,
+}
+
+impl ProbeLog {
+    fn new() -> Self {
+        Self { lines: Vec::new() }
+    }
+
+    fn line(&mut self, line: impl Into<String>) {
+        self.lines.push(line.into());
+    }
+
+    fn section(&mut self, title: &str, content: &str) {
+        self.lines.push(format!("--- {title} ---"));
+        if content.trim().is_empty() {
+            self.lines.push("(empty)".to_owned());
+        } else {
+            self.lines.push(limit_text(content, 4000));
+        }
+    }
+
+    fn finish(self) -> String {
+        limit_text(&self.lines.join("\n"), 16_000)
+    }
+}
+
+async fn record_node_check_event(
+    db: &SqlitePool,
+    node: &NodeListItem,
+    result: &NodeCheckResult,
+) -> Result<(), crate::events::EventLogError> {
+    let level = if result.status == "passed" {
+        "info"
+    } else {
+        "error"
+    };
+    insert_event_log(
+        db,
+        EventLogInput {
+            event_type: "node.check",
+            level,
+            target_type: "node",
+            target_id: &node.id.to_string(),
+            target_name: &node.name,
+            title: "节点探测",
+            summary: &result.message,
+            detail: &result.probe_log,
+        },
+    )
+    .await
+}
+
+fn ssh_probe_sections_log(output: &str) -> String {
+    let sections = parse_ssh_probe_sections(output);
+    let mut fields = sections.keys().cloned().collect::<Vec<_>>();
+    fields.sort();
+    fields
+        .into_iter()
+        .map(|field| {
+            let section = &sections[&field];
+            format!(
+                "{field}: status={}, output={}",
+                section.status,
+                first_non_empty_line(&section.output)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn limit_text(value: &str, max_chars: usize) -> String {
+    let mut truncated = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        truncated.push_str("\n... truncated ...");
+    }
+    truncated
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1634,11 +1934,11 @@ fn require_probe_section(
             Ok(section.output.trim().to_owned())
         }
         Some(section) if !section.output.trim().is_empty() => Err(format!(
-            "{} 探测失败: {}",
+            "{} 鎺㈡祴澶辫触: {}",
             probe_field_label(field),
             first_non_empty_line(&section.output)
         )),
-        Some(_) => Err(format!("{} 探测失败", probe_field_label(field))),
+        Some(_) => Err(format!("{} 鎺㈡祴澶辫触", probe_field_label(field))),
         None => Err(format!("{} 探测未返回结果", probe_field_label(field))),
     }
 }
@@ -1650,22 +1950,22 @@ fn require_probe_section_status(
     match sections.get(field) {
         Some(section) if section.status == "ok" => Ok(()),
         Some(section) if !section.output.trim().is_empty() => Err(format!(
-            "{} 探测失败: {}",
+            "{} 鎺㈡祴澶辫触: {}",
             probe_field_label(field),
             first_non_empty_line(&section.output)
         )),
-        Some(_) => Err(format!("{} 探测失败", probe_field_label(field))),
+        Some(_) => Err(format!("{} 鎺㈡祴澶辫触", probe_field_label(field))),
         None => Err(format!("{} 探测未返回结果", probe_field_label(field))),
     }
 }
 
 fn probe_field_label(field: &str) -> &'static str {
     match field {
-        "work_dir" => "SSH 工作目录",
+        "work_dir" => "SSH 宸ヤ綔鐩綍",
         "docker_version" => "Docker CLI",
         "docker_info" => "Docker daemon",
         "compose_version" => "Docker Compose",
-        _ => "命令",
+        _ => "鍛戒护",
     }
 }
 
@@ -1734,7 +2034,7 @@ fn normalize_key(value: &str) -> Result<String, NodeError> {
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
     {
         return Err(NodeError::InvalidInput(
-            "节点标识仅支持字母、数字、短横线和下划线".to_owned(),
+            "鑺傜偣鏍囪瘑浠呮敮鎸佸瓧姣嶃€佹暟瀛椼€佺煭妯嚎鍜屼笅鍒掔嚎".to_owned(),
         ));
     }
     Ok(key)
@@ -1762,7 +2062,7 @@ fn validate_ssh_port(port: i64) -> Result<i64, NodeError> {
         Ok(port)
     } else {
         Err(NodeError::InvalidInput(
-            "SSH 端口需要在 1 到 65535 之间".to_owned(),
+            "SSH 绔彛闇€瑕佸湪 1 鍒?65535 涔嬮棿".to_owned(),
         ))
     }
 }

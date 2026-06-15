@@ -125,9 +125,37 @@ pub struct TaskDetailItem {
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct TaskLogItem {
     pub id: i64,
+    pub step_id: Option<i64>,
     pub stream: String,
     pub content: String,
     pub created_at: String,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct TaskStepItem {
+    pub id: i64,
+    pub task_id: i64,
+    pub node_id: Option<i64>,
+    pub node_name: Option<String>,
+    pub step_no: i64,
+    pub step_key: String,
+    pub title: String,
+    pub command: String,
+    pub status: String,
+    pub exit_code: Option<i64>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct StartTaskStepInput<'a> {
+    pub task_id: i64,
+    pub node_id: Option<i64>,
+    pub step_key: &'a str,
+    pub title: &'a str,
+    pub command: &'a str,
 }
 
 #[derive(Clone, Debug)]
@@ -140,6 +168,18 @@ pub struct TaskNodeResultInput<'a> {
     pub status: &'a str,
     pub message: &'a str,
     pub command_count: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecordDeploymentRunInput<'a> {
+    pub app_id: i64,
+    pub task_id: i64,
+    pub deploy_action: &'a str,
+    pub status: &'a str,
+    pub message: &'a str,
+    pub config_snapshot_id: Option<i64>,
+    pub config_revision_no: i64,
+    pub artifact_version: &'a str,
 }
 
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -267,11 +307,41 @@ impl TaskService {
     pub async fn task_logs(&self, task_id: i64) -> Result<Vec<TaskLogItem>, TaskError> {
         sqlx::query_as::<_, TaskLogItem>(
             r#"
-            SELECT id, stream, content, created_at
+            SELECT id, step_id, stream, content, created_at
             FROM operation_task_logs
             WHERE task_id = ?1
             ORDER BY id ASC
             LIMIT 1000
+            "#,
+        )
+        .bind(task_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(TaskError::from)
+    }
+
+    pub async fn task_steps(&self, task_id: i64) -> Result<Vec<TaskStepItem>, TaskError> {
+        sqlx::query_as::<_, TaskStepItem>(
+            r#"
+            SELECT
+                s.id,
+                s.task_id,
+                s.node_id,
+                n.name AS node_name,
+                s.step_no,
+                s.step_key,
+                s.title,
+                s.command,
+                s.status,
+                s.exit_code,
+                s.started_at,
+                s.finished_at,
+                s.created_at,
+                s.updated_at
+            FROM operation_task_steps s
+            LEFT JOIN nodes n ON n.id = s.node_id
+            WHERE s.task_id = ?1
+            ORDER BY s.step_no ASC, s.id ASC
             "#,
         )
         .bind(task_id)
@@ -603,6 +673,163 @@ impl TaskService {
         Ok(())
     }
 
+    pub async fn start_step(&self, input: StartTaskStepInput<'_>) -> Result<i64, TaskError> {
+        let step_key = normalize_step_key(input.step_key)?;
+        let title = required_step_text(input.title, "步骤名称不能为空")?;
+        let command = input.command.trim();
+        let mut tx = self.db.begin().await?;
+        let step_no = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COALESCE(MAX(step_no), 0) + 1
+            FROM operation_task_steps
+            WHERE task_id = ?1
+            "#,
+        )
+        .bind(input.task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let step_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO operation_task_steps(
+                task_id,
+                node_id,
+                step_no,
+                step_key,
+                title,
+                command,
+                status,
+                started_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            RETURNING id
+            "#,
+        )
+        .bind(input.task_id)
+        .bind(input.node_id)
+        .bind(step_no)
+        .bind(step_key)
+        .bind(title)
+        .bind(command)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO operation_task_logs(task_id, step_id, stream, content)
+            VALUES (?1, ?2, 'system', ?3)
+            "#,
+        )
+        .bind(input.task_id)
+        .bind(step_id)
+        .bind(format!("开始步骤: {}", title))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(step_id)
+    }
+
+    pub async fn append_step_log(
+        &self,
+        task_id: i64,
+        step_id: i64,
+        stream: &str,
+        content: &str,
+    ) -> Result<(), TaskError> {
+        let stream = normalize_log_stream(stream)?;
+        sqlx::query(
+            r#"
+            INSERT INTO operation_task_logs(task_id, step_id, stream, content)
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+        )
+        .bind(task_id)
+        .bind(step_id)
+        .bind(stream)
+        .bind(content)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn finish_step(
+        &self,
+        task_id: i64,
+        step_id: i64,
+        exit_code: Option<i64>,
+        summary: &str,
+    ) -> Result<(), TaskError> {
+        self.finish_step_with_status(task_id, step_id, "success", exit_code, summary)
+            .await
+    }
+
+    pub async fn fail_step(
+        &self,
+        task_id: i64,
+        step_id: i64,
+        exit_code: Option<i64>,
+        summary: &str,
+    ) -> Result<(), TaskError> {
+        self.finish_step_with_status(task_id, step_id, "failed", exit_code, summary)
+            .await
+    }
+
+    pub async fn skip_step(
+        &self,
+        task_id: i64,
+        step_id: i64,
+        summary: &str,
+    ) -> Result<(), TaskError> {
+        self.finish_step_with_status(task_id, step_id, "skipped", None, summary)
+            .await
+    }
+
+    async fn finish_step_with_status(
+        &self,
+        task_id: i64,
+        step_id: i64,
+        status: &str,
+        exit_code: Option<i64>,
+        summary: &str,
+    ) -> Result<(), TaskError> {
+        let status = normalize_step_status(status)?;
+        let mut tx = self.db.begin().await?;
+        let result = sqlx::query(
+            r#"
+            UPDATE operation_task_steps
+            SET status = ?3,
+                exit_code = ?4,
+                finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE task_id = ?1
+              AND id = ?2
+            "#,
+        )
+        .bind(task_id)
+        .bind(step_id)
+        .bind(status)
+        .bind(exit_code)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(TaskError::NotFound("任务步骤不存在".to_owned()));
+        }
+        let summary = summary.trim();
+        if !summary.is_empty() {
+            sqlx::query(
+                r#"
+                INSERT INTO operation_task_logs(task_id, step_id, stream, content)
+                VALUES (?1, ?2, 'system', ?3)
+                "#,
+            )
+            .bind(task_id)
+            .bind(step_id)
+            .bind(summary)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn fail_task(&self, task_id: i64, message: &str) -> Result<(), TaskError> {
         sqlx::query(
             r#"
@@ -632,6 +859,7 @@ impl TaskService {
         stream: &str,
         content: &str,
     ) -> Result<(), TaskError> {
+        let stream = normalize_log_stream(stream)?;
         sqlx::query(
             r#"
             INSERT INTO operation_task_logs(task_id, stream, content)
@@ -648,11 +876,7 @@ impl TaskService {
 
     pub async fn record_deployment_run(
         &self,
-        app_id: i64,
-        task_id: i64,
-        deploy_action: &str,
-        status: &str,
-        message: &str,
+        input: RecordDeploymentRunInput<'_>,
     ) -> Result<(), TaskError> {
         sqlx::query(
             r#"
@@ -662,7 +886,10 @@ impl TaskService {
                 deploy_action,
                 status,
                 finished_at,
-                message
+                message,
+                config_snapshot_id,
+                config_revision_no,
+                artifact_version
             )
             VALUES (
                 ?1,
@@ -670,15 +897,21 @@ impl TaskService {
                 ?3,
                 ?4,
                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                ?5
+                ?5,
+                ?6,
+                ?7,
+                ?8
             )
             "#,
         )
-        .bind(app_id)
-        .bind(task_id)
-        .bind(deploy_action)
-        .bind(status)
-        .bind(message)
+        .bind(input.app_id)
+        .bind(input.task_id)
+        .bind(input.deploy_action)
+        .bind(input.status)
+        .bind(input.message)
+        .bind(input.config_snapshot_id)
+        .bind(input.config_revision_no)
+        .bind(input.artifact_version)
         .execute(&self.db)
         .await?;
         Ok(())
@@ -765,6 +998,45 @@ fn normalize_node_result_status(status: &str) -> Result<&str, TaskError> {
         _ => Err(TaskError::InvalidState(format!(
             "节点任务结果状态无效: {status}"
         ))),
+    }
+}
+
+fn normalize_step_status(status: &str) -> Result<&str, TaskError> {
+    match status {
+        "pending" | "running" | "success" | "failed" | "skipped" => Ok(status),
+        _ => Err(TaskError::InvalidState(format!(
+            "任务步骤状态无效: {status}"
+        ))),
+    }
+}
+
+fn normalize_log_stream(stream: &str) -> Result<&str, TaskError> {
+    match stream {
+        "system" | "stdout" | "stderr" | "combined" => Ok(stream),
+        _ => Err(TaskError::InvalidState(format!("任务日志流无效: {stream}"))),
+    }
+}
+
+fn normalize_step_key(value: &str) -> Result<&str, TaskError> {
+    let value = value.trim();
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+    {
+        return Err(TaskError::InvalidState(
+            "任务步骤标识仅支持字母、数字、点、短横线和下划线".to_owned(),
+        ));
+    }
+    Ok(value)
+}
+
+fn required_step_text<'a>(value: &'a str, message: &str) -> Result<&'a str, TaskError> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(TaskError::InvalidState(message.to_owned()))
+    } else {
+        Ok(value)
     }
 }
 
@@ -885,6 +1157,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_steps_record_status_and_link_logs() {
+        let tasks = task_service().await;
+        let task_id = tasks
+            .create_task(CreateTaskInput {
+                task_kind: "compose.up".to_owned(),
+                title: "Deploy redis".to_owned(),
+                app_id: None,
+                node_id: None,
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect("create task");
+
+        let step_id = tasks
+            .start_step(StartTaskStepInput {
+                task_id,
+                node_id: None,
+                step_key: "compose.config",
+                title: "校验 Compose 配置",
+                command: "docker compose config",
+            })
+            .await
+            .expect("start step");
+        tasks
+            .append_step_log(task_id, step_id, "combined", "services:\n  redis:\n")
+            .await
+            .expect("append step log");
+        tasks
+            .finish_step(task_id, step_id, Some(0), "Compose 配置校验通过")
+            .await
+            .expect("finish step");
+
+        let steps = tasks.task_steps(task_id).await.expect("task steps");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].id, step_id);
+        assert_eq!(steps[0].step_no, 1);
+        assert_eq!(steps[0].step_key, "compose.config");
+        assert_eq!(steps[0].status, "success");
+        assert_eq!(steps[0].exit_code, Some(0));
+
+        let logs = tasks.task_logs(task_id).await.expect("task logs");
+        assert!(logs.iter().any(|log| log.step_id == Some(step_id)
+            && log.stream == "combined"
+            && log.content.contains("redis")));
+        assert!(logs.iter().any(|log| log.step_id == Some(step_id)
+            && log.stream == "system"
+            && log.content.contains("Compose 配置校验通过")));
+    }
+
+    #[tokio::test]
     async fn cancel_queued_task_marks_canceled_and_writes_log() {
         let tasks = task_service().await;
         let task_id = tasks
@@ -935,6 +1257,84 @@ mod tests {
             .await
             .expect_err("running task cannot be canceled");
         assert!(err.message().contains("只能取消等待中的任务"));
+    }
+
+    #[tokio::test]
+    async fn deployment_run_records_config_revision_and_artifact_version() {
+        let tasks = task_service().await;
+        let app_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO apps(app_key, name, app_type, deploy_mode, work_dir)
+            VALUES ('worker-bin', 'Worker', 'binary', 'binary', '/opt/worker')
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&tasks.db)
+        .await
+        .expect("create app");
+        let snapshot_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO app_config_snapshots(
+                app_id,
+                revision_no,
+                snapshot_kind,
+                compose_content,
+                env_content,
+                artifact_version,
+                config_hash,
+                metadata
+            )
+            VALUES (?1, 3, 'manual', '', 'RUST_LOG=info', 'v1.2.3', 'abc123', '{}')
+            RETURNING id
+            "#,
+        )
+        .bind(app_id)
+        .fetch_one(&tasks.db)
+        .await
+        .expect("create config snapshot");
+        let task_id = tasks
+            .create_task(CreateTaskInput {
+                task_kind: "binary.restart".to_owned(),
+                title: "重启 Worker".to_owned(),
+                app_id: Some(app_id),
+                node_id: None,
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect("create task");
+
+        tasks
+            .record_deployment_run(RecordDeploymentRunInput {
+                app_id,
+                task_id,
+                deploy_action: "binary_restart",
+                status: "success",
+                message: "ok",
+                config_snapshot_id: Some(snapshot_id),
+                config_revision_no: 3,
+                artifact_version: "v1.2.3",
+            })
+            .await
+            .expect("record deployment run");
+
+        let row = sqlx::query_as::<_, (i64, i64, String)>(
+            r#"
+            SELECT
+                config_snapshot_id,
+                config_revision_no,
+                artifact_version
+            FROM deployment_runs
+            WHERE task_id = ?1
+            "#,
+        )
+        .bind(task_id)
+        .fetch_one(&tasks.db)
+        .await
+        .expect("load deployment run");
+
+        assert_eq!(row.0, snapshot_id);
+        assert_eq!(row.1, 3);
+        assert_eq!(row.2, "v1.2.3");
     }
 
     #[tokio::test]

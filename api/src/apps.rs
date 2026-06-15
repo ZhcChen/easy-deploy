@@ -7,7 +7,7 @@ use std::{
 
 use flate2::read::GzDecoder;
 use fs2::available_space;
-use serde_json::Value as JsonValue;
+use serde_json::{Value as JsonValue, json};
 use serde_yaml::Value;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
@@ -27,12 +27,15 @@ use crate::{
         META_DIR_NAME, RuntimeFs, RuntimeFsError, SYSTEMD_DIR_NAME, TargetNodeMetadata,
     },
     tasks::{
-        CreateTaskInput, TaskError, TaskNodeResultInput, TaskService, active_task_status_label,
+        CreateTaskInput, RecordDeploymentRunInput, StartTaskStepInput, TaskError,
+        TaskNodeResultInput, TaskService, active_task_status_label,
     },
 };
 
 const COMPOSE_TASK_QUEUE_CAPACITY: usize = 100;
 const MIN_COMPOSE_FREE_SPACE_BYTES: u64 = 512 * 1024 * 1024;
+pub const BINARY_PACKAGE_PATTERN: &str = "{service_key}_version_{x_y_z}.tar.gz";
+pub const BINARY_PACKAGE_EXAMPLE: &str = "orders-api-prod_version_1_2_3.tar.gz";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeployStrategy {
@@ -183,6 +186,8 @@ struct ComposeTaskJob {
     task_id: i64,
     app_id: i64,
     app_key: String,
+    config_snapshot_id: Option<i64>,
+    config_revision_no: i64,
     deploy_strategy: DeployStrategy,
     action: ComposeTaskAction,
 }
@@ -196,6 +201,8 @@ struct BinaryTaskJob {
     unit_name: String,
     artifact_version: String,
     artifact_path: String,
+    config_snapshot_id: Option<i64>,
+    config_revision_no: i64,
     release_strategy: String,
     active_slot: String,
     base_port: i64,
@@ -518,13 +525,16 @@ async fn run_compose_task_job(
     let final_output = prepend_failure_context(final_output, &deployment_message);
 
     if let Err(err) = tasks
-        .record_deployment_run(
-            job.app_id,
-            job.task_id,
-            job.action.deploy_action(),
-            deployment_status,
-            &deployment_message,
-        )
+        .record_deployment_run(RecordDeploymentRunInput {
+            app_id: job.app_id,
+            task_id: job.task_id,
+            deploy_action: job.action.deploy_action(),
+            status: deployment_status,
+            message: &deployment_message,
+            config_snapshot_id: job.config_snapshot_id,
+            config_revision_no: job.config_revision_no,
+            artifact_version: "",
+        })
         .await
     {
         error!(
@@ -533,32 +543,38 @@ async fn run_compose_task_job(
             "failed to record deployment run"
         );
     };
-    if overall_success
-        && let Err(err) = record_deploy_config_snapshot(
+    if overall_success {
+        match record_deploy_config_snapshot(
             db,
             job.app_id,
             &work_dir,
             "compose_task",
             &format!("task-{}", job.task_id),
+            "",
+            None,
         )
         .await
-    {
-        error!(
-            task_id = job.task_id,
-            error = %err,
-            "failed to record compose deploy config snapshot"
-        );
+        {
+            Ok(snapshot) => {
+                if let Err(err) =
+                    bind_deployment_run_snapshot(db, job.app_id, job.task_id, &snapshot, "").await
+                {
+                    error!(
+                        task_id = job.task_id,
+                        error = %err,
+                        "failed to bind compose deployment run snapshot"
+                    );
+                }
+            }
+            Err(err) => {
+                error!(
+                    task_id = job.task_id,
+                    error = %err,
+                    "failed to record compose deploy config snapshot"
+                );
+            }
+        }
     }
-    update_app_status_best_effort(
-        db,
-        job.app_id,
-        if overall_success {
-            job.action.success_status()
-        } else {
-            "failed"
-        },
-    )
-    .await;
     if let Err(err) = tasks
         .finish_with_compose_output(job.task_id, &final_output)
         .await
@@ -930,13 +946,16 @@ async fn run_binary_task_job(
     let final_output = prepend_failure_context(final_output, &deployment_message);
 
     if let Err(err) = tasks
-        .record_deployment_run(
-            job.app_id,
-            job.task_id,
-            job.action.deploy_action(),
-            deployment_status,
-            &deployment_message,
-        )
+        .record_deployment_run(RecordDeploymentRunInput {
+            app_id: job.app_id,
+            task_id: job.task_id,
+            deploy_action: job.action.deploy_action(),
+            status: deployment_status,
+            message: &deployment_message,
+            config_snapshot_id: job.config_snapshot_id,
+            config_revision_no: job.config_revision_no,
+            artifact_version: &job.artifact_version,
+        })
         .await
     {
         error!(
@@ -945,32 +964,45 @@ async fn run_binary_task_job(
             "failed to record binary deployment run"
         );
     };
-    if overall_success
-        && let Err(err) = record_deploy_config_snapshot(
+    if overall_success {
+        let binary_config = fetch_binary_config_for_app(db, job.app_id).await.ok();
+        match record_deploy_config_snapshot(
             db,
             job.app_id,
             &work_dir,
             "binary_task",
             &job.artifact_version,
+            &job.artifact_version,
+            binary_config.as_ref(),
         )
         .await
-    {
-        error!(
-            task_id = job.task_id,
-            error = %err,
-            "failed to record binary deploy config snapshot"
-        );
+        {
+            Ok(snapshot) => {
+                if let Err(err) = bind_deployment_run_snapshot(
+                    db,
+                    job.app_id,
+                    job.task_id,
+                    &snapshot,
+                    &job.artifact_version,
+                )
+                .await
+                {
+                    error!(
+                        task_id = job.task_id,
+                        error = %err,
+                        "failed to bind binary deployment run snapshot"
+                    );
+                }
+            }
+            Err(err) => {
+                error!(
+                    task_id = job.task_id,
+                    error = %err,
+                    "failed to record binary deploy config snapshot"
+                );
+            }
+        }
     }
-    update_app_status_best_effort(
-        db,
-        job.app_id,
-        if overall_success {
-            job.action.success_status()
-        } else {
-            "failed"
-        },
-    )
-    .await;
     if let Err(err) = tasks
         .finish_with_compose_output(job.task_id, &final_output)
         .await
@@ -990,7 +1022,6 @@ async fn fail_compose_task(
     task_id: i64,
     message: &str,
 ) {
-    update_app_status_best_effort(db, app_id, "failed").await;
     update_runtime_states_best_effort(RuntimeStatesUpdate {
         db,
         app_id,
@@ -1018,7 +1049,6 @@ async fn fail_binary_task(
     task_id: i64,
     message: &str,
 ) {
-    update_app_status_best_effort(db, app_id, "failed").await;
     update_runtime_states_best_effort(RuntimeStatesUpdate {
         db,
         app_id,
@@ -1077,30 +1107,78 @@ async fn run_compose_task_on_node(
         .tasks
         .update_phase(context.task_id, "preflight")
         .await?;
+    let preflight_step_id = start_task_step(
+        context.tasks,
+        context.task_id,
+        Some(node),
+        "node.preflight",
+        &format!("节点 {} 预检", node.name),
+        "check node availability",
+    )
+    .await?;
     if let Some(message) =
         block_unavailable_node_preflight(context.tasks, context.task_id, node).await?
     {
+        fail_task_step_message(context.tasks, context.task_id, preflight_step_id, &message).await?;
         return Ok(ComposeNodeTaskResult {
             success: false,
             message,
             outputs: Vec::new(),
         });
     }
+    finish_task_step(
+        context.tasks,
+        context.task_id,
+        preflight_step_id,
+        true,
+        None,
+        "节点预检通过",
+    )
+    .await?;
 
     let mut outputs = if node.node_type == "ssh" {
         context
             .tasks
             .update_phase(context.task_id, "preparing_files")
             .await?;
-        sync_compose_runtime_to_ssh_target(
+        let sync_step_id = start_task_step(
             context.tasks,
             context.task_id,
+            Some(node),
+            "compose.sync",
+            &format!("同步 Compose 文件到 {}", node.name),
+            "mkdir/copy compose runtime files",
+        )
+        .await?;
+        match sync_compose_runtime_to_ssh_target(
+            context.tasks,
+            context.task_id,
+            Some(sync_step_id),
             context.ssh,
             context.runtime_work_dir,
             context.job,
             node,
         )
-        .await?
+        .await
+        {
+            Ok(outputs) => {
+                finish_task_step(
+                    context.tasks,
+                    context.task_id,
+                    sync_step_id,
+                    true,
+                    Some(0),
+                    "Compose 运行文件同步完成",
+                )
+                .await?;
+                outputs
+            }
+            Err(err) => {
+                fail_task_step_message(context.tasks, context.task_id, sync_step_id, err.message())
+                    .await?;
+                return Err(err);
+            }
+        }
     } else {
         Vec::new()
     };
@@ -1109,7 +1187,24 @@ async fn run_compose_task_on_node(
         .tasks
         .update_phase(context.task_id, "preflight")
         .await?;
-    let preflight = run_compose_preflight_on_node(context, node).await?;
+    let compose_preflight_step_id = start_task_step(
+        context.tasks,
+        context.task_id,
+        Some(node),
+        "compose.config",
+        &format!("校验 {} 的 Compose 配置", node.name),
+        "docker info && docker compose config",
+    )
+    .await?;
+    let preflight =
+        run_compose_preflight_on_node(context, node, Some(compose_preflight_step_id)).await?;
+    finish_task_step_result(
+        context.tasks,
+        context.task_id,
+        compose_preflight_step_id,
+        &preflight,
+    )
+    .await?;
     if !preflight.success {
         outputs.extend(preflight.outputs);
         return Ok(ComposeNodeTaskResult {
@@ -1124,9 +1219,28 @@ async fn run_compose_task_on_node(
         .tasks
         .update_phase(context.task_id, "executing")
         .await?;
+    let action_step_id = start_task_step(
+        context.tasks,
+        context.task_id,
+        Some(node),
+        "compose.action",
+        &format!("{} {}", node.name, context.job.action.label()),
+        compose_action_command_label(context.job.action),
+    )
+    .await?;
     let output = run_compose_action_on_node(context, node).await?;
+    append_step_command_output(context.tasks, context.task_id, action_step_id, &output).await?;
     let command_success = output.success;
     let mut message = friendly_command_error(&output.output, "命令没有输出");
+    finish_task_step(
+        context.tasks,
+        context.task_id,
+        action_step_id,
+        command_success,
+        output.status_code.map(i64::from),
+        &message,
+    )
+    .await?;
     outputs.push(output);
 
     if command_success && context.job.action.runs_health_check() {
@@ -1134,8 +1248,18 @@ async fn run_compose_task_on_node(
             .tasks
             .update_phase(context.task_id, "healthchecking")
             .await?;
-        let health = run_compose_health_check_on_node(context, node).await?;
+        let health_step_id = start_task_step(
+            context.tasks,
+            context.task_id,
+            Some(node),
+            "compose.healthcheck",
+            &format!("{} 健康检查", node.name),
+            "health check",
+        )
+        .await?;
+        let health = run_compose_health_check_on_node(context, node, Some(health_step_id)).await?;
         message = health.message.clone();
+        finish_task_step_result(context.tasks, context.task_id, health_step_id, &health).await?;
         outputs.extend(health.outputs);
         return Ok(ComposeNodeTaskResult {
             success: health.success,
@@ -1224,6 +1348,7 @@ async fn run_compose_action_on_node(
 async fn run_compose_preflight_on_node(
     context: &ComposeTaskExecutionContext<'_>,
     node: &AppTargetNode,
+    step_id: Option<i64>,
 ) -> Result<ComposeNodeTaskResult, AppError> {
     match node.node_type.as_str() {
         "local" => {
@@ -1231,11 +1356,12 @@ async fn run_compose_preflight_on_node(
                 context.tasks,
                 context.compose,
                 context.task_id,
+                step_id,
                 context.runtime_work_dir.to_path_buf(),
             )
             .await
         }
-        "ssh" => run_ssh_compose_preflight(context, node).await,
+        "ssh" => run_ssh_compose_preflight(context, node, step_id).await,
         _ => Err(AppError::InvalidInput(format!(
             "节点 {} 的类型 {} 不支持 Compose 部署",
             node.name, node.node_type
@@ -1247,23 +1373,25 @@ async fn run_local_compose_preflight(
     tasks: &TaskService,
     compose: &ComposeExecutor,
     task_id: i64,
+    step_id: Option<i64>,
     work_dir: PathBuf,
 ) -> Result<ComposeNodeTaskResult, AppError> {
-    Ok(run_compose_preflight(tasks, compose, task_id, work_dir).await)
+    Ok(run_compose_preflight(tasks, compose, task_id, step_id, work_dir).await)
 }
 
 async fn run_ssh_compose_preflight(
     context: &ComposeTaskExecutionContext<'_>,
     node: &AppTargetNode,
+    step_id: Option<i64>,
 ) -> Result<ComposeNodeTaskResult, AppError> {
-    context
-        .tasks
-        .append_log(
-            context.task_id,
-            "system",
-            &format!("开始节点 {} Compose 远程预检", node.name),
-        )
-        .await?;
+    append_task_or_step_log(
+        context.tasks,
+        context.task_id,
+        step_id,
+        "system",
+        &format!("开始节点 {} Compose 远程预检", node.name),
+    )
+    .await?;
     let target = node.ssh_target()?;
     let remote_work_dir = compose_node_deploy_work_dir(context.job, node);
     let output = context
@@ -1274,7 +1402,8 @@ async fn run_ssh_compose_preflight(
             &remote_work_dir,
         )
         .await?;
-    append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+    append_intermediate_command_output_for_step(context.tasks, context.task_id, step_id, &output)
+        .await?;
     let success = output.success;
     let message = if success {
         "Compose 远程配置校验通过".to_owned()
@@ -1291,6 +1420,7 @@ async fn run_ssh_compose_preflight(
 async fn run_compose_health_check_on_node(
     context: &ComposeTaskExecutionContext<'_>,
     node: &AppTargetNode,
+    step_id: Option<i64>,
 ) -> Result<ComposeNodeTaskResult, AppError> {
     let config = load_health_check_config(context.db, context.job.app_id).await?;
     if node.node_type == "local" {
@@ -1301,6 +1431,7 @@ async fn run_compose_health_check_on_node(
             context.systemd,
             context.job.app_id,
             context.task_id,
+            step_id,
             context.runtime_work_dir,
         )
         .await?
@@ -1325,14 +1456,14 @@ async fn run_compose_health_check_on_node(
             outputs: Vec::new(),
         }),
         HealthCheckKind::ComposeRunning => {
-            context
-                .tasks
-                .append_log(
-                    context.task_id,
-                    "system",
-                    &format!("开始节点 {} 容器运行状态检查", node.name),
-                )
-                .await?;
+            append_task_or_step_log(
+                context.tasks,
+                context.task_id,
+                step_id,
+                "system",
+                &format!("开始节点 {} 容器运行状态检查", node.name),
+            )
+            .await?;
             let target = node.ssh_target()?;
             let remote_work_dir = compose_node_deploy_work_dir(context.job, node);
             let output = context
@@ -1343,7 +1474,13 @@ async fn run_compose_health_check_on_node(
                     &remote_work_dir,
                 )
                 .await?;
-            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            append_intermediate_command_output_for_step(
+                context.tasks,
+                context.task_id,
+                step_id,
+                &output,
+            )
+            .await?;
             let running_lines = count_compose_running_lines(&output.output);
             let success = output.success && running_lines > 0;
             let message = if success {
@@ -1368,7 +1505,13 @@ async fn run_compose_health_check_on_node(
                     config.timeout_secs,
                 )
                 .await?;
-            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            append_intermediate_command_output_for_step(
+                context.tasks,
+                context.task_id,
+                step_id,
+                &output,
+            )
+            .await?;
             let status = output.output.trim();
             let success = output.success && status == config.expected_status.to_string().as_str();
             let message = if success {
@@ -1382,9 +1525,7 @@ async fn run_compose_health_check_on_node(
                     ),
                 )
             };
-            context
-                .tasks
-                .append_log(context.task_id, "system", &message)
+            append_task_or_step_log(context.tasks, context.task_id, step_id, "system", &message)
                 .await?;
             Ok(ComposeNodeTaskResult {
                 success,
@@ -1403,7 +1544,13 @@ async fn run_compose_health_check_on_node(
                     config.timeout_secs,
                 )
                 .await?;
-            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            append_intermediate_command_output_for_step(
+                context.tasks,
+                context.task_id,
+                step_id,
+                &output,
+            )
+            .await?;
             let success = output.success;
             let message = if success {
                 format!("TCP 健康检查通过: {}", config.endpoint)
@@ -1413,9 +1560,7 @@ async fn run_compose_health_check_on_node(
                     &format!("TCP 健康检查失败: {}", config.endpoint),
                 )
             };
-            context
-                .tasks
-                .append_log(context.task_id, "system", &message)
+            append_task_or_step_log(context.tasks, context.task_id, step_id, "system", &message)
                 .await?;
             Ok(ComposeNodeTaskResult {
                 success,
@@ -1438,6 +1583,7 @@ async fn run_compose_health_check_on_node(
 async fn sync_compose_runtime_to_ssh_target(
     tasks: &TaskService,
     task_id: i64,
+    step_id: Option<i64>,
     ssh: &SshExecutor,
     runtime_work_dir: &Path,
     job: &ComposeTaskJob,
@@ -1464,7 +1610,7 @@ async fn sync_compose_runtime_to_ssh_target(
         let output = ssh
             .mkdir_all(&target, runtime_work_dir.to_path_buf(), &dir)
             .await?;
-        append_intermediate_command_output(tasks, task_id, &output).await?;
+        append_intermediate_command_output_for_step(tasks, task_id, step_id, &output).await?;
         let success = output.success;
         outputs.push(output);
         if !success {
@@ -1480,7 +1626,7 @@ async fn sync_compose_runtime_to_ssh_target(
                 &file.remote_path,
             )
             .await?;
-        append_intermediate_command_output(tasks, task_id, &output).await?;
+        append_intermediate_command_output_for_step(tasks, task_id, step_id, &output).await?;
         let success = output.success;
         let remote_path = file.remote_path;
         outputs.push(output);
@@ -1490,16 +1636,17 @@ async fn sync_compose_runtime_to_ssh_target(
             )));
         }
     }
-    tasks
-        .append_log(
-            task_id,
-            "system",
-            &format!(
-                "已同步 Compose 运行文件到 SSH 节点 {}: {}",
-                node.name, target_root
-            ),
-        )
-        .await?;
+    append_task_or_step_log(
+        tasks,
+        task_id,
+        step_id,
+        "system",
+        &format!(
+            "已同步 Compose 运行文件到 SSH 节点 {}: {}",
+            node.name, target_root
+        ),
+    )
+    .await?;
     Ok(outputs)
 }
 
@@ -1570,9 +1717,19 @@ async fn run_binary_task_on_node(
         .tasks
         .update_phase(context.task_id, "preflight")
         .await?;
+    let preflight_step_id = start_task_step(
+        context.tasks,
+        context.task_id,
+        Some(node),
+        "node.preflight",
+        &format!("节点 {} 预检", node.name),
+        "check node availability and proxy capability",
+    )
+    .await?;
     if let Some(message) =
         block_unavailable_node_preflight(context.tasks, context.task_id, node).await?
     {
+        fail_task_step_message(context.tasks, context.task_id, preflight_step_id, &message).await?;
         return Ok(BinaryNodeTaskResult {
             success: false,
             message,
@@ -1583,6 +1740,7 @@ async fn run_binary_task_on_node(
     if let Some(message) =
         block_missing_proxy_preflight(context.tasks, context.task_id, node, context.job).await?
     {
+        fail_task_step_message(context.tasks, context.task_id, preflight_step_id, &message).await?;
         return Ok(BinaryNodeTaskResult {
             success: false,
             message,
@@ -1590,6 +1748,15 @@ async fn run_binary_task_on_node(
             promoted_slot: None,
         });
     }
+    finish_task_step(
+        context.tasks,
+        context.task_id,
+        preflight_step_id,
+        true,
+        None,
+        "节点预检通过",
+    )
+    .await?;
 
     let mut outputs = Vec::new();
     if context.job.action.syncs_runtime_files() {
@@ -1597,169 +1764,223 @@ async fn run_binary_task_on_node(
             .tasks
             .update_phase(context.task_id, "preparing_files")
             .await?;
+        let prepare_step_id = start_task_step(
+            context.tasks,
+            context.task_id,
+            Some(node),
+            "binary.prepare",
+            &format!("准备 {} 的二进制运行文件", node.name),
+            "sync runtime files && systemctl link && daemon-reload",
+        )
+        .await?;
         let unit_name = context.job.execution_unit_name();
-        match node.node_type.as_str() {
-            "local" => {
-                sync_binary_runtime_to_local_target(
-                    context.tasks,
-                    context.task_id,
-                    context.runtime_work_dir,
-                    context.job,
-                    node,
-                )
-                .await?;
-                let command_work_dir = binary_command_work_dir(
-                    &binary_node_deploy_work_dir(context.job, node),
-                    context.runtime_work_dir,
-                );
-                if let Some(artifact_path) = binary_target_artifact_path(
-                    &binary_node_deploy_work_dir(context.job, node),
-                    &context.job.artifact_path,
-                ) {
-                    let output = context
-                        .systemd
-                        .make_executable(command_work_dir.clone(), &artifact_path)
-                        .await?;
-                    append_intermediate_command_output(context.tasks, context.task_id, &output)
-                        .await?;
-                    let success = output.success;
-                    let message = friendly_command_error(&output.output, "chmod +x 制品失败");
-                    outputs.push(output);
-                    if !success {
-                        return Ok(BinaryNodeTaskResult {
-                            success: false,
-                            message,
-                            outputs,
-                            promoted_slot: None,
-                        });
-                    }
-                }
-                let unit_path = binary_systemd_unit_path(&command_work_dir, &unit_name);
-                let output = context
-                    .systemd
-                    .link_unit(command_work_dir.clone(), unit_path)
-                    .await?;
-                append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
-                let success = output.success;
-                let message = friendly_command_error(&output.output, "systemctl link failed");
-                outputs.push(output);
-                if !success {
-                    return Ok(BinaryNodeTaskResult {
-                        success: false,
-                        message,
-                        outputs,
-                        promoted_slot: None,
-                    });
-                }
-                let output = context.systemd.daemon_reload(command_work_dir).await?;
-                append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
-                let success = output.success;
-                let message =
-                    friendly_command_error(&output.output, "systemctl daemon-reload 失败");
-                outputs.push(output);
-                if !success {
-                    return Ok(BinaryNodeTaskResult {
-                        success: false,
-                        message,
-                        outputs,
-                        promoted_slot: None,
-                    });
-                }
-            }
-            "ssh" => {
-                let sync_outputs = sync_binary_runtime_to_ssh_target(
-                    context.tasks,
-                    context.task_id,
-                    context.ssh,
-                    context.runtime_work_dir,
-                    context.job,
-                    node,
-                )
-                .await?;
-                outputs.extend(sync_outputs);
-                let target = node.ssh_target()?;
-                if let Some(remote_artifact_path) = binary_target_artifact_path(
-                    &binary_node_deploy_work_dir(context.job, node),
-                    &context.job.artifact_path,
-                ) {
-                    let output = context
-                        .ssh
-                        .make_executable(
-                            &target,
-                            context.runtime_work_dir.to_path_buf(),
-                            &remote_artifact_path,
-                        )
-                        .await?;
-                    append_intermediate_command_output(context.tasks, context.task_id, &output)
-                        .await?;
-                    let success = output.success;
-                    let message = friendly_command_error(&output.output, "远程 chmod +x 制品失败");
-                    outputs.push(output);
-                    if !success {
-                        return Ok(BinaryNodeTaskResult {
-                            success: false,
-                            message,
-                            outputs,
-                            promoted_slot: None,
-                        });
-                    }
-                }
-                let remote_unit_path = remote_binary_systemd_unit_path(
-                    &binary_node_deploy_work_dir(context.job, node),
-                    &unit_name,
-                )?;
-                let output = context
-                    .ssh
-                    .link_unit(
-                        &target,
-                        context.runtime_work_dir.to_path_buf(),
-                        &remote_unit_path,
+        let prepare_result: Result<(), AppError> = async {
+            match node.node_type.as_str() {
+                "local" => {
+                    sync_binary_runtime_to_local_target(
+                        context.tasks,
+                        context.task_id,
+                        Some(prepare_step_id),
+                        context.runtime_work_dir,
+                        context.job,
+                        node,
                     )
                     .await?;
-                append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
-                let success = output.success;
-                let message =
-                    friendly_command_error(&output.output, "remote systemctl link failed");
-                outputs.push(output);
-                if !success {
-                    return Ok(BinaryNodeTaskResult {
-                        success: false,
-                        message,
-                        outputs,
-                        promoted_slot: None,
-                    });
-                }
-                let output = context
-                    .ssh
-                    .daemon_reload(&target, context.runtime_work_dir.to_path_buf())
+                    let command_work_dir = binary_command_work_dir(
+                        &binary_node_deploy_work_dir(context.job, node),
+                        context.runtime_work_dir,
+                    );
+                    if let Some(artifact_path) = binary_target_artifact_path(
+                        &binary_node_deploy_work_dir(context.job, node),
+                        &context.job.artifact_path,
+                    ) {
+                        let output = context
+                            .systemd
+                            .make_executable(command_work_dir.clone(), &artifact_path)
+                            .await?;
+                        append_step_command_output(
+                            context.tasks,
+                            context.task_id,
+                            prepare_step_id,
+                            &output,
+                        )
+                        .await?;
+                        let success = output.success;
+                        let message = friendly_command_error(&output.output, "chmod +x 版本包失败");
+                        outputs.push(output);
+                        if !success {
+                            Err(AppError::Internal(message))?
+                        }
+                    }
+                    let unit_path = binary_systemd_unit_path(&command_work_dir, &unit_name);
+                    let output = context
+                        .systemd
+                        .link_unit(command_work_dir.clone(), unit_path)
+                        .await?;
+                    append_step_command_output(
+                        context.tasks,
+                        context.task_id,
+                        prepare_step_id,
+                        &output,
+                    )
                     .await?;
-                append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
-                let success = output.success;
-                let message =
-                    friendly_command_error(&output.output, "远程 systemctl daemon-reload 失败");
-                outputs.push(output);
-                if !success {
-                    return Ok(BinaryNodeTaskResult {
-                        success: false,
-                        message,
-                        outputs,
-                        promoted_slot: None,
-                    });
+                    let success = output.success;
+                    let message = friendly_command_error(&output.output, "systemctl link failed");
+                    outputs.push(output);
+                    if !success {
+                        Err(AppError::Internal(message))?;
+                    }
+                    let output = context.systemd.daemon_reload(command_work_dir).await?;
+                    append_step_command_output(
+                        context.tasks,
+                        context.task_id,
+                        prepare_step_id,
+                        &output,
+                    )
+                    .await?;
+                    let success = output.success;
+                    let message =
+                        friendly_command_error(&output.output, "systemctl daemon-reload 失败");
+                    outputs.push(output);
+                    if !success {
+                        Err(AppError::Internal(message))?;
+                    }
+                    Ok(())
                 }
-            }
-            _ => {
-                return Err(AppError::InvalidInput(format!(
+                "ssh" => {
+                    let sync_outputs = sync_binary_runtime_to_ssh_target(
+                        context.tasks,
+                        context.task_id,
+                        Some(prepare_step_id),
+                        context.ssh,
+                        context.runtime_work_dir,
+                        context.job,
+                        node,
+                    )
+                    .await?;
+                    outputs.extend(sync_outputs);
+                    let target = node.ssh_target()?;
+                    if let Some(remote_artifact_path) = binary_target_artifact_path(
+                        &binary_node_deploy_work_dir(context.job, node),
+                        &context.job.artifact_path,
+                    ) {
+                        let output = context
+                            .ssh
+                            .make_executable(
+                                &target,
+                                context.runtime_work_dir.to_path_buf(),
+                                &remote_artifact_path,
+                            )
+                            .await?;
+                        append_step_command_output(
+                            context.tasks,
+                            context.task_id,
+                            prepare_step_id,
+                            &output,
+                        )
+                        .await?;
+                        let success = output.success;
+                        let message =
+                            friendly_command_error(&output.output, "远程 chmod +x 版本包失败");
+                        outputs.push(output);
+                        if !success {
+                            Err(AppError::Internal(message))?;
+                        }
+                    }
+                    let remote_unit_path = remote_binary_systemd_unit_path(
+                        &binary_node_deploy_work_dir(context.job, node),
+                        &unit_name,
+                    )?;
+                    let output = context
+                        .ssh
+                        .link_unit(
+                            &target,
+                            context.runtime_work_dir.to_path_buf(),
+                            &remote_unit_path,
+                        )
+                        .await?;
+                    append_step_command_output(
+                        context.tasks,
+                        context.task_id,
+                        prepare_step_id,
+                        &output,
+                    )
+                    .await?;
+                    let success = output.success;
+                    let message =
+                        friendly_command_error(&output.output, "remote systemctl link failed");
+                    outputs.push(output);
+                    if !success {
+                        Err(AppError::Internal(message))?;
+                    }
+                    let output = context
+                        .ssh
+                        .daemon_reload(&target, context.runtime_work_dir.to_path_buf())
+                        .await?;
+                    append_step_command_output(
+                        context.tasks,
+                        context.task_id,
+                        prepare_step_id,
+                        &output,
+                    )
+                    .await?;
+                    let success = output.success;
+                    let message =
+                        friendly_command_error(&output.output, "远程 systemctl daemon-reload 失败");
+                    outputs.push(output);
+                    if !success {
+                        Err(AppError::Internal(message))?;
+                    }
+                    Ok(())
+                }
+                _ => Err(AppError::InvalidInput(format!(
                     "节点 {} 的类型 {} 不支持二进制部署",
                     node.name, node.node_type
-                )));
+                ))),
             }
         }
+        .await;
+        if let Err(err) = prepare_result {
+            fail_task_step_message(
+                context.tasks,
+                context.task_id,
+                prepare_step_id,
+                err.message(),
+            )
+            .await?;
+            return Ok(BinaryNodeTaskResult {
+                success: false,
+                message: err.message().to_owned(),
+                outputs,
+                promoted_slot: None,
+            });
+        }
+        finish_task_step(
+            context.tasks,
+            context.task_id,
+            prepare_step_id,
+            true,
+            Some(0),
+            "二进制运行文件准备完成",
+        )
+        .await?;
     }
 
     context
         .tasks
         .update_phase(context.task_id, "executing")
         .await?;
+    let action_command =
+        binary_action_command_label(context.job.action, &context.job.execution_unit_name());
+    let action_step_id = start_task_step(
+        context.tasks,
+        context.task_id,
+        Some(node),
+        "binary.action",
+        &format!("{} {}", node.name, context.job.action.label()),
+        &action_command,
+    )
+    .await?;
     let output = match node.node_type.as_str() {
         "local" => {
             let command_work_dir = binary_command_work_dir(
@@ -1804,8 +2025,18 @@ async fn run_binary_task_on_node(
             )));
         }
     };
+    append_step_command_output(context.tasks, context.task_id, action_step_id, &output).await?;
     let command_success = output.success;
     let mut message = friendly_command_error(&output.output, "命令没有输出");
+    finish_task_step(
+        context.tasks,
+        context.task_id,
+        action_step_id,
+        command_success,
+        output.status_code.map(i64::from),
+        &message,
+    )
+    .await?;
     outputs.push(output);
 
     if command_success && context.job.action.runs_health_check() {
@@ -1813,9 +2044,20 @@ async fn run_binary_task_on_node(
             .tasks
             .update_phase(context.task_id, "healthchecking")
             .await?;
-        let health = run_binary_health_check_on_node(context, node).await?;
+        let health_step_id = start_task_step(
+            context.tasks,
+            context.task_id,
+            Some(node),
+            "binary.healthcheck",
+            &format!("{} 健康检查", node.name),
+            "health check",
+        )
+        .await?;
+        let health = run_binary_health_check_on_node(context, node, Some(health_step_id)).await?;
         message = health.message.clone();
         let health_success = health.success;
+        finish_binary_task_step_result(context.tasks, context.task_id, health_step_id, &health)
+            .await?;
         outputs.extend(health.outputs);
         return Ok(BinaryNodeTaskResult {
             success: health_success,
@@ -1836,6 +2078,7 @@ async fn run_binary_task_on_node(
 async fn run_binary_health_check_on_node(
     context: &BinaryTaskExecutionContext<'_>,
     node: &AppTargetNode,
+    step_id: Option<i64>,
 ) -> Result<BinaryNodeTaskResult, AppError> {
     let config = load_health_check_config(context.db, context.job.app_id).await?;
     if node.node_type == "local" {
@@ -1850,6 +2093,7 @@ async fn run_binary_health_check_on_node(
                 node,
                 &command_work_dir,
                 None,
+                step_id,
             )
             .await?
             {
@@ -1878,6 +2122,7 @@ async fn run_binary_health_check_on_node(
             context.systemd,
             context.job.app_id,
             context.task_id,
+            step_id,
             &command_work_dir,
         )
         .await?
@@ -1913,6 +2158,7 @@ async fn run_binary_health_check_on_node(
                     node,
                     context.runtime_work_dir,
                     Some(&target),
+                    step_id,
                 )
                 .await?;
                 return Ok(BinaryNodeTaskResult {
@@ -1930,14 +2176,14 @@ async fn run_binary_health_check_on_node(
                     promoted_slot: None,
                 });
             }
-            context
-                .tasks
-                .append_log(
-                    context.task_id,
-                    "system",
-                    &format!("开始节点 {} systemd active 检查", node.name),
-                )
-                .await?;
+            append_task_or_step_log(
+                context.tasks,
+                context.task_id,
+                step_id,
+                "system",
+                &format!("开始节点 {} systemd active 检查", node.name),
+            )
+            .await?;
             let target = node.ssh_target()?;
             let endpoint = if context.job.release_strategy == "blue_green" {
                 context.job.execution_unit_name()
@@ -1948,7 +2194,13 @@ async fn run_binary_health_check_on_node(
                 .ssh
                 .is_active(&target, context.runtime_work_dir.to_path_buf(), &endpoint)
                 .await?;
-            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            append_intermediate_command_output_for_step(
+                context.tasks,
+                context.task_id,
+                step_id,
+                &output,
+            )
+            .await?;
             let success = output.success && output.output.trim() == "active";
             let message = if success {
                 format!("systemd active 检查通过: {endpoint}")
@@ -1974,6 +2226,7 @@ async fn run_binary_health_check_on_node(
                     node,
                     context.runtime_work_dir,
                     Some(&target),
+                    step_id,
                 )
                 .await?;
                 return Ok(BinaryNodeTaskResult {
@@ -2002,7 +2255,13 @@ async fn run_binary_health_check_on_node(
                     config.timeout_secs,
                 )
                 .await?;
-            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            append_intermediate_command_output_for_step(
+                context.tasks,
+                context.task_id,
+                step_id,
+                &output,
+            )
+            .await?;
             let status = output.output.trim();
             let success = output.success && status == config.expected_status.to_string().as_str();
             let message = if success {
@@ -2016,9 +2275,7 @@ async fn run_binary_health_check_on_node(
                     ),
                 )
             };
-            context
-                .tasks
-                .append_log(context.task_id, "system", &message)
+            append_task_or_step_log(context.tasks, context.task_id, step_id, "system", &message)
                 .await?;
             Ok(BinaryNodeTaskResult {
                 success,
@@ -2036,6 +2293,7 @@ async fn run_binary_health_check_on_node(
                     node,
                     context.runtime_work_dir,
                     Some(&target),
+                    step_id,
                 )
                 .await?;
                 return Ok(BinaryNodeTaskResult {
@@ -2064,7 +2322,13 @@ async fn run_binary_health_check_on_node(
                     config.timeout_secs,
                 )
                 .await?;
-            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            append_intermediate_command_output_for_step(
+                context.tasks,
+                context.task_id,
+                step_id,
+                &output,
+            )
+            .await?;
             let success = output.success;
             let message = if success {
                 format!("TCP 健康检查通过: {}", config.endpoint)
@@ -2074,9 +2338,7 @@ async fn run_binary_health_check_on_node(
                     &format!("TCP 健康检查失败: {}", config.endpoint),
                 )
             };
-            context
-                .tasks
-                .append_log(context.task_id, "system", &message)
+            append_task_or_step_log(context.tasks, context.task_id, step_id, "system", &message)
                 .await?;
             Ok(BinaryNodeTaskResult {
                 success,
@@ -2104,25 +2366,30 @@ async fn run_binary_slot_health_check(
     _node: &AppTargetNode,
     work_dir: &Path,
     ssh_target: Option<&SshTarget>,
+    step_id: Option<i64>,
 ) -> Result<bool, AppError> {
-    context
-        .tasks
-        .append_log(
-            context.task_id,
-            "system",
-            &format!(
-                "开始 Blue/Green 备用槽位 {} 健康检查: {}",
-                context.job.target_slot(),
-                config.kind.label()
-            ),
-        )
-        .await?;
+    append_task_or_step_log(
+        context.tasks,
+        context.task_id,
+        step_id,
+        "system",
+        &format!(
+            "开始 Blue/Green 备用槽位 {} 健康检查: {}",
+            context.job.target_slot(),
+            config.kind.label()
+        ),
+    )
+    .await?;
     match config.kind {
         HealthCheckKind::None => {
-            context
-                .tasks
-                .append_log(context.task_id, "system", "未配置健康检查")
-                .await?;
+            append_task_or_step_log(
+                context.tasks,
+                context.task_id,
+                step_id,
+                "system",
+                "未配置健康检查",
+            )
+            .await?;
             Ok(true)
         }
         HealthCheckKind::SystemdActive => {
@@ -2138,7 +2405,13 @@ async fn run_binary_slot_health_check(
                     .is_active(work_dir.to_path_buf(), &unit_name)
                     .await?
             };
-            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            append_intermediate_command_output_for_step(
+                context.tasks,
+                context.task_id,
+                step_id,
+                &output,
+            )
+            .await?;
             let success = output.success && output.output.trim() == "active";
             let message = if success {
                 format!("systemd active 检查通过: {unit_name}")
@@ -2148,9 +2421,7 @@ async fn run_binary_slot_health_check(
                     &format!("systemd active 检查失败: {unit_name}"),
                 )
             };
-            context
-                .tasks
-                .append_log(context.task_id, "system", &message)
+            append_task_or_step_log(context.tasks, context.task_id, step_id, "system", &message)
                 .await?;
             Ok(success)
         }
@@ -2166,7 +2437,13 @@ async fn run_binary_slot_health_check(
                         config.timeout_secs,
                     )
                     .await?;
-                append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+                append_intermediate_command_output_for_step(
+                    context.tasks,
+                    context.task_id,
+                    step_id,
+                    &output,
+                )
+                .await?;
                 let status = output.output.trim();
                 let success = output.success && status == config.expected_status.to_string();
                 let message = if success {
@@ -2180,17 +2457,19 @@ async fn run_binary_slot_health_check(
                         ),
                     )
                 };
-                context
-                    .tasks
-                    .append_log(context.task_id, "system", &message)
-                    .await?;
+                append_task_or_step_log(
+                    context.tasks,
+                    context.task_id,
+                    step_id,
+                    "system",
+                    &message,
+                )
+                .await?;
                 return Ok(success);
             }
             let outcome =
                 run_slot_http_check(&endpoint, config.timeout_secs, config.expected_status).await;
-            context
-                .tasks
-                .append_log(context.task_id, "system", &outcome)
+            append_task_or_step_log(context.tasks, context.task_id, step_id, "system", &outcome)
                 .await?;
             Ok(outcome.starts_with("HTTP 健康检查通过"))
         }
@@ -2206,35 +2485,43 @@ async fn run_binary_slot_health_check(
                         config.timeout_secs,
                     )
                     .await?;
-                append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+                append_intermediate_command_output_for_step(
+                    context.tasks,
+                    context.task_id,
+                    step_id,
+                    &output,
+                )
+                .await?;
                 let success = output.success;
                 let message = if success {
                     format!("TCP 健康检查通过: {endpoint}")
                 } else {
                     friendly_command_error(&output.output, &format!("TCP 健康检查失败: {endpoint}"))
                 };
-                context
-                    .tasks
-                    .append_log(context.task_id, "system", &message)
-                    .await?;
+                append_task_or_step_log(
+                    context.tasks,
+                    context.task_id,
+                    step_id,
+                    "system",
+                    &message,
+                )
+                .await?;
                 return Ok(success);
             }
             let outcome = run_slot_tcp_check(&endpoint, config.timeout_secs).await;
-            context
-                .tasks
-                .append_log(context.task_id, "system", &outcome)
+            append_task_or_step_log(context.tasks, context.task_id, step_id, "system", &outcome)
                 .await?;
             Ok(outcome.starts_with("TCP 健康检查通过"))
         }
         HealthCheckKind::ComposeRunning => {
-            context
-                .tasks
-                .append_log(
-                    context.task_id,
-                    "system",
-                    "Blue/Green 二进制部署不使用容器运行状态检查，已跳过",
-                )
-                .await?;
+            append_task_or_step_log(
+                context.tasks,
+                context.task_id,
+                step_id,
+                "system",
+                "Blue/Green 二进制部署不使用容器运行状态检查，已跳过",
+            )
+            .await?;
             Ok(true)
         }
     }
@@ -2415,31 +2702,165 @@ fn prepend_failure_context(
     output
 }
 
-async fn append_intermediate_command_output(
+async fn append_intermediate_command_output_for_step(
     tasks: &TaskService,
     task_id: i64,
+    step_id: Option<i64>,
     output: &ComposeCommandOutput,
 ) -> Result<(), TaskError> {
-    tasks
-        .append_log(
-            task_id,
-            "system",
-            &format!(
-                "{} · 退出码 {}",
-                output.command,
-                output
-                    .status_code
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "无".to_owned())
-            ),
-        )
-        .await?;
-    if !output.output.trim().is_empty() {
+    let command_summary = format!(
+        "{} · 退出码 {}",
+        output.command,
+        output
+            .status_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "无".to_owned())
+    );
+    if let Some(step_id) = step_id {
         tasks
-            .append_log(task_id, "combined", &output.output)
+            .append_step_log(task_id, step_id, "system", &command_summary)
+            .await?;
+    } else {
+        tasks
+            .append_log(task_id, "system", &command_summary)
             .await?;
     }
+    if !output.output.trim().is_empty() {
+        if let Some(step_id) = step_id {
+            tasks
+                .append_step_log(task_id, step_id, "combined", &output.output)
+                .await?;
+        } else {
+            tasks
+                .append_log(task_id, "combined", &output.output)
+                .await?;
+        }
+    }
     Ok(())
+}
+
+async fn start_task_step(
+    tasks: &TaskService,
+    task_id: i64,
+    node: Option<&AppTargetNode>,
+    step_key: &str,
+    title: &str,
+    command: &str,
+) -> Result<i64, AppError> {
+    tasks
+        .start_step(StartTaskStepInput {
+            task_id,
+            node_id: node.map(|node| node.id),
+            step_key,
+            title,
+            command,
+        })
+        .await
+        .map_err(AppError::from)
+}
+
+async fn finish_task_step(
+    tasks: &TaskService,
+    task_id: i64,
+    step_id: i64,
+    success: bool,
+    exit_code: Option<i64>,
+    message: &str,
+) -> Result<(), AppError> {
+    if success {
+        tasks
+            .finish_step(task_id, step_id, exit_code, message)
+            .await
+            .map_err(AppError::from)
+    } else {
+        tasks
+            .fail_step(task_id, step_id, exit_code, message)
+            .await
+            .map_err(AppError::from)
+    }
+}
+
+async fn finish_task_step_result(
+    tasks: &TaskService,
+    task_id: i64,
+    step_id: i64,
+    result: &ComposeNodeTaskResult,
+) -> Result<(), AppError> {
+    let exit_code = result
+        .outputs
+        .iter()
+        .rev()
+        .find_map(|output| output.status_code.map(i64::from));
+    finish_task_step(
+        tasks,
+        task_id,
+        step_id,
+        result.success,
+        exit_code,
+        &result.message,
+    )
+    .await
+}
+
+async fn finish_binary_task_step_result(
+    tasks: &TaskService,
+    task_id: i64,
+    step_id: i64,
+    result: &BinaryNodeTaskResult,
+) -> Result<(), AppError> {
+    let exit_code = result
+        .outputs
+        .iter()
+        .rev()
+        .find_map(|output| output.status_code.map(i64::from));
+    finish_task_step(
+        tasks,
+        task_id,
+        step_id,
+        result.success,
+        exit_code,
+        &result.message,
+    )
+    .await
+}
+
+async fn fail_task_step_message(
+    tasks: &TaskService,
+    task_id: i64,
+    step_id: i64,
+    message: &str,
+) -> Result<(), AppError> {
+    tasks
+        .fail_step(task_id, step_id, None, message)
+        .await
+        .map_err(AppError::from)
+}
+
+async fn append_step_command_output(
+    tasks: &TaskService,
+    task_id: i64,
+    step_id: i64,
+    output: &ComposeCommandOutput,
+) -> Result<(), AppError> {
+    append_intermediate_command_output_for_step(tasks, task_id, Some(step_id), output)
+        .await
+        .map_err(AppError::from)
+}
+
+async fn append_task_or_step_log(
+    tasks: &TaskService,
+    task_id: i64,
+    step_id: Option<i64>,
+    stream: &str,
+    content: &str,
+) -> Result<(), TaskError> {
+    if let Some(step_id) = step_id {
+        tasks
+            .append_step_log(task_id, step_id, stream, content)
+            .await
+    } else {
+        tasks.append_log(task_id, stream, content).await
+    }
 }
 
 fn binary_command_work_dir(deploy_work_dir: &str, runtime_work_dir: &Path) -> PathBuf {
@@ -2468,6 +2889,7 @@ fn remote_binary_systemd_unit_path(root: &str, unit_name: &str) -> Result<String
 async fn sync_binary_runtime_to_local_target(
     tasks: &TaskService,
     task_id: i64,
+    step_id: Option<i64>,
     runtime_work_dir: &Path,
     job: &BinaryTaskJob,
     node: &AppTargetNode,
@@ -2503,22 +2925,24 @@ async fn sync_binary_runtime_to_local_target(
         &target_root.join(".easy-deploy").join("app.yaml"),
         "同步 app.yaml",
     )?;
-    tasks
-        .append_log(
-            task_id,
-            "system",
-            &format!(
-                "已同步二进制运行文件到本机部署目录: {}",
-                target_root.to_string_lossy()
-            ),
-        )
-        .await?;
+    append_task_or_step_log(
+        tasks,
+        task_id,
+        step_id,
+        "system",
+        &format!(
+            "已同步二进制运行文件到本机部署目录: {}",
+            target_root.to_string_lossy()
+        ),
+    )
+    .await?;
     Ok(())
 }
 
 async fn sync_binary_runtime_to_ssh_target(
     tasks: &TaskService,
     task_id: i64,
+    step_id: Option<i64>,
     ssh: &SshExecutor,
     runtime_work_dir: &Path,
     job: &BinaryTaskJob,
@@ -2558,7 +2982,7 @@ async fn sync_binary_runtime_to_ssh_target(
         let output = ssh
             .mkdir_all(&target, runtime_work_dir.to_path_buf(), &dir)
             .await?;
-        append_intermediate_command_output(tasks, task_id, &output).await?;
+        append_intermediate_command_output_for_step(tasks, task_id, step_id, &output).await?;
         let success = output.success;
         outputs.push(output);
         if !success {
@@ -2575,7 +2999,7 @@ async fn sync_binary_runtime_to_ssh_target(
                 &file.remote_path,
             )
             .await?;
-        append_intermediate_command_output(tasks, task_id, &output).await?;
+        append_intermediate_command_output_for_step(tasks, task_id, step_id, &output).await?;
         let success = output.success;
         let remote_path = file.remote_path;
         outputs.push(output);
@@ -2586,16 +3010,17 @@ async fn sync_binary_runtime_to_ssh_target(
         }
     }
 
-    tasks
-        .append_log(
-            task_id,
-            "system",
-            &format!(
-                "已同步二进制运行文件到 SSH 节点 {}: {}",
-                node.name, target_root
-            ),
-        )
-        .await?;
+    append_task_or_step_log(
+        tasks,
+        task_id,
+        step_id,
+        "system",
+        &format!(
+            "已同步二进制运行文件到 SSH 节点 {}: {}",
+            node.name, target_root
+        ),
+    )
+    .await?;
 
     Ok(outputs)
 }
@@ -2612,14 +3037,22 @@ async fn sync_promoted_binary_runtime_to_targets(
     for node in target_nodes {
         match node.node_type.as_str() {
             "local" => {
-                sync_binary_runtime_to_local_target(tasks, task_id, runtime_work_dir, job, node)
-                    .await?;
+                sync_binary_runtime_to_local_target(
+                    tasks,
+                    task_id,
+                    None,
+                    runtime_work_dir,
+                    job,
+                    node,
+                )
+                .await?;
             }
             "ssh" => {
                 outputs.extend(
                     sync_binary_runtime_to_ssh_target(
                         tasks,
                         task_id,
+                        None,
                         ssh,
                         runtime_work_dir,
                         job,
@@ -2688,43 +3121,53 @@ async fn cleanup_binary_standby_slot(
     let unit_name = job.execution_unit_name();
     let mut outputs = Vec::new();
     for node in target_nodes {
-        tasks
-            .append_log(
-                task_id,
-                "system",
-                &format!(
-                    "开始在节点 {} 停止备用槽位 systemd unit: {}",
-                    node.name, unit_name
-                ),
-            )
-            .await?;
-        let output = match node.node_type.as_str() {
+        let step_id = start_task_step(
+            tasks,
+            task_id,
+            Some(node),
+            "binary.cleanup_standby",
+            &format!("停止 {} 的备用槽位", node.name),
+            &format!("systemctl stop {unit_name}"),
+        )
+        .await?;
+        let output_result = match node.node_type.as_str() {
             "local" => {
                 let command_work_dir = binary_command_work_dir(
                     &binary_node_deploy_work_dir(job, node),
                     runtime_work_dir,
                 );
-                systemd.stop(command_work_dir, &unit_name).await?
+                systemd.stop(command_work_dir, &unit_name).await
             }
             "ssh" => {
                 let target = node.ssh_target()?;
                 ssh.stop(&target, runtime_work_dir.to_path_buf(), &unit_name)
-                    .await?
+                    .await
             }
             _ => {
-                return Err(AppError::InvalidInput(format!(
+                let message = format!(
                     "节点 {} 的类型 {} 不支持备用槽位清理",
                     node.name, node.node_type
-                )));
+                );
+                fail_task_step_message(tasks, task_id, step_id, &message).await?;
+                return Err(AppError::InvalidInput(message));
             }
         };
-        append_intermediate_command_output(tasks, task_id, &output).await?;
+        let output = match output_result {
+            Ok(output) => output,
+            Err(err) => {
+                fail_task_step_message(tasks, task_id, step_id, err.message()).await?;
+                return Err(AppError::from(err));
+            }
+        };
+        append_step_command_output(tasks, task_id, step_id, &output).await?;
         let success = output.success;
         let message = friendly_command_error(&output.output, "停止备用槽位失败");
         outputs.push(output);
         if !success {
+            fail_task_step_message(tasks, task_id, step_id, &message).await?;
             return Err(AppError::Internal(message));
         }
+        finish_task_step(tasks, task_id, step_id, true, Some(0), "备用槽位已停止").await?;
     }
     Ok(outputs)
 }
@@ -2745,21 +3188,35 @@ async fn switch_binary_proxy_on_node(
 ) -> Result<Vec<ComposeCommandOutput>, AppError> {
     let job = context.job;
     let config_path = binary_proxy_config_path(context.job)?;
-    context
-        .tasks
-        .append_log(
-            context.task_id,
-            "system",
-            &format!(
-                "开始在节点 {} 切换 {} 反向代理到 {}({})",
-                node.name,
-                binary_proxy_kind_label(&job.proxy_kind),
-                job.target_slot(),
-                display_port(job.target_port())
-            ),
-        )
-        .await?;
-    match node.node_type.as_str() {
+    let step_id = start_task_step(
+        context.tasks,
+        context.task_id,
+        Some(node),
+        "binary.proxy_switch",
+        &format!("切换 {} 的反向代理", node.name),
+        &format!(
+            "{} -> {}({})",
+            binary_proxy_kind_label(&job.proxy_kind),
+            job.target_slot(),
+            display_port(job.target_port())
+        ),
+    )
+    .await?;
+    append_task_or_step_log(
+        context.tasks,
+        context.task_id,
+        Some(step_id),
+        "system",
+        &format!(
+            "开始在节点 {} 切换 {} 反向代理到 {}({})",
+            node.name,
+            binary_proxy_kind_label(&job.proxy_kind),
+            job.target_slot(),
+            display_port(job.target_port())
+        ),
+    )
+    .await?;
+    let result = match node.node_type.as_str() {
         "local" => {
             write_local_proxy_config(&config_path, context.proxy_config).await?;
             let command_work_dir = binary_command_work_dir(
@@ -2769,6 +3226,7 @@ async fn switch_binary_proxy_on_node(
             run_local_proxy_switch(
                 context.tasks,
                 context.task_id,
+                Some(step_id),
                 context.systemd,
                 command_work_dir,
                 &job.proxy_kind,
@@ -2791,7 +3249,13 @@ async fn switch_binary_proxy_on_node(
                 .ssh
                 .mkdir_all(&target, context.runtime_work_dir.to_path_buf(), &parent)
                 .await?;
-            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            append_intermediate_command_output_for_step(
+                context.tasks,
+                context.task_id,
+                Some(step_id),
+                &output,
+            )
+            .await?;
             let success = output.success;
             outputs.push(output);
             if !success {
@@ -2809,7 +3273,13 @@ async fn switch_binary_proxy_on_node(
                     &config_path,
                 )
                 .await?;
-            append_intermediate_command_output(context.tasks, context.task_id, &output).await?;
+            append_intermediate_command_output_for_step(
+                context.tasks,
+                context.task_id,
+                Some(step_id),
+                &output,
+            )
+            .await?;
             let success = output.success;
             outputs.push(output);
             if !success {
@@ -2822,6 +3292,7 @@ async fn switch_binary_proxy_on_node(
                 run_ssh_proxy_switch(
                     context.tasks,
                     context.task_id,
+                    Some(step_id),
                     context.ssh,
                     &target,
                     context.runtime_work_dir,
@@ -2836,12 +3307,36 @@ async fn switch_binary_proxy_on_node(
             "节点 {} 的类型 {} 不支持反向代理切流",
             node.name, node.node_type
         ))),
+    };
+    match result {
+        Ok(outputs) => {
+            let exit_code = outputs
+                .iter()
+                .rev()
+                .find_map(|output| output.status_code.map(i64::from))
+                .or(Some(0));
+            finish_task_step(
+                context.tasks,
+                context.task_id,
+                step_id,
+                true,
+                exit_code,
+                "反向代理切流完成",
+            )
+            .await?;
+            Ok(outputs)
+        }
+        Err(err) => {
+            fail_task_step_message(context.tasks, context.task_id, step_id, err.message()).await?;
+            Err(err)
+        }
     }
 }
 
 async fn run_local_proxy_switch(
     tasks: &TaskService,
     task_id: i64,
+    step_id: Option<i64>,
     systemd: &SystemdExecutor,
     work_dir: PathBuf,
     proxy_kind: &str,
@@ -2860,7 +3355,7 @@ async fn run_local_proxy_switch(
                 .await?
         }
     };
-    append_intermediate_command_output(tasks, task_id, &validate).await?;
+    append_intermediate_command_output_for_step(tasks, task_id, step_id, &validate).await?;
     let success = validate.success;
     let message = friendly_command_error(&validate.output, "反向代理配置校验失败");
     outputs.push(validate);
@@ -2870,7 +3365,7 @@ async fn run_local_proxy_switch(
 
     let service_name = proxy_systemd_service_name(proxy_kind);
     let reload = systemd.reload_service(work_dir, service_name).await?;
-    append_intermediate_command_output(tasks, task_id, &reload).await?;
+    append_intermediate_command_output_for_step(tasks, task_id, step_id, &reload).await?;
     let success = reload.success;
     let message = friendly_command_error(&reload.output, "反向代理 reload 失败");
     outputs.push(reload);
@@ -2883,6 +3378,7 @@ async fn run_local_proxy_switch(
 async fn run_ssh_proxy_switch(
     tasks: &TaskService,
     task_id: i64,
+    step_id: Option<i64>,
     ssh: &SshExecutor,
     target: &SshTarget,
     runtime_work_dir: &Path,
@@ -2900,7 +3396,7 @@ async fn run_ssh_proxy_switch(
                 .await?
         }
     };
-    append_intermediate_command_output(tasks, task_id, &validate).await?;
+    append_intermediate_command_output_for_step(tasks, task_id, step_id, &validate).await?;
     let success = validate.success;
     let message = friendly_command_error(&validate.output, "远程反向代理配置校验失败");
     outputs.push(validate);
@@ -2912,7 +3408,7 @@ async fn run_ssh_proxy_switch(
     let reload = ssh
         .reload_service(target, runtime_work_dir.to_path_buf(), service_name)
         .await?;
-    append_intermediate_command_output(tasks, task_id, &reload).await?;
+    append_intermediate_command_output_for_step(tasks, task_id, step_id, &reload).await?;
     let success = reload.success;
     let message = friendly_command_error(&reload.output, "远程反向代理 reload 失败");
     outputs.push(reload);
@@ -3242,21 +3738,25 @@ async fn run_app_health_check(
     systemd: &SystemdExecutor,
     app_id: i64,
     task_id: i64,
+    step_id: Option<i64>,
     work_dir: &Path,
 ) -> Result<bool, AppError> {
     let config = load_health_check_config(db, app_id).await?;
-    if let Err(err) = tasks
-        .append_log(
-            task_id,
-            "system",
-            &format!("开始健康检查: {}", config.kind.label()),
-        )
-        .await
+    if let Err(err) = append_task_or_step_log(
+        tasks,
+        task_id,
+        step_id,
+        "system",
+        &format!("开始健康检查: {}", config.kind.label()),
+    )
+    .await
     {
         return Err(AppError::from(err));
     }
     let outcome = run_health_check(&config, compose, systemd, work_dir.to_path_buf()).await?;
-    if let Err(err) = tasks.append_log(task_id, "system", &outcome.message).await {
+    if let Err(err) =
+        append_task_or_step_log(tasks, task_id, step_id, "system", &outcome.message).await
+    {
         return Err(AppError::from(err));
     }
     Ok(outcome.healthy)
@@ -3266,12 +3766,18 @@ async fn run_compose_preflight(
     tasks: &TaskService,
     compose: &ComposeExecutor,
     task_id: i64,
+    step_id: Option<i64>,
     work_dir: std::path::PathBuf,
 ) -> ComposeNodeTaskResult {
     let mut outputs = Vec::new();
-    if let Err(err) = tasks
-        .append_log(task_id, "system", "开始部署前预检: Docker daemon")
-        .await
+    if let Err(err) = append_task_or_step_log(
+        tasks,
+        task_id,
+        step_id,
+        "system",
+        "开始部署前预检: Docker daemon",
+    )
+    .await
     {
         error!(
             task_id,
@@ -3286,10 +3792,24 @@ async fn run_compose_preflight(
     }
     match compose.docker_info(work_dir.clone()).await {
         Ok(output) if output.success => {
+            if let Err(err) =
+                append_intermediate_command_output_for_step(tasks, task_id, step_id, &output).await
+            {
+                error!(
+                    task_id,
+                    error = %err,
+                    "failed to append docker info output"
+                );
+                return ComposeNodeTaskResult {
+                    success: false,
+                    message: "写入 Docker 预检输出失败".to_owned(),
+                    outputs,
+                };
+            }
             outputs.push(output);
-            if let Err(err) = tasks
-                .append_log(task_id, "system", "Docker daemon 连接正常")
-                .await
+            if let Err(err) =
+                append_task_or_step_log(tasks, task_id, step_id, "system", "Docker daemon 连接正常")
+                    .await
             {
                 error!(
                     task_id,
@@ -3304,6 +3824,15 @@ async fn run_compose_preflight(
             }
         }
         Ok(output) => {
+            if let Err(err) =
+                append_intermediate_command_output_for_step(tasks, task_id, step_id, &output).await
+            {
+                error!(
+                    task_id,
+                    error = %err,
+                    "failed to append docker info output"
+                );
+            }
             let message = format!(
                 "Docker daemon 预检失败: {}",
                 friendly_command_error(&output.output, "docker info 返回非 0 状态")
@@ -3328,7 +3857,9 @@ async fn run_compose_preflight(
     match run_local_preflight(&work_dir) {
         Ok(result) => {
             for message in result.messages {
-                if let Err(err) = tasks.append_log(task_id, "system", &message).await {
+                if let Err(err) =
+                    append_task_or_step_log(tasks, task_id, step_id, "system", &message).await
+                {
                     error!(
                         task_id,
                         error = %err,
@@ -3352,9 +3883,14 @@ async fn run_compose_preflight(
         }
     }
 
-    if let Err(err) = tasks
-        .append_log(task_id, "system", "开始部署前预检: docker compose config")
-        .await
+    if let Err(err) = append_task_or_step_log(
+        tasks,
+        task_id,
+        step_id,
+        "system",
+        "开始部署前预检: docker compose config",
+    )
+    .await
     {
         error!(
             task_id,
@@ -3369,10 +3905,24 @@ async fn run_compose_preflight(
     }
     match compose.config(work_dir).await {
         Ok(output) if output.success => {
+            if let Err(err) =
+                append_intermediate_command_output_for_step(tasks, task_id, step_id, &output).await
+            {
+                error!(
+                    task_id,
+                    error = %err,
+                    "failed to append compose config output"
+                );
+                return ComposeNodeTaskResult {
+                    success: false,
+                    message: "写入 Compose 配置输出失败".to_owned(),
+                    outputs,
+                };
+            }
             outputs.push(output);
-            if let Err(err) = tasks
-                .append_log(task_id, "system", "Compose 配置校验通过")
-                .await
+            if let Err(err) =
+                append_task_or_step_log(tasks, task_id, step_id, "system", "Compose 配置校验通过")
+                    .await
             {
                 error!(
                     task_id,
@@ -3392,6 +3942,15 @@ async fn run_compose_preflight(
             }
         }
         Ok(output) => {
+            if let Err(err) =
+                append_intermediate_command_output_for_step(tasks, task_id, step_id, &output).await
+            {
+                error!(
+                    task_id,
+                    error = %err,
+                    "failed to append compose config output"
+                );
+            }
             let message = format!(
                 "Compose 配置预检失败: {}",
                 friendly_command_error(&output.output, "docker compose config 返回非 0 状态")
@@ -3679,30 +4238,55 @@ async fn record_deploy_config_snapshot(
     work_dir: &Path,
     source: &str,
     version: &str,
-) -> Result<(), AppError> {
+    artifact_version: &str,
+    binary: Option<&BinaryConfigItem>,
+) -> Result<RuntimeConfigSnapshotRecord, AppError> {
     let compose_content = fs::read_to_string(work_dir.join("compose.yaml")).unwrap_or_default();
     let env_content = fs::read_to_string(work_dir.join(".env")).unwrap_or_default();
+    let mut tx = db.begin().await?;
+    let snapshot = insert_runtime_config_snapshot(
+        &mut tx,
+        RuntimeConfigSnapshotInput {
+            app_id,
+            snapshot_kind: "deploy",
+            compose_content: &compose_content,
+            env_content: &env_content,
+            artifact_version,
+            metadata: runtime_snapshot_metadata(
+                source,
+                work_dir.to_string_lossy(),
+                Some(version),
+                binary,
+            ),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(snapshot)
+}
+
+async fn bind_deployment_run_snapshot(
+    db: &SqlitePool,
+    app_id: i64,
+    task_id: i64,
+    snapshot: &RuntimeConfigSnapshotRecord,
+    artifact_version: &str,
+) -> Result<(), AppError> {
     sqlx::query(
         r#"
-        INSERT INTO app_config_snapshots(
-            app_id,
-            snapshot_kind,
-            compose_content,
-            env_content,
-            metadata
-        )
-        VALUES (?1, 'deploy', ?2, ?3, ?4)
+        UPDATE deployment_runs
+        SET config_snapshot_id = ?3,
+            config_revision_no = ?4,
+            artifact_version = ?5
+        WHERE app_id = ?1
+          AND task_id = ?2
         "#,
     )
     .bind(app_id)
-    .bind(compose_content)
-    .bind(env_content)
-    .bind(format!(
-        "{{\"source\":\"{}\",\"version\":\"{}\",\"runtime\":\"file\",\"runtime_root\":\"{}\"}}",
-        json_escape(source),
-        json_escape(version),
-        json_escape(&work_dir.to_string_lossy())
-    ))
+    .bind(task_id)
+    .bind(snapshot.id)
+    .bind(snapshot.revision_no)
+    .bind(artifact_version)
     .execute(db)
     .await?;
     Ok(())
@@ -3774,6 +4358,7 @@ async fn fetch_app_detail_by_id(db: &SqlitePool, app_id: i64) -> Result<AppDetai
             a.app_key,
             a.name,
             a.description,
+            a.environment,
             a.app_type,
             a.deploy_mode,
             a.deploy_strategy,
@@ -3863,17 +4448,6 @@ async fn target_node_metadata_for_app(
             .collect()
     })
     .map_err(AppError::from)
-}
-
-async fn update_app_status_best_effort(db: &SqlitePool, app_id: i64, status: &str) {
-    if let Err(err) = update_app_status_in_db(db, app_id, status).await {
-        warn!(
-            app_id,
-            status,
-            error = %err,
-            "failed to update app status from compose task"
-        );
-    }
 }
 
 struct RuntimeStatesUpdate<'a> {
@@ -4052,6 +4626,219 @@ async fn update_runtime_state_for_node_in_db(
     Ok(())
 }
 
+async fn insert_runtime_config_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    input: RuntimeConfigSnapshotInput<'_>,
+) -> Result<RuntimeConfigSnapshotRecord, sqlx::Error> {
+    let revision_no = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COALESCE(MAX(revision_no), 0) + 1
+        FROM app_config_snapshots
+        WHERE app_id = ?1
+        "#,
+    )
+    .bind(input.app_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let config_hash = runtime_config_hash(
+        input.compose_content,
+        input.env_content,
+        input.artifact_version,
+        &input.metadata,
+    );
+    let id = sqlx::query_scalar::<_, i64>(
+        r#"
+        INSERT INTO app_config_snapshots(
+            app_id,
+            revision_no,
+            snapshot_kind,
+            compose_content,
+            env_content,
+            artifact_version,
+            config_hash,
+            metadata
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        RETURNING id
+        "#,
+    )
+    .bind(input.app_id)
+    .bind(revision_no)
+    .bind(input.snapshot_kind)
+    .bind(input.compose_content)
+    .bind(input.env_content)
+    .bind(input.artifact_version)
+    .bind(config_hash)
+    .bind(input.metadata)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    Ok(RuntimeConfigSnapshotRecord { id, revision_no })
+}
+
+fn runtime_config_hash(
+    compose_content: &str,
+    env_content: &str,
+    artifact_version: &str,
+    metadata: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(compose_content.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(env_content.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(artifact_version.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(metadata.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn runtime_snapshot_metadata(
+    source: &str,
+    runtime_root: impl AsRef<str>,
+    version: Option<&str>,
+    binary: Option<&BinaryConfigItem>,
+) -> String {
+    let mut metadata = json!({
+        "source": source,
+        "runtime": "file",
+        "runtime_root": runtime_root.as_ref(),
+    });
+    if let Some(version) = version {
+        metadata["version"] = json!(version);
+    }
+    if let Some(binary) = binary {
+        metadata["binary"] = json!({
+            "service_name": binary.service_name.as_str(),
+            "artifact_version": binary.artifact_version.as_str(),
+            "artifact_path": binary.artifact_path.as_str(),
+            "exec_args": binary.exec_args.as_str(),
+            "working_dir": binary.working_dir.as_str(),
+            "service_user": binary.service_user.as_str(),
+            "unit_name": binary.unit_name.as_str(),
+            "release_strategy": binary.release_strategy.as_str(),
+            "active_slot": binary.active_slot.as_str(),
+            "base_port": binary.base_port,
+            "standby_port": binary.standby_port,
+            "proxy_enabled": binary.proxy_enabled,
+            "proxy_kind": binary.proxy_kind.as_str(),
+            "proxy_domain": binary.proxy_domain.as_str(),
+            "proxy_config_path": binary.proxy_config_path.as_str(),
+        });
+    }
+    metadata.to_string()
+}
+
+fn snapshot_artifact_version(snapshot: &AppConfigSnapshotItem) -> String {
+    if !snapshot.artifact_version.trim().is_empty() {
+        return snapshot.artifact_version.trim().to_owned();
+    }
+    serde_json::from_str::<JsonValue>(&snapshot.metadata)
+        .ok()
+        .and_then(|metadata| {
+            json_string(metadata.get("binary"), "artifact_version")
+                .or_else(|| json_string(Some(&metadata), "version"))
+        })
+        .unwrap_or_default()
+}
+
+fn binary_config_from_snapshot(
+    app: &AppDetailItem,
+    snapshot: &AppConfigSnapshotItem,
+    current: &BinaryConfigItem,
+    artifact: Option<&BinaryArtifactItem>,
+) -> BinaryConfigItem {
+    let metadata = serde_json::from_str::<JsonValue>(&snapshot.metadata).ok();
+    let binary = metadata
+        .as_ref()
+        .and_then(|value| value.get("binary"))
+        .filter(|value| value.is_object());
+    let mut config = current.clone();
+
+    config.service_name =
+        json_string(binary, "service_name").unwrap_or_else(|| current.service_name.clone());
+    config.exec_args =
+        json_string(binary, "exec_args").unwrap_or_else(|| current.exec_args.clone());
+    config.working_dir =
+        json_string(binary, "working_dir").unwrap_or_else(|| current.working_dir.clone());
+    config.service_user =
+        json_string(binary, "service_user").unwrap_or_else(|| current.service_user.clone());
+    config.unit_name =
+        json_string(binary, "unit_name").unwrap_or_else(|| current.unit_name.clone());
+    config.release_strategy =
+        json_string(binary, "release_strategy").unwrap_or_else(|| current.release_strategy.clone());
+    config.active_slot =
+        json_string(binary, "active_slot").unwrap_or_else(|| current.active_slot.clone());
+    config.base_port = json_i64(binary, "base_port").unwrap_or(current.base_port);
+    config.standby_port = json_i64(binary, "standby_port").unwrap_or(current.standby_port);
+    config.proxy_enabled = json_i64(binary, "proxy_enabled")
+        .or_else(|| json_bool(binary, "proxy_enabled").map(i64::from))
+        .unwrap_or(current.proxy_enabled);
+    config.proxy_kind =
+        json_string(binary, "proxy_kind").unwrap_or_else(|| current.proxy_kind.clone());
+    config.proxy_domain =
+        json_string(binary, "proxy_domain").unwrap_or_else(|| current.proxy_domain.clone());
+    config.proxy_config_path = json_string(binary, "proxy_config_path")
+        .unwrap_or_else(|| current.proxy_config_path.clone());
+    config.env_content = normalize_env_content(&snapshot.env_content);
+
+    if let Some(artifact) = artifact {
+        config.artifact_version = artifact.version.clone();
+        config.artifact_path = artifact.artifact_path.clone();
+    } else if let Some(version) = json_string(binary, "artifact_version")
+        .or_else(|| json_string(metadata.as_ref(), "version"))
+        .filter(|value| !value.trim().is_empty())
+    {
+        config.artifact_version = version;
+        if let Some(path) =
+            json_string(binary, "artifact_path").filter(|value| !value.trim().is_empty())
+        {
+            config.artifact_path = path;
+        }
+    }
+
+    if config.service_name.trim().is_empty() {
+        config.service_name = app.app_key.clone();
+    }
+    if config.working_dir.trim().is_empty() {
+        config.working_dir = app.work_dir.clone();
+    }
+    if config.service_user.trim().is_empty() {
+        config.service_user = "deploy".to_owned();
+    }
+    if config.unit_name.trim().is_empty() {
+        config.unit_name = format!("easy-deploy-{}.service", app.app_key);
+    }
+    if config.release_strategy.trim().is_empty() {
+        config.release_strategy = "restart".to_owned();
+    }
+    if config.active_slot.trim().is_empty() {
+        config.active_slot = "blue".to_owned();
+    }
+    config
+}
+
+fn json_string(value: Option<&JsonValue>, key: &str) -> Option<String> {
+    value
+        .and_then(|value| value.get(key))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn json_i64(value: Option<&JsonValue>, key: &str) -> Option<i64> {
+    value
+        .and_then(|value| value.get(key))
+        .and_then(JsonValue::as_i64)
+}
+
+fn json_bool(value: Option<&JsonValue>, key: &str) -> Option<bool> {
+    value
+        .and_then(|value| value.get(key))
+        .and_then(JsonValue::as_bool)
+}
+
 async fn upsert_binary_config(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     app_id: i64,
@@ -4156,11 +4943,20 @@ async fn prune_uploaded_binary_releases(
 ) -> Result<Vec<String>, AppError> {
     let rows = sqlx::query_as::<_, BinaryArtifactItem>(
         r#"
-        SELECT id, version, artifact_path, artifact_kind, status, metadata, created_at
+        SELECT
+            id,
+            version,
+            version_code,
+            artifact_path,
+            artifact_kind,
+            status,
+            metadata,
+            published_at,
+            created_at
         FROM binary_artifacts
         WHERE app_id = ?1
           AND status != 'disabled'
-        ORDER BY created_at DESC, id DESC
+        ORDER BY version_code DESC, published_at DESC, id DESC
         "#,
     )
     .bind(app_id)
@@ -4274,13 +5070,13 @@ fn build_deploy_diff(
     if app.app_type == "binary" {
         let baseline_binary = binary_config_from_metadata(&baseline.metadata);
         rows.push(diff_row(
-            "制品版本",
+            "发布版本",
             &binary_config.artifact_version,
             &baseline_binary.artifact_version,
             summarize_inline_value,
         ));
         rows.push(diff_row(
-            "制品路径",
+            "部署文件路径",
             &binary_config.artifact_path,
             &baseline_binary.artifact_path,
             summarize_inline_value,
@@ -4440,11 +5236,14 @@ pub struct AppListItem {
     pub app_key: String,
     pub name: String,
     pub description: String,
+    pub environment: String,
     pub app_type: String,
     pub deploy_mode: String,
     pub deploy_strategy: String,
     pub work_dir: String,
     pub status: String,
+    pub runtime_status: String,
+    pub runtime_summary: String,
     pub target_names: Option<String>,
     pub target_count: i64,
     pub created_at: String,
@@ -4457,6 +5256,7 @@ pub struct AppDetailItem {
     pub app_key: String,
     pub name: String,
     pub description: String,
+    pub environment: String,
     pub app_type: String,
     pub deploy_mode: String,
     pub deploy_strategy: String,
@@ -4503,6 +5303,9 @@ pub struct AppDeploymentRunItem {
     pub deploy_action: String,
     pub status: String,
     pub message: String,
+    pub config_snapshot_id: Option<i64>,
+    pub config_revision_no: i64,
+    pub artifact_version: String,
     pub started_at: String,
     pub finished_at: Option<String>,
 }
@@ -4510,11 +5313,30 @@ pub struct AppDeploymentRunItem {
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct AppConfigSnapshotItem {
     pub id: i64,
+    pub revision_no: i64,
     pub snapshot_kind: String,
     pub compose_content: String,
     pub env_content: String,
+    pub artifact_version: String,
+    pub config_hash: String,
     pub metadata: String,
     pub created_at: String,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeConfigSnapshotInput<'a> {
+    app_id: i64,
+    snapshot_kind: &'a str,
+    compose_content: &'a str,
+    env_content: &'a str,
+    artifact_version: &'a str,
+    metadata: String,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+struct RuntimeConfigSnapshotRecord {
+    id: i64,
+    revision_no: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -4607,10 +5429,12 @@ pub struct BinaryConfigItem {
 pub struct BinaryArtifactItem {
     pub id: i64,
     pub version: String,
+    pub version_code: i64,
     pub artifact_path: String,
     pub artifact_kind: String,
     pub status: String,
     pub metadata: String,
+    pub published_at: String,
     pub created_at: String,
 }
 
@@ -4620,7 +5444,7 @@ impl BinaryArtifactItem {
     }
 }
 
-pub struct BinaryRollbackResult {
+pub struct BinaryReleaseDeployResult {
     pub task_id: i64,
     pub version: String,
 }
@@ -4632,10 +5456,12 @@ pub struct ArtifactListItem {
     pub app_name: String,
     pub app_key: String,
     pub version: String,
+    pub version_code: i64,
     pub artifact_path: String,
     pub artifact_kind: String,
     pub status: String,
     pub metadata: String,
+    pub published_at: String,
     pub created_at: String,
 }
 
@@ -4703,6 +5529,7 @@ pub struct CreateAppInput {
     pub app_key: String,
     pub name: String,
     pub description: String,
+    pub environment: String,
     pub app_type: String,
     pub deploy_strategy: String,
     pub work_dir: String,
@@ -4750,6 +5577,7 @@ pub struct UpdateAppMetadataInput {
     pub app_id: i64,
     pub name: String,
     pub description: String,
+    pub environment: String,
     pub work_dir: String,
     pub deploy_strategy: String,
     pub target_node_ids: Vec<i64>,
@@ -4759,9 +5587,75 @@ pub struct UpdateAppMetadataInput {
 pub struct UploadBinaryArtifactInput {
     pub app_id: i64,
     pub artifact_version: String,
+    pub version_code: Option<i64>,
+    pub published_at: String,
     pub file_name: String,
     pub bytes: Vec<u8>,
     pub entry_file: String,
+    pub source: String,
+}
+
+struct RegisterBinaryArtifactInput {
+    app: AppDetailItem,
+    artifact_version: String,
+    version_code: Option<i64>,
+    published_at: String,
+    file_name: String,
+    bytes: Vec<u8>,
+    entry_file: String,
+    source: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct UploadBinaryArtifactResult {
+    pub app_id: i64,
+    pub app_key: String,
+    pub artifact_version: String,
+    pub version_code: i64,
+    pub artifact_path: String,
+    pub artifact_kind: String,
+    pub published_at: String,
+    pub config_snapshot_id: i64,
+    pub config_revision_no: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ParsedBinaryPackageName {
+    pub service_key: String,
+    pub release_version: String,
+    pub version_code: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BinaryPackageNameError {
+    InvalidPackageVersionName,
+    ServiceKeyMismatch { expected: String, actual: String },
+    PackageVersionConflict { expected: String, actual: String },
+}
+
+impl BinaryPackageNameError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidPackageVersionName => "INVALID_PACKAGE_VERSION_NAME",
+            Self::ServiceKeyMismatch { .. } => "PACKAGE_SERVICE_KEY_MISMATCH",
+            Self::PackageVersionConflict { .. } => "PACKAGE_VERSION_CONFLICT",
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::InvalidPackageVersionName => format!(
+                "版本包文件名不符合规范，请使用 {}，例如 {}",
+                BINARY_PACKAGE_PATTERN, BINARY_PACKAGE_EXAMPLE
+            ),
+            Self::ServiceKeyMismatch { expected, actual } => {
+                format!("版本包服务标识不匹配，接口路径为 {expected}，文件名中为 {actual}")
+            }
+            Self::PackageVersionConflict { expected, actual } => {
+                format!("版本包发布版本冲突，接口字段为 {expected}，文件名中为 {actual}")
+            }
+        }
+    }
 }
 
 struct NormalizeBinaryConfigInput<'a> {
@@ -4821,16 +5715,56 @@ impl AppService {
     pub async fn list_apps(&self) -> Result<Vec<AppListItem>, AppError> {
         sqlx::query_as::<_, AppListItem>(
             r#"
+            WITH runtime_counts AS (
+                SELECT
+                    app_id,
+                    COUNT(*) AS node_count,
+                    SUM(CASE WHEN runtime_status = 'healthy' THEN 1 ELSE 0 END) AS healthy_count,
+                    SUM(CASE WHEN runtime_status = 'unhealthy' THEN 1 ELSE 0 END) AS unhealthy_count,
+                    SUM(CASE WHEN runtime_status = 'deploying' THEN 1 ELSE 0 END) AS deploying_count,
+                    SUM(CASE WHEN runtime_status = 'stopped' THEN 1 ELSE 0 END) AS stopped_count
+                FROM app_runtime_states
+                GROUP BY app_id
+            )
             SELECT
                 a.id,
                 a.app_key,
                 a.name,
                 a.description,
+                a.environment,
                 a.app_type,
                 a.deploy_mode,
                 a.deploy_strategy,
                 a.work_dir,
                 a.status,
+                CASE
+                    WHEN a.status = 'disabled' THEN 'disabled'
+                    WHEN COALESCE(rc.deploying_count, 0) > 0 THEN 'deploying'
+                    WHEN COALESCE(rc.unhealthy_count, 0) > 0 THEN 'unhealthy'
+                    WHEN COALESCE(rc.healthy_count, 0) > 0
+                        AND COALESCE(rc.healthy_count, 0) = COALESCE(rc.node_count, 0)
+                        THEN 'healthy'
+                    WHEN COALESCE(rc.stopped_count, 0) > 0
+                        AND COALESCE(rc.stopped_count, 0) = COALESCE(rc.node_count, 0)
+                        THEN 'stopped'
+                    ELSE 'unknown'
+                END AS runtime_status,
+                CASE
+                    WHEN a.status = 'disabled' THEN '应用已停用'
+                    WHEN COALESCE(rc.node_count, 0) = 0 THEN '暂无节点运行记录'
+                    ELSE
+                        COALESCE(rc.healthy_count, 0) || ' 健康，'
+                        || COALESCE(rc.unhealthy_count, 0) || ' 异常，'
+                        || COALESCE(rc.deploying_count, 0) || ' 部署中，'
+                        || COALESCE(rc.stopped_count, 0) || ' 已停止，'
+                        || (
+                            COALESCE(rc.node_count, 0)
+                            - COALESCE(rc.healthy_count, 0)
+                            - COALESCE(rc.unhealthy_count, 0)
+                            - COALESCE(rc.deploying_count, 0)
+                            - COALESCE(rc.stopped_count, 0)
+                        ) || ' 未知'
+                END AS runtime_summary,
                 group_concat(n.name, '、') AS target_names,
                 COUNT(n.id) AS target_count,
                 a.created_at,
@@ -4838,6 +5772,7 @@ impl AppService {
             FROM apps a
             LEFT JOIN app_targets t ON t.app_id = a.id
             LEFT JOIN nodes n ON n.id = t.node_id
+            LEFT JOIN runtime_counts rc ON rc.app_id = a.id
             GROUP BY a.id
             ORDER BY a.id DESC
             "#,
@@ -4924,6 +5859,31 @@ impl AppService {
         })
     }
 
+    pub async fn app_id_by_key(&self, app_key: &str) -> Result<i64, AppError> {
+        let app_key = normalize_key(app_key)?;
+        sqlx::query_scalar::<_, i64>("SELECT id FROM apps WHERE app_key = ?1")
+            .bind(app_key)
+            .fetch_optional(&self.db)
+            .await?
+            .ok_or_else(|| AppError::InvalidInput("服务标识不存在".to_owned()))
+    }
+
+    pub async fn node_ids_by_keys(&self, node_keys: &[String]) -> Result<Vec<i64>, AppError> {
+        let mut node_ids = Vec::new();
+        for node_key in dedupe_strings(node_keys) {
+            let node_key = normalize_key(&node_key)?;
+            let node_id = sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM nodes WHERE node_key = ?1 AND status != 'disabled'",
+            )
+            .bind(&node_key)
+            .fetch_optional(&self.db)
+            .await?
+            .ok_or_else(|| AppError::InvalidInput(format!("目标节点 {node_key} 不存在或已禁用")))?;
+            node_ids.push(node_id);
+        }
+        Ok(node_ids)
+    }
+
     async fn list_app_target_summaries(
         &self,
         app_id: i64,
@@ -4971,6 +5931,9 @@ impl AppService {
                 r.deploy_action,
                 r.status,
                 r.message,
+                r.config_snapshot_id,
+                r.config_revision_no,
+                r.artifact_version,
                 r.started_at,
                 r.finished_at
             FROM deployment_runs r
@@ -4994,9 +5957,12 @@ impl AppService {
             r#"
             SELECT
                 id,
+                revision_no,
                 snapshot_kind,
                 compose_content,
                 env_content,
+                artifact_version,
+                config_hash,
                 metadata,
                 created_at
             FROM app_config_snapshots
@@ -5019,14 +5985,36 @@ impl AppService {
             r#"
             SELECT
                 id,
+                revision_no,
                 snapshot_kind,
                 compose_content,
                 env_content,
+                artifact_version,
+                config_hash,
                 metadata,
                 created_at
             FROM app_config_snapshots
             WHERE app_id = ?1
               AND snapshot_kind = 'deploy'
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(app_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(AppError::from)
+    }
+
+    async fn latest_config_snapshot(
+        &self,
+        app_id: i64,
+    ) -> Result<Option<RuntimeConfigSnapshotRecord>, AppError> {
+        sqlx::query_as::<_, RuntimeConfigSnapshotRecord>(
+            r#"
+            SELECT id, revision_no
+            FROM app_config_snapshots
+            WHERE app_id = ?1
             ORDER BY id DESC
             LIMIT 1
             "#,
@@ -5154,19 +6142,50 @@ impl AppService {
             SELECT
                 id,
                 version,
+                version_code,
                 artifact_path,
                 artifact_kind,
                 status,
                 metadata,
+                published_at,
                 created_at
             FROM binary_artifacts
             WHERE app_id = ?1
-            ORDER BY id DESC
+            ORDER BY version_code DESC, published_at DESC, id DESC
             LIMIT 20
             "#,
         )
         .bind(app_id)
         .fetch_all(&self.db)
+        .await
+        .map_err(AppError::from)
+    }
+
+    async fn binary_artifact_by_version(
+        &self,
+        app_id: i64,
+        version: &str,
+    ) -> Result<Option<BinaryArtifactItem>, AppError> {
+        sqlx::query_as::<_, BinaryArtifactItem>(
+            r#"
+            SELECT
+                id,
+                version,
+                version_code,
+                artifact_path,
+                artifact_kind,
+                status,
+                metadata,
+                published_at,
+                created_at
+            FROM binary_artifacts
+            WHERE app_id = ?1
+              AND version = ?2
+            "#,
+        )
+        .bind(app_id)
+        .bind(version)
+        .fetch_optional(&self.db)
         .await
         .map_err(AppError::from)
     }
@@ -5180,14 +6199,16 @@ impl AppService {
                 a.name AS app_name,
                 a.app_key,
                 ba.version,
+                ba.version_code,
                 ba.artifact_path,
                 ba.artifact_kind,
                 ba.status,
                 ba.metadata,
+                ba.published_at,
                 ba.created_at
             FROM binary_artifacts ba
             JOIN apps a ON a.id = ba.app_id
-            ORDER BY ba.id DESC
+            ORDER BY ba.version_code DESC, ba.published_at DESC, ba.id DESC
             LIMIT 100
             "#,
         )
@@ -5283,6 +6304,7 @@ impl AppService {
         let app_key = normalize_key(&input.app_key)?;
         let name = required_text(&input.name, "请输入应用名称")?;
         let app_type = normalize_app_type(&input.app_type)?;
+        let environment = normalize_app_environment(&input.environment)?;
         let deploy_mode = app_type.clone();
         let deploy_strategy = normalize_deploy_strategy(&input.deploy_strategy)?;
         let work_dir = required_text(&input.work_dir, "请输入部署目录")?;
@@ -5337,19 +6359,21 @@ impl AppService {
                 app_key,
                 name,
                 description,
+                environment,
                 app_type,
                 deploy_mode,
                 deploy_strategy,
                 work_dir,
                 status
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'draft')
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready')
             RETURNING id
             "#,
         )
         .bind(&app_key)
         .bind(&name)
         .bind(&description)
+        .bind(&environment)
         .bind(&app_type)
         .bind(&deploy_mode)
         .bind(&deploy_strategy)
@@ -5431,64 +6455,57 @@ impl AppService {
             .bind(&config.env_content)
             .execute(&mut *tx)
             .await?;
-            sqlx::query(
-                r#"
-                INSERT INTO binary_artifacts(
-                    app_id,
-                    version,
-                    artifact_path,
-                    artifact_kind,
-                    status,
-                    metadata
-                )
-                VALUES (?1, ?2, ?3, 'binary', 'registered', ?4)
-                ON CONFLICT(app_id, version) DO UPDATE SET
-                    artifact_path = excluded.artifact_path,
-                    status = 'registered',
-                    metadata = excluded.metadata
-                "#,
-            )
-            .bind(app_id)
-            .bind(&config.artifact_version)
-            .bind(&config.artifact_path)
-            .bind(format!(
-                "{{\"source\":\"manual\",\"unit_name\":\"{}\"}}",
-                json_escape(&config.unit_name)
-            ))
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        sqlx::query(
-            r#"
-            INSERT INTO app_config_snapshots(
+            if !config.artifact_version.trim().is_empty() {
+                sqlx::query(
+                    r#"
+            INSERT INTO binary_artifacts(
                 app_id,
-                snapshot_kind,
-                compose_content,
-                env_content,
+                version,
+                version_code,
+                artifact_path,
+                artifact_kind,
+                status,
+                published_at,
                 metadata
             )
-            VALUES (?1, 'initial', ?2, ?3, ?4)
-            "#,
-        )
-        .bind(app_id)
-        .bind(&compose_content)
-        .bind(&env_content)
-        .bind("{\"source\":\"manual\",\"runtime\":\"file\"}")
-        .execute(&mut *tx)
-        .await?;
+            VALUES (?1, ?2, ?3, ?4, 'binary', 'registered', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?5)
+            ON CONFLICT(app_id, version) DO UPDATE SET
+                version_code = excluded.version_code,
+                artifact_path = excluded.artifact_path,
+                status = 'registered',
+                published_at = excluded.published_at,
+                metadata = excluded.metadata
+        "#,
+    )
+    .bind(app_id)
+    .bind(&config.artifact_version)
+    .bind(version_code_from_release(&config.artifact_version).unwrap_or_default())
+    .bind(&config.artifact_path)
+    .bind(format!(
+        "{{\"source\":\"manual\",\"unit_name\":\"{}\"}}",
+                    json_escape(&config.unit_name)
+                ))
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
 
+        let initial_artifact_version = binary_config
+            .as_ref()
+            .map(|config| config.artifact_version.as_str())
+            .unwrap_or("");
         let runtime_result = self
             .runtime_fs
             .save_app_config(AppRuntimeConfig {
                 app_key: app_key.clone(),
                 app_id,
-                name,
-                description,
-                app_type,
-                deploy_mode,
-                deploy_strategy,
-                deploy_work_dir: work_dir,
+                name: name.clone(),
+                description: description.clone(),
+                environment: environment.clone(),
+                app_type: app_type.clone(),
+                deploy_mode: deploy_mode.clone(),
+                deploy_strategy: deploy_strategy.clone(),
+                deploy_work_dir: work_dir.clone(),
                 target_nodes: target_nodes
                     .into_iter()
                     .map(|node| TargetNodeMetadata {
@@ -5496,12 +6513,15 @@ impl AppService {
                         name: node.name,
                     })
                     .collect(),
-                compose_content,
-                env_content,
+                compose_content: compose_content.clone(),
+                env_content: env_content.clone(),
                 binary: binary_config.as_ref().map(to_binary_runtime_metadata),
             })
             .await?;
-        if let Some(config) = &binary_config {
+        if let Some(config) = binary_config
+            .as_ref()
+            .filter(|config| !config.artifact_version.trim().is_empty())
+        {
             self.runtime_fs
                 .save_binary_runtime_files(to_binary_runtime_config(
                     app_id,
@@ -5511,19 +6531,40 @@ impl AppService {
                 ))
                 .await?;
         }
+        let initial_metadata = runtime_snapshot_metadata(
+            "manual",
+            runtime_result.root_dir.to_string_lossy(),
+            None,
+            binary_config.as_ref(),
+        );
+        let initial_snapshot = insert_runtime_config_snapshot(
+            &mut tx,
+            RuntimeConfigSnapshotInput {
+                app_id,
+                snapshot_kind: "initial",
+                compose_content: &compose_content,
+                env_content: &env_content,
+                artifact_version: initial_artifact_version,
+                metadata: initial_metadata.clone(),
+            },
+        )
+        .await?;
 
         sqlx::query(
             r#"
             UPDATE app_config_snapshots
-            SET metadata = ?2
-            WHERE app_id = ?1
-              AND snapshot_kind = 'initial'
+            SET metadata = ?2,
+                config_hash = ?3
+            WHERE id = ?1
             "#,
         )
-        .bind(app_id)
-        .bind(format!(
-            "{{\"source\":\"manual\",\"runtime\":\"file\",\"runtime_root\":\"{}\"}}",
-            json_escape(&runtime_result.root_dir.to_string_lossy())
+        .bind(initial_snapshot.id)
+        .bind(&initial_metadata)
+        .bind(runtime_config_hash(
+            &compose_content,
+            &env_content,
+            initial_artifact_version,
+            &initial_metadata,
         ))
         .execute(&mut *tx)
         .await?;
@@ -5535,7 +6576,7 @@ impl AppService {
     pub async fn update_app_config(&self, input: UpdateAppConfigInput) -> Result<(), AppError> {
         let app = self.fetch_app_detail(input.app_id).await?;
         ensure_app_enabled(&app)?;
-        ensure_app_idle(&app)?;
+        self.ensure_no_active_deploy_task(app.id).await?;
         let compose_content = if app.app_type == "compose" {
             normalize_compose_content(&input.compose_content, &app.app_key)?
         } else {
@@ -5627,26 +6668,26 @@ impl AppService {
         if let Some(config) = &binary_config {
             upsert_binary_config(&mut tx, app.id, config).await?;
         }
-        sqlx::query(
-            r#"
-            INSERT INTO app_config_snapshots(
-                app_id,
-                snapshot_kind,
-                compose_content,
-                env_content,
-                metadata
-            )
-            VALUES (?1, 'manual', ?2, ?3, ?4)
-            "#,
+        let artifact_version = binary_config
+            .as_ref()
+            .map(|config| config.artifact_version.as_str())
+            .unwrap_or("");
+        insert_runtime_config_snapshot(
+            &mut tx,
+            RuntimeConfigSnapshotInput {
+                app_id: app.id,
+                snapshot_kind: "manual",
+                compose_content: &compose_content,
+                env_content: &env_content,
+                artifact_version,
+                metadata: runtime_snapshot_metadata(
+                    "manual",
+                    runtime_root.to_string_lossy(),
+                    None,
+                    binary_config.as_ref(),
+                ),
+            },
         )
-        .bind(app.id)
-        .bind(&compose_content)
-        .bind(&env_content)
-        .bind(format!(
-            "{{\"source\":\"manual\",\"runtime\":\"file\",\"runtime_root\":\"{}\"}}",
-            json_escape(&runtime_root.to_string_lossy())
-        ))
-        .execute(&mut *tx)
         .await?;
         sqlx::query(
             r#"
@@ -5665,9 +6706,10 @@ impl AppService {
     pub async fn update_app_metadata(&self, input: UpdateAppMetadataInput) -> Result<(), AppError> {
         let mut app = self.fetch_app_detail(input.app_id).await?;
         ensure_app_enabled(&app)?;
-        ensure_app_idle(&app)?;
+        self.ensure_no_active_deploy_task(app.id).await?;
         let name = required_text(&input.name, "请输入应用名称")?;
         let description = input.description.trim().to_owned();
+        let environment = normalize_app_environment(&input.environment)?;
         let work_dir = required_text(&input.work_dir, "请输入部署目录")?;
         let deploy_strategy = normalize_deploy_strategy(&input.deploy_strategy)?;
         if input.target_node_ids.is_empty() {
@@ -5689,6 +6731,7 @@ impl AppService {
         let mut binary_config = self.load_binary_config(&app).await?;
         app.name = name.clone();
         app.description = description.clone();
+        app.environment = environment.clone();
         app.work_dir = work_dir.clone();
         app.deploy_strategy = deploy_strategy.clone();
         let binary_config_for_metadata = if app.app_type == "binary" {
@@ -5740,8 +6783,9 @@ impl AppService {
             UPDATE apps
             SET name = ?2,
                 description = ?3,
-                work_dir = ?4,
-                deploy_strategy = ?5,
+                environment = ?4,
+                work_dir = ?5,
+                deploy_strategy = ?6,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE id = ?1
             "#,
@@ -5749,6 +6793,7 @@ impl AppService {
         .bind(app.id)
         .bind(&app.name)
         .bind(&app.description)
+        .bind(&app.environment)
         .bind(&app.work_dir)
         .bind(&app.deploy_strategy)
         .execute(&mut *tx)
@@ -5801,13 +6846,68 @@ impl AppService {
     pub async fn upload_binary_artifact(
         &self,
         input: UploadBinaryArtifactInput,
-    ) -> Result<(), AppError> {
+    ) -> Result<UploadBinaryArtifactResult, AppError> {
         let app = self.fetch_app_detail(input.app_id).await?;
         ensure_app_enabled(&app)?;
-        ensure_app_idle(&app)?;
+        self.ensure_no_active_deploy_task(app.id).await?;
         self.ensure_binary_app(&app)?;
+        self.register_binary_artifact(RegisterBinaryArtifactInput {
+            app,
+            artifact_version: input.artifact_version,
+            version_code: input.version_code,
+            published_at: input.published_at,
+            file_name: input.file_name,
+            bytes: input.bytes,
+            entry_file: input.entry_file,
+            source: input.source,
+        })
+        .await
+    }
+
+    pub async fn register_binary_artifact_from_task(
+        &self,
+        input: UploadBinaryArtifactInput,
+    ) -> Result<UploadBinaryArtifactResult, AppError> {
+        let app = self.fetch_app_detail(input.app_id).await?;
+        ensure_app_enabled(&app)?;
+        self.ensure_binary_app(&app)?;
+        self.register_binary_artifact(RegisterBinaryArtifactInput {
+            app,
+            artifact_version: input.artifact_version,
+            version_code: input.version_code,
+            published_at: input.published_at,
+            file_name: input.file_name,
+            bytes: input.bytes,
+            entry_file: input.entry_file,
+            source: input.source,
+        })
+        .await
+    }
+
+    async fn register_binary_artifact(
+        &self,
+        input: RegisterBinaryArtifactInput,
+    ) -> Result<UploadBinaryArtifactResult, AppError> {
+        let app = input.app;
         let artifact_version = normalize_release_id(&input.artifact_version)?;
-        let file_name = required_text(&input.file_name, "请选择二进制制品文件")?;
+        let version_code = match input.version_code {
+            Some(version_code) if version_code > 0 => version_code,
+            Some(_) => {
+                return Err(AppError::InvalidInput(
+                    "versionCode 必须是大于 0 的整数".to_owned(),
+                ));
+            }
+            None => version_code_from_release(&artifact_version).ok_or_else(|| {
+                AppError::InvalidInput(
+                    "发布版本必须是 vX.Y.Z 格式，或显式传入 versionCode".to_owned(),
+                )
+            })?,
+        };
+        let published_at = match normalize_published_at(&input.published_at)? {
+            Some(value) => value,
+            None => sqlite_now(&self.db).await?,
+        };
+        let file_name = required_text(&input.file_name, "请选择二进制版本包文件")?;
         if input.bytes.is_empty() {
             return Err(AppError::InvalidInput("上传文件不能为空".to_owned()));
         }
@@ -5886,25 +6986,31 @@ impl AppService {
             INSERT INTO binary_artifacts(
                 app_id,
                 version,
+                version_code,
                 artifact_path,
                 artifact_kind,
                 status,
+                published_at,
                 metadata
             )
-            VALUES (?1, ?2, ?3, ?4, 'active', ?5)
+            VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7)
             ON CONFLICT(app_id, version) DO UPDATE SET
+                version_code = excluded.version_code,
                 artifact_path = excluded.artifact_path,
                 artifact_kind = excluded.artifact_kind,
                 status = 'active',
+                published_at = excluded.published_at,
                 metadata = excluded.metadata
             "#,
         )
         .bind(app.id)
         .bind(&artifact_version)
+        .bind(version_code)
         .bind(&config.artifact_path)
         .bind(artifact_kind)
+        .bind(&published_at)
         .bind(render_artifact_metadata(ArtifactMetadataInput {
-            source: "upload",
+            source: upload_source(&input.source),
             unit_name: &config.unit_name,
             uploaded_path: &uploaded_path.to_string_lossy(),
             original_file_name: &file_name,
@@ -5935,27 +7041,22 @@ impl AppService {
             platform_config.uploaded_binary_releases_to_keep,
         )
         .await?;
-        sqlx::query(
-            r#"
-            INSERT INTO app_config_snapshots(
-                app_id,
-                snapshot_kind,
-                compose_content,
-                env_content,
-                metadata
-            )
-            VALUES (?1, 'manual', ?2, ?3, ?4)
-            "#,
+        let config_snapshot = insert_runtime_config_snapshot(
+            &mut tx,
+            RuntimeConfigSnapshotInput {
+                app_id: app.id,
+                snapshot_kind: "manual",
+                compose_content: &runtime_files.compose_content,
+                env_content: &config.env_content,
+                artifact_version: &artifact_version,
+                metadata: runtime_snapshot_metadata(
+                    "binary_upload",
+                    runtime_root.to_string_lossy(),
+                    Some(&artifact_version),
+                    Some(&config),
+                ),
+            },
         )
-        .bind(app.id)
-        .bind(runtime_files.compose_content)
-        .bind(&config.env_content)
-        .bind(format!(
-            "{{\"source\":\"binary_upload\",\"version\":\"{}\",\"runtime\":\"file\",\"runtime_root\":\"{}\"}}",
-            json_escape(&artifact_version),
-            json_escape(&runtime_root.to_string_lossy())
-        ))
-        .execute(&mut *tx)
         .await?;
         sqlx::query(
             r#"
@@ -5969,18 +7070,27 @@ impl AppService {
         .await?;
         tx.commit().await?;
         cleanup_pruned_binary_release_dirs(&runtime_root, &pruned_releases)?;
-        Ok(())
+        Ok(UploadBinaryArtifactResult {
+            app_id: app.id,
+            app_key: app.app_key,
+            artifact_version,
+            version_code,
+            artifact_path: config.artifact_path,
+            artifact_kind: artifact_kind.to_owned(),
+            published_at,
+            config_snapshot_id: config_snapshot.id,
+            config_revision_no: config_snapshot.revision_no,
+        })
     }
 
-    pub async fn rollback_binary_artifact(
+    pub async fn deploy_binary_artifact(
         &self,
         app_id: i64,
         artifact_id: i64,
         actor: &str,
-    ) -> Result<BinaryRollbackResult, AppError> {
+    ) -> Result<BinaryReleaseDeployResult, AppError> {
         let app = self.fetch_app_detail(app_id).await?;
         ensure_app_enabled(&app)?;
-        ensure_app_idle(&app)?;
         self.ensure_no_active_deploy_task(app.id).await?;
         self.ensure_binary_app(&app)?;
         ensure_has_enabled_targets(&self.target_node_metadata_for_app(app.id).await?)?;
@@ -5989,10 +7099,12 @@ impl AppService {
             SELECT
                 id,
                 version,
+                version_code,
                 artifact_path,
                 artifact_kind,
                 status,
                 metadata,
+                published_at,
                 created_at
             FROM binary_artifacts
             WHERE id = ?1
@@ -6065,27 +7177,22 @@ impl AppService {
         .bind(&artifact.artifact_path)
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
-            r#"
-            INSERT INTO app_config_snapshots(
-                app_id,
-                snapshot_kind,
-                compose_content,
-                env_content,
-                metadata
-            )
-            VALUES (?1, 'manual', ?2, ?3, ?4)
-            "#,
+        let config_snapshot = insert_runtime_config_snapshot(
+            &mut tx,
+            RuntimeConfigSnapshotInput {
+                app_id: app.id,
+                snapshot_kind: "manual",
+                compose_content: &runtime_files.compose_content,
+                env_content: &config.env_content,
+                artifact_version: &artifact.version,
+                metadata: runtime_snapshot_metadata(
+                    "binary_release_deploy",
+                    runtime_root.to_string_lossy(),
+                    Some(&artifact.version),
+                    Some(&config),
+                ),
+            },
         )
-        .bind(app.id)
-        .bind(runtime_files.compose_content)
-        .bind(&config.env_content)
-        .bind(format!(
-            "{{\"source\":\"binary_release_activate\",\"version\":\"{}\",\"runtime\":\"file\",\"runtime_root\":\"{}\"}}",
-            json_escape(&artifact.version),
-            json_escape(&runtime_root.to_string_lossy())
-        ))
-        .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         let version = artifact.version.clone();
@@ -6095,10 +7202,11 @@ impl AppService {
                 config,
                 BinaryTaskAction::Restart,
                 actor,
-                "回滚并重启二进制",
+                "部署发布版本并重启二进制",
+                Some(config_snapshot),
             )
             .await?;
-        Ok(BinaryRollbackResult { task_id, version })
+        Ok(BinaryReleaseDeployResult { task_id, version })
     }
 
     pub async fn restore_config_snapshot(
@@ -6108,14 +7216,17 @@ impl AppService {
     ) -> Result<(), AppError> {
         let app = self.fetch_app_detail(app_id).await?;
         ensure_app_enabled(&app)?;
-        ensure_app_idle(&app)?;
+        self.ensure_no_active_deploy_task(app.id).await?;
         let snapshot = sqlx::query_as::<_, AppConfigSnapshotItem>(
             r#"
             SELECT
                 id,
+                revision_no,
                 snapshot_kind,
                 compose_content,
                 env_content,
+                artifact_version,
+                config_hash,
                 metadata,
                 created_at
             FROM app_config_snapshots
@@ -6129,17 +7240,49 @@ impl AppService {
         .await?
         .ok_or_else(|| AppError::InvalidInput("配置快照不存在".to_owned()))?;
 
-        let binary_config = self.load_binary_config(&app).await?;
+        let current_binary_config = self.load_binary_config(&app).await?;
+        let snapshot_artifact_version = snapshot_artifact_version(&snapshot);
+        let snapshot_artifact = if app.app_type == "binary" && !snapshot_artifact_version.is_empty()
+        {
+            Some(
+                self.binary_artifact_by_version(app.id, &snapshot_artifact_version)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::InvalidInput(format!(
+                            "配置快照绑定的发布版本 {snapshot_artifact_version} 不存在，无法恢复"
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
+        if let Some(artifact) = &snapshot_artifact
+            && artifact.status == "disabled"
+        {
+            return Err(AppError::InvalidInput(format!(
+                "配置快照绑定的发布版本 {} 已清理，无法恢复",
+                artifact.version
+            )));
+        }
+        let binary_config = if app.app_type == "binary" {
+            Some(binary_config_from_snapshot(
+                &app,
+                &snapshot,
+                &current_binary_config,
+                snapshot_artifact.as_ref(),
+            ))
+        } else {
+            None
+        };
         let compose_content = if app.app_type == "compose" {
             normalize_compose_content(&snapshot.compose_content, &app.app_key)?
         } else {
             String::new()
         };
-        let env_content = if app.app_type == "binary" {
-            binary_config.env_content.clone()
-        } else {
-            normalize_env_content(&snapshot.env_content)
-        };
+        let env_content = binary_config
+            .as_ref()
+            .map(|config| config.env_content.clone())
+            .unwrap_or_else(|| normalize_env_content(&snapshot.env_content));
         let target_nodes = self.target_node_metadata_for_app(app.id).await?;
         let runtime_root = self.runtime_fs.app_root(&app.app_key)?;
         let metadata_content = render_runtime_metadata(
@@ -6152,11 +7295,7 @@ impl AppService {
                 })
                 .collect(),
             &runtime_root.to_string_lossy(),
-            if app.app_type == "binary" {
-                Some(&binary_config)
-            } else {
-                None
-            },
+            binary_config.as_ref(),
         );
         self.runtime_fs
             .save_app_runtime_files(
@@ -6172,34 +7311,54 @@ impl AppService {
                     app.id,
                     &app.app_key,
                     &app.name,
-                    &binary_config,
+                    binary_config
+                        .as_ref()
+                        .ok_or_else(|| AppError::Internal("二进制配置恢复失败".to_owned()))?,
                 ))
                 .await?;
         }
 
         let mut tx = self.db.begin().await?;
-        sqlx::query(
-            r#"
-            INSERT INTO app_config_snapshots(
-                app_id,
-                snapshot_kind,
-                compose_content,
-                env_content,
-                metadata
-            )
-            VALUES (?1, 'manual', ?2, ?3, ?4)
-            "#,
+        if let Some(config) = &binary_config {
+            upsert_binary_config(&mut tx, app.id, config).await?;
+            if let Some(artifact) = &snapshot_artifact {
+                sqlx::query(
+                    r#"
+                    UPDATE binary_artifacts
+                    SET status = CASE WHEN id = ?2 THEN 'active' ELSE 'registered' END
+                    WHERE app_id = ?1
+                      AND status != 'disabled'
+                    "#,
+                )
+                .bind(app.id)
+                .bind(artifact.id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        let artifact_version = binary_config
+            .as_ref()
+            .map(|config| config.artifact_version.as_str())
+            .unwrap_or("");
+        insert_runtime_config_snapshot(
+            &mut tx,
+            RuntimeConfigSnapshotInput {
+                app_id: app.id,
+                snapshot_kind: "manual",
+                compose_content: &compose_content,
+                env_content: &env_content,
+                artifact_version,
+                metadata: runtime_snapshot_metadata(
+                    "restore",
+                    runtime_root.to_string_lossy(),
+                    Some(&format!(
+                        "snapshot-{}-{}",
+                        snapshot.id, snapshot.snapshot_kind
+                    )),
+                    binary_config.as_ref(),
+                ),
+            },
         )
-        .bind(app.id)
-        .bind(&compose_content)
-        .bind(&env_content)
-        .bind(format!(
-            "{{\"source\":\"restore\",\"snapshot_id\":{},\"snapshot_kind\":\"{}\",\"runtime\":\"file\",\"runtime_root\":\"{}\"}}",
-            snapshot.id,
-            json_escape(&snapshot.snapshot_kind),
-            json_escape(&runtime_root.to_string_lossy())
-        ))
-        .execute(&mut *tx)
         .await?;
         sqlx::query(
             r#"
@@ -6218,7 +7377,7 @@ impl AppService {
     pub async fn compose_config(&self, app_id: i64) -> Result<ComposeCommandOutput, AppError> {
         let app = self.fetch_app_detail(app_id).await?;
         ensure_app_enabled(&app)?;
-        ensure_app_idle(&app)?;
+        self.ensure_no_active_deploy_task(app.id).await?;
         self.ensure_compose_app(&app)?;
         let work_dir = self.runtime_fs.app_root(&app.app_key)?;
         self.compose.config(work_dir).await.map_err(AppError::from)
@@ -6346,7 +7505,6 @@ impl AppService {
     ) -> Result<i64, AppError> {
         let app = self.fetch_app_detail(app_id).await?;
         ensure_app_enabled(&app)?;
-        ensure_app_idle(&app)?;
         self.ensure_no_active_deploy_task(app.id).await?;
         self.ensure_compose_app(&app)?;
         ensure_has_enabled_targets(&self.target_node_metadata_for_app(app.id).await?)?;
@@ -6368,9 +7526,25 @@ impl AppService {
             return Err(AppError::InvalidInput("Compose 工作目录不存在".to_owned()));
         }
         let deploy_strategy = parse_deploy_strategy(&app.deploy_strategy);
+        let config_snapshot =
+            self.latest_config_snapshot(app.id)
+                .await?
+                .unwrap_or(RuntimeConfigSnapshotRecord {
+                    id: 0,
+                    revision_no: 0,
+                });
         self.tasks
             .append_log(task_id, "system", "任务已加入后台部署队列")
             .await?;
+        if config_snapshot.revision_no > 0 {
+            self.tasks
+                .append_log(
+                    task_id,
+                    "system",
+                    &format!("运行配置版本: config#{}", config_snapshot.revision_no),
+                )
+                .await?;
+        }
         self.tasks
             .append_log(
                 task_id,
@@ -6378,10 +7552,6 @@ impl AppService {
                 &format!("部署策略: {}", deploy_strategy.label()),
             )
             .await?;
-        if let Err(err) = self.update_app_status(app.id, "deploying").await {
-            let _ = self.tasks.fail_task(task_id, err.message()).await;
-            return Err(err);
-        }
         update_runtime_states_in_db(&RuntimeStatesUpdate {
             db: &self.db,
             app_id: app.id,
@@ -6399,13 +7569,14 @@ impl AppService {
                 task_id,
                 app_id: app.id,
                 app_key: app.app_key,
+                config_snapshot_id: (config_snapshot.id > 0).then_some(config_snapshot.id),
+                config_revision_no: config_snapshot.revision_no,
                 deploy_strategy,
                 action,
             })
             .await
         {
             self.tasks.fail_task(task_id, err.message()).await?;
-            self.update_app_status(app.id, "failed").await?;
             update_runtime_states_in_db(&RuntimeStatesUpdate {
                 db: &self.db,
                 app_id: app.id,
@@ -6448,14 +7619,13 @@ impl AppService {
     ) -> Result<i64, AppError> {
         let app = self.fetch_app_detail(app_id).await?;
         ensure_app_enabled(&app)?;
-        ensure_app_idle(&app)?;
         self.ensure_no_active_deploy_task(app.id).await?;
         self.ensure_binary_app(&app)?;
         ensure_has_enabled_targets(&self.target_node_metadata_for_app(app.id).await?)?;
         let config = self.load_binary_config(&app).await?;
         if config.artifact_version.is_empty() || config.artifact_path.is_empty() {
             return Err(AppError::InvalidInput(
-                "请先保存二进制制品版本和路径".to_owned(),
+                "请先保存二进制发布版本和部署文件路径".to_owned(),
             ));
         }
         let task_id = self
@@ -6476,6 +7646,13 @@ impl AppService {
             return Err(AppError::InvalidInput("二进制工作目录不存在".to_owned()));
         }
         let deploy_strategy = parse_deploy_strategy(&app.deploy_strategy);
+        let config_snapshot =
+            self.latest_config_snapshot(app.id)
+                .await?
+                .unwrap_or(RuntimeConfigSnapshotRecord {
+                    id: 0,
+                    revision_no: 0,
+                });
         self.tasks
             .append_log(task_id, "system", "任务已加入后台二进制部署队列")
             .await?;
@@ -6490,12 +7667,17 @@ impl AppService {
             .append_log(
                 task_id,
                 "system",
-                &format!("二进制制品版本: {}", config.artifact_version),
+                &format!("二进制发布版本: {}", config.artifact_version),
             )
             .await?;
-        if let Err(err) = self.update_app_status(app.id, "deploying").await {
-            let _ = self.tasks.fail_task(task_id, err.message()).await;
-            return Err(err);
+        if config_snapshot.revision_no > 0 {
+            self.tasks
+                .append_log(
+                    task_id,
+                    "system",
+                    &format!("运行配置版本: config#{}", config_snapshot.revision_no),
+                )
+                .await?;
         }
         update_runtime_states_in_db(&RuntimeStatesUpdate {
             db: &self.db,
@@ -6518,6 +7700,8 @@ impl AppService {
                 unit_name: config.unit_name,
                 artifact_version: config.artifact_version,
                 artifact_path: config.artifact_path,
+                config_snapshot_id: (config_snapshot.id > 0).then_some(config_snapshot.id),
+                config_revision_no: config_snapshot.revision_no,
                 release_strategy: config.release_strategy,
                 active_slot: config.active_slot,
                 base_port: config.base_port,
@@ -6532,7 +7716,6 @@ impl AppService {
             .await
         {
             self.tasks.fail_task(task_id, err.message()).await?;
-            self.update_app_status(app.id, "failed").await?;
             update_runtime_states_in_db(&RuntimeStatesUpdate {
                 db: &self.db,
                 app_id: app.id,
@@ -6556,9 +7739,9 @@ impl AppService {
         action: BinaryTaskAction,
         actor: &str,
         title_prefix: &str,
+        config_snapshot: Option<RuntimeConfigSnapshotRecord>,
     ) -> Result<i64, AppError> {
         ensure_app_enabled(&app)?;
-        ensure_app_idle(&app)?;
         self.ensure_no_active_deploy_task(app.id).await?;
         let task_id = self
             .tasks
@@ -6592,13 +7775,9 @@ impl AppService {
             .append_log(
                 task_id,
                 "system",
-                &format!("二进制制品版本: {}", config.artifact_version),
+                &format!("二进制发布版本: {}", config.artifact_version),
             )
             .await?;
-        if let Err(err) = self.update_app_status(app.id, "deploying").await {
-            let _ = self.tasks.fail_task(task_id, err.message()).await;
-            return Err(err);
-        }
         update_runtime_states_in_db(&RuntimeStatesUpdate {
             db: &self.db,
             app_id: app.id,
@@ -6610,6 +7789,16 @@ impl AppService {
             touch_deploy_time: false,
         })
         .await?;
+        let config_snapshot =
+            match config_snapshot {
+                Some(snapshot) => snapshot,
+                None => self.latest_config_snapshot(app.id).await?.unwrap_or(
+                    RuntimeConfigSnapshotRecord {
+                        id: 0,
+                        revision_no: 0,
+                    },
+                ),
+            };
         if let Err(err) = self
             .binary_queue
             .enqueue(BinaryTaskJob {
@@ -6620,6 +7809,8 @@ impl AppService {
                 unit_name: config.unit_name,
                 artifact_version: config.artifact_version,
                 artifact_path: config.artifact_path,
+                config_snapshot_id: (config_snapshot.id > 0).then_some(config_snapshot.id),
+                config_revision_no: config_snapshot.revision_no,
                 release_strategy: config.release_strategy,
                 active_slot: config.active_slot,
                 base_port: config.base_port,
@@ -6634,7 +7825,6 @@ impl AppService {
             .await
         {
             self.tasks.fail_task(task_id, err.message()).await?;
-            self.update_app_status(app.id, "failed").await?;
             update_runtime_states_in_db(&RuntimeStatesUpdate {
                 db: &self.db,
                 app_id: app.id,
@@ -6669,15 +7859,12 @@ impl AppService {
         self.run_binary_task(app_id, action, actor).await
     }
 
-    pub async fn set_app_status(
+    pub async fn set_app_enabled(
         &self,
         app_id: i64,
-        status: &str,
+        enabled: bool,
     ) -> Result<AppStatusChange, AppError> {
-        let status = match status {
-            "disabled" | "ready" => status,
-            _ => return Err(AppError::InvalidInput("应用状态不支持".to_owned())),
-        };
+        let status = if enabled { "ready" } else { "disabled" };
         let app = self.fetch_app_detail(app_id).await?;
         if app.status == status {
             return Ok(AppStatusChange {
@@ -6687,9 +7874,7 @@ impl AppService {
                 status: app.status,
             });
         }
-        if app.status == "deploying" {
-            return Err(AppError::Conflict("部署中的应用不能停用".to_owned()));
-        }
+        self.ensure_no_active_deploy_task(app.id).await?;
         update_app_status_in_db(&self.db, app.id, status).await?;
         Ok(AppStatusChange {
             app_id: app.id,
@@ -6697,6 +7882,18 @@ impl AppService {
             previous_status: app.status,
             status: status.to_owned(),
         })
+    }
+
+    pub async fn set_app_status(
+        &self,
+        app_id: i64,
+        status: &str,
+    ) -> Result<AppStatusChange, AppError> {
+        match status {
+            "disabled" => self.set_app_enabled(app_id, false).await,
+            "ready" => self.set_app_enabled(app_id, true).await,
+            _ => Err(AppError::InvalidInput("应用只支持启用或停用".to_owned())),
+        }
     }
 
     fn ensure_compose_app(&self, app: &AppDetailItem) -> Result<(), AppError> {
@@ -6725,6 +7922,7 @@ impl AppService {
                 a.app_key,
                 a.name,
                 a.description,
+                a.environment,
                 a.app_type,
                 a.deploy_mode,
                 a.deploy_strategy,
@@ -6815,11 +8013,6 @@ impl AppService {
         .map_err(AppError::from)
     }
 
-    async fn update_app_status(&self, app_id: i64, status: &str) -> Result<(), AppError> {
-        update_app_status_in_db(&self.db, app_id, status).await?;
-        Ok(())
-    }
-
     async fn ensure_no_active_deploy_task(&self, app_id: i64) -> Result<(), AppError> {
         if let Some(task) = self.tasks.active_app_task(app_id).await? {
             return Err(AppError::Conflict(format!(
@@ -6830,6 +8023,22 @@ impl AppService {
                 task_phase_label(&task.phase)
             )));
         }
+        let deploying_nodes = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(1)
+            FROM app_runtime_states
+            WHERE app_id = ?1
+              AND runtime_status = 'deploying'
+            "#,
+        )
+        .bind(app_id)
+        .fetch_one(&self.db)
+        .await?;
+        if deploying_nodes > 0 {
+            return Err(AppError::Conflict(
+                "应用正在部署中，请等待当前任务结束后再提交".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -6838,16 +8047,6 @@ fn ensure_app_enabled(app: &AppDetailItem) -> Result<(), AppError> {
     if app.status == "disabled" {
         Err(AppError::InvalidInput(
             "应用已停用，不能执行变更操作".to_owned(),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn ensure_app_idle(app: &AppDetailItem) -> Result<(), AppError> {
-    if app.status == "deploying" {
-        Err(AppError::Conflict(
-            "应用正在部署中，请等待当前任务结束".to_owned(),
         ))
     } else {
         Ok(())
@@ -7169,10 +8368,11 @@ impl ComposeTaskAction {
         }
     }
 
-    fn success_status(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
-            Self::Up | Self::Restart => "running",
-            Self::Down => "ready",
+            Self::Up => "启动",
+            Self::Down => "停止",
+            Self::Restart => "重启",
         }
     }
 
@@ -7189,6 +8389,14 @@ impl ComposeTaskAction {
                 Self::Up | Self::Restart => "healthy",
             }
         }
+    }
+}
+
+fn compose_action_command_label(action: ComposeTaskAction) -> &'static str {
+    match action {
+        ComposeTaskAction::Up => "docker compose up -d --remove-orphans",
+        ComposeTaskAction::Down => "docker compose down",
+        ComposeTaskAction::Restart => "docker compose restart",
     }
 }
 
@@ -7222,10 +8430,10 @@ impl BinaryTaskAction {
         }
     }
 
-    fn success_status(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
-            Self::Restart => "running",
-            Self::Stop => "ready",
+            Self::Restart => "重启",
+            Self::Stop => "停止",
         }
     }
 
@@ -7246,6 +8454,13 @@ impl BinaryTaskAction {
                 Self::Stop => "stopped",
             }
         }
+    }
+}
+
+fn binary_action_command_label(action: BinaryTaskAction, unit_name: &str) -> String {
+    match action {
+        BinaryTaskAction::Restart => format!("systemctl restart {unit_name}"),
+        BinaryTaskAction::Stop => format!("systemctl stop {unit_name}"),
     }
 }
 
@@ -7303,11 +8518,25 @@ fn normalize_app_type(value: &str) -> Result<String, AppError> {
     }
 }
 
+fn normalize_app_environment(value: &str) -> Result<String, AppError> {
+    let environment = value.trim().to_ascii_lowercase();
+    if environment.is_empty() {
+        return Ok("test".to_owned());
+    }
+    match environment.as_str() {
+        "production" | "prod" => Ok("production".to_owned()),
+        "test" | "testing" => Ok("test".to_owned()),
+        _ => Err(AppError::InvalidInput(
+            "应用环境仅支持 production 或 test".to_owned(),
+        )),
+    }
+}
+
 fn normalize_binary_config(
     input: NormalizeBinaryConfigInput<'_>,
 ) -> Result<BinaryConfigItem, AppError> {
-    let artifact_version = required_text(input.artifact_version, "请输入二进制制品版本")?;
-    let artifact_path = required_text(input.artifact_path, "请输入二进制制品路径")?;
+    let artifact_version = input.artifact_version.trim().to_owned();
+    let artifact_path = input.artifact_path.trim().to_owned();
     let unit_name = normalize_unit_name(input.unit_name, input.app_key)?;
     let service_user = input.service_user.trim();
     let service_user = if service_user.is_empty() {
@@ -7570,6 +8799,7 @@ fn render_runtime_metadata(
     push_yaml_string(&mut output, "app_key", &app.app_key);
     push_yaml_string(&mut output, "name", &app.name);
     push_yaml_string(&mut output, "description", &app.description);
+    push_yaml_string(&mut output, "environment", &app.environment);
     push_yaml_string(&mut output, "app_type", &app.app_type);
     push_yaml_string(&mut output, "deploy_mode", &app.deploy_mode);
     push_yaml_string(&mut output, "deploy_strategy", &app.deploy_strategy);
@@ -7810,6 +9040,11 @@ fn render_artifact_metadata(input: ArtifactMetadataInput<'_>) -> String {
     )
 }
 
+fn upload_source(source: &str) -> &str {
+    let source = source.trim();
+    if source.is_empty() { "upload" } else { source }
+}
+
 fn artifact_metadata_value(metadata: &str, key: &str) -> String {
     serde_json::from_str::<JsonValue>(metadata)
         .ok()
@@ -7835,6 +9070,126 @@ fn normalize_release_id(value: &str) -> Result<String, AppError> {
         ));
     }
     Ok(value.to_owned())
+}
+
+pub fn parse_binary_package_name(
+    file_name: &str,
+) -> Result<ParsedBinaryPackageName, BinaryPackageNameError> {
+    let file_name = file_name
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let file_stem = strip_binary_package_extension(file_name);
+    let Some((service_key, version)) = file_stem.rsplit_once("_version_") else {
+        return Err(BinaryPackageNameError::InvalidPackageVersionName);
+    };
+    let service_key = normalize_key(service_key)
+        .map_err(|_| BinaryPackageNameError::InvalidPackageVersionName)?;
+    let release_version = normalize_package_version(version)
+        .ok_or(BinaryPackageNameError::InvalidPackageVersionName)?;
+    let version_code = version_code_from_release(&release_version)
+        .ok_or(BinaryPackageNameError::InvalidPackageVersionName)?;
+    Ok(ParsedBinaryPackageName {
+        service_key,
+        release_version,
+        version_code,
+    })
+}
+
+pub fn parse_binary_package_name_for_service(
+    file_name: &str,
+    expected_service_key: &str,
+    explicit_release_version: Option<&str>,
+) -> Result<ParsedBinaryPackageName, BinaryPackageNameError> {
+    let parsed = parse_binary_package_name(file_name)?;
+    let expected_service_key = normalize_key(expected_service_key)
+        .map_err(|_| BinaryPackageNameError::InvalidPackageVersionName)?;
+    if parsed.service_key != expected_service_key {
+        return Err(BinaryPackageNameError::ServiceKeyMismatch {
+            expected: expected_service_key,
+            actual: parsed.service_key,
+        });
+    }
+    if let Some(explicit_release_version) = explicit_release_version
+        && !explicit_release_version.trim().is_empty()
+    {
+        let explicit_release_version = normalize_package_version(explicit_release_version)
+            .ok_or(BinaryPackageNameError::InvalidPackageVersionName)?;
+        if parsed.release_version != explicit_release_version {
+            return Err(BinaryPackageNameError::PackageVersionConflict {
+                expected: explicit_release_version,
+                actual: parsed.release_version,
+            });
+        }
+    }
+    Ok(parsed)
+}
+
+fn strip_binary_package_extension(file_name: &str) -> &str {
+    for extension in [".tar.gz", ".tgz", ".jar", ".zip"] {
+        if let Some(stripped) = file_name.strip_suffix(extension) {
+            return stripped;
+        }
+    }
+    file_name
+}
+
+fn normalize_package_version(version: &str) -> Option<String> {
+    let version = version.trim();
+    let version = version
+        .strip_prefix('v')
+        .or_else(|| version.strip_prefix('V'))
+        .unwrap_or(version)
+        .replace('_', ".");
+    let parts = version.split('.').collect::<Vec<_>>();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(format!("v{}.{}.{}", parts[0], parts[1], parts[2]))
+}
+
+fn version_code_from_release(version: &str) -> Option<i64> {
+    let version = normalize_package_version(version)?;
+    let version = version.strip_prefix('v').unwrap_or(&version);
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse::<i64>().ok()?;
+    let minor = parts.next()?.parse::<i64>().ok()?;
+    let patch = parts.next()?.parse::<i64>().ok()?;
+    if parts.next().is_some() || major < 0 || minor < 0 || patch < 0 {
+        return None;
+    }
+    Some(major * 1_000_000 + minor * 1_000 + patch)
+}
+
+fn normalize_published_at(value: &str) -> Result<Option<String>, AppError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() < 10
+        || value.len() > 64
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | ':' | '.' | 'T' | 'Z' | '+'))
+    {
+        return Err(AppError::InvalidInput(
+            "发布时间格式不正确，请使用 ISO-8601 时间，例如 2026-06-09T10:00:00Z".to_owned(),
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+async fn sqlite_now(db: &SqlitePool) -> Result<String, AppError> {
+    sqlx::query_scalar::<_, String>("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+        .fetch_one(db)
+        .await
+        .map_err(AppError::from)
 }
 
 fn artifact_kind_from_file_name(file_name: &str) -> &'static str {
@@ -7863,7 +9218,7 @@ fn normalize_entry_file(
     };
     if value.is_empty() {
         return Err(AppError::InvalidInput(
-            "tar.gz 制品需要填写入口文件，例如 bin/server".to_owned(),
+            "tar.gz 版本包需要填写入口文件，例如 bin/server".to_owned(),
         ));
     }
     if value.starts_with('/')
@@ -7897,14 +9252,14 @@ fn extract_tar_gz(path: &Path, artifact_version: &str) -> Result<(), AppError> {
         .to_path_buf();
     let file = File::open(path).map_err(|err| {
         AppError::Internal(format!(
-            "读取 tar.gz 制品 {} 失败: {err}",
+            "读取 tar.gz 版本包 {} 失败: {err}",
             path.to_string_lossy()
         ))
     })?;
     let decoder = GzDecoder::new(file);
     let mut archive = Archive::new(decoder);
     let entries = archive.entries().map_err(|err| {
-        AppError::InvalidInput(format!("解析 tar.gz 制品 {artifact_version} 失败: {err}"))
+        AppError::InvalidInput(format!("解析 tar.gz 版本包 {artifact_version} 失败: {err}"))
     })?;
     for entry in entries {
         let mut entry = entry.map_err(|err| {
@@ -7941,7 +9296,7 @@ fn sanitize_archive_path(path: &Path) -> Result<PathBuf, AppError> {
             std::path::Component::CurDir => {}
             _ => {
                 return Err(AppError::InvalidInput(
-                    "tar.gz 制品不能包含绝对路径或上级目录".to_owned(),
+                    "tar.gz 版本包不能包含绝对路径或上级目录".to_owned(),
                 ));
             }
         }
@@ -8013,9 +9368,88 @@ fn dedupe_ids(ids: &[i64]) -> Vec<i64> {
     deduped
 }
 
+fn dedupe_strings(values: &[String]) -> Vec<String> {
+    let mut deduped = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if !value.is_empty() && !deduped.iter().any(|item: &String| item == value) {
+            deduped.push(value.to_owned());
+        }
+    }
+    deduped
+}
+
 #[cfg(test)]
 mod tests {
+    use sqlx::sqlite::SqliteConnectOptions;
+
     use super::*;
+
+    async fn task_service() -> TaskService {
+        let db = sqlx::SqlitePool::connect_with(
+            "sqlite::memory:"
+                .parse::<SqliteConnectOptions>()
+                .expect("valid in-memory sqlite url")
+                .foreign_keys(true),
+        )
+        .await
+        .expect("connect in-memory sqlite");
+        sqlx::migrate!("./migrations")
+            .run(&db)
+            .await
+            .expect("run migrations");
+        TaskService::new(db)
+    }
+
+    #[tokio::test]
+    async fn command_output_can_be_attached_to_task_step() {
+        let tasks = task_service().await;
+        let task_id = tasks
+            .create_task(CreateTaskInput {
+                task_kind: "compose.up".to_owned(),
+                title: "部署 Redis".to_owned(),
+                app_id: None,
+                node_id: None,
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect("create task");
+        let step_id = start_task_step(
+            &tasks,
+            task_id,
+            None,
+            "compose.action",
+            "启动 Compose 服务",
+            "docker compose up -d",
+        )
+        .await
+        .expect("start task step");
+        let output = ComposeCommandOutput {
+            command: "docker compose up -d".to_owned(),
+            success: true,
+            status_code: Some(0),
+            output: "Container redis Started".to_owned(),
+        };
+
+        append_step_command_output(&tasks, task_id, step_id, &output)
+            .await
+            .expect("append step command output");
+        finish_task_step(&tasks, task_id, step_id, true, Some(0), "启动完成")
+            .await
+            .expect("finish step");
+
+        let logs = tasks.task_logs(task_id).await.expect("task logs");
+        assert!(logs.iter().any(|log| {
+            log.step_id == Some(step_id)
+                && log.stream == "system"
+                && log.content.contains("docker compose up -d")
+        }));
+        assert!(logs.iter().any(|log| {
+            log.step_id == Some(step_id)
+                && log.stream == "combined"
+                && log.content.contains("redis")
+        }));
+    }
 
     #[test]
     fn normalize_compose_content_strips_top_level_version() {
@@ -8130,6 +9564,115 @@ services:
 
         assert_eq!(ids, [2, 1]);
         assert_eq!(versions, ["v1.2.0", "v1.1.0"]);
+    }
+
+    #[test]
+    fn parse_binary_package_name_normalizes_service_and_version() {
+        let parsed =
+            parse_binary_package_name("orders-api-prod_version_1_2_3.tar.gz").expect("parse");
+
+        assert_eq!(parsed.service_key, "orders-api-prod");
+        assert_eq!(parsed.release_version, "v1.2.3");
+        assert_eq!(parsed.version_code, 1_002_003);
+
+        let jar = parse_binary_package_name("orders-api-prod_version_v1.2.3.jar").expect("parse");
+        assert_eq!(jar.service_key, "orders-api-prod");
+        assert_eq!(jar.release_version, "v1.2.3");
+        assert_eq!(jar.version_code, 1_002_003);
+    }
+
+    #[test]
+    fn version_code_from_release_uses_semver_ordering() {
+        assert_eq!(version_code_from_release("v1.2.3"), Some(1_002_003));
+        assert_eq!(version_code_from_release("2_10_4"), Some(2_010_004));
+        assert_eq!(version_code_from_release("bad"), None);
+    }
+
+    #[test]
+    fn parse_binary_package_name_rejects_invalid_name() {
+        let err = parse_binary_package_name("orders-api-prod-v1.2.3.tar.gz")
+            .expect_err("invalid package name");
+
+        assert_eq!(err.code(), "INVALID_PACKAGE_VERSION_NAME");
+    }
+
+    #[test]
+    fn parse_binary_package_name_for_service_rejects_mismatch() {
+        let err = parse_binary_package_name_for_service(
+            "orders-api_version_1_2_3.tar.gz",
+            "payments",
+            None,
+        )
+        .expect_err("service mismatch");
+
+        assert_eq!(err.code(), "PACKAGE_SERVICE_KEY_MISMATCH");
+        assert!(err.message().contains("payments"));
+        assert!(err.message().contains("orders-api"));
+    }
+
+    #[test]
+    fn parse_binary_package_name_for_service_rejects_explicit_version_conflict() {
+        let err = parse_binary_package_name_for_service(
+            "orders-api_version_1_2_3.tar.gz",
+            "orders-api",
+            Some("v1.2.4"),
+        )
+        .expect_err("version conflict");
+
+        assert_eq!(err.code(), "PACKAGE_VERSION_CONFLICT");
+        assert!(err.message().contains("v1.2.4"));
+        assert!(err.message().contains("v1.2.3"));
+    }
+
+    #[test]
+    fn runtime_snapshot_metadata_records_binary_runtime_config() {
+        let config = binary_config_item("v1.2.3", "/opt/app/releases/v1.2.3/app");
+
+        let metadata =
+            runtime_snapshot_metadata("manual", "/data/apps/app", Some("v1.2.3"), Some(&config));
+        let value = serde_json::from_str::<JsonValue>(&metadata).expect("metadata json");
+        let binary = value.get("binary").expect("binary metadata");
+
+        assert_eq!(value["source"], "manual");
+        assert_eq!(value["version"], "v1.2.3");
+        assert_eq!(binary["artifact_version"], "v1.2.3");
+        assert_eq!(binary["artifact_path"], "/opt/app/releases/v1.2.3/app");
+        assert_eq!(binary["exec_args"], "--port 8080");
+        assert_eq!(binary["unit_name"], "easy-deploy-worker-bin.service");
+        assert_eq!(binary["release_strategy"], "blue_green");
+        assert_eq!(binary["proxy_kind"], "caddy");
+    }
+
+    #[test]
+    fn binary_config_from_snapshot_restores_runtime_config_and_artifact() {
+        let app = app_detail_item("worker-bin", "/opt/app");
+        let current = binary_config_item("v1.0.0", "/opt/app/releases/v1.0.0/app");
+        let mut snapshot_config = binary_config_item("v1.2.3", "/opt/app/releases/v1.2.3/app");
+        snapshot_config.exec_args = "--worker-count 4".to_owned();
+        snapshot_config.base_port = 9000;
+        snapshot_config.standby_port = 19000;
+        snapshot_config.proxy_domain = "worker.example.com".to_owned();
+        let snapshot = app_config_snapshot_item(
+            "v1.2.3",
+            &runtime_snapshot_metadata(
+                "manual",
+                "/data/apps/app",
+                Some("v1.2.3"),
+                Some(&snapshot_config),
+            ),
+            "RUST_LOG=debug",
+        );
+        let artifact = binary_artifact(9, "v1.2.3", r#"{"source":"upload"}"#);
+
+        let restored = binary_config_from_snapshot(&app, &snapshot, &current, Some(&artifact));
+
+        assert_eq!(restored.artifact_version, "v1.2.3");
+        assert_eq!(restored.artifact_path, "/tmp/v1.2.3");
+        assert_eq!(restored.exec_args, "--worker-count 4");
+        assert_eq!(restored.base_port, 9000);
+        assert_eq!(restored.standby_port, 19000);
+        assert_eq!(restored.proxy_domain, "worker.example.com");
+        assert_eq!(restored.env_content, "RUST_LOG=debug\n");
     }
 
     #[test]
@@ -8263,11 +9806,71 @@ services:
         BinaryArtifactItem {
             id,
             version: version.to_owned(),
+            version_code: version_code_from_release(version).unwrap_or(id),
             artifact_path: format!("/tmp/{version}"),
             artifact_kind: "file".to_owned(),
             status: "registered".to_owned(),
             metadata: metadata.to_owned(),
+            published_at: format!("2026-06-01T00:00:{id:02}Z"),
             created_at: format!("2026-06-01T00:00:{id:02}Z"),
+        }
+    }
+
+    fn binary_config_item(version: &str, artifact_path: &str) -> BinaryConfigItem {
+        BinaryConfigItem {
+            service_name: "worker-bin".to_owned(),
+            artifact_version: version.to_owned(),
+            artifact_path: artifact_path.to_owned(),
+            exec_args: "--port 8080".to_owned(),
+            working_dir: "/opt/app".to_owned(),
+            service_user: "deploy".to_owned(),
+            unit_name: "easy-deploy-worker-bin.service".to_owned(),
+            release_strategy: "blue_green".to_owned(),
+            active_slot: "blue".to_owned(),
+            base_port: 8080,
+            standby_port: 18080,
+            proxy_enabled: 1,
+            proxy_kind: "caddy".to_owned(),
+            proxy_domain: "worker.local".to_owned(),
+            proxy_config_path: "/etc/caddy/Caddyfile.d/worker-bin.caddy".to_owned(),
+            env_content: "RUST_LOG=info\n".to_owned(),
+        }
+    }
+
+    fn app_detail_item(app_key: &str, work_dir: &str) -> AppDetailItem {
+        AppDetailItem {
+            id: 1,
+            app_key: app_key.to_owned(),
+            name: "Worker".to_owned(),
+            description: String::new(),
+            environment: "test".to_owned(),
+            app_type: "binary".to_owned(),
+            deploy_mode: "binary".to_owned(),
+            deploy_strategy: "rolling_stop_on_failure".to_owned(),
+            work_dir: work_dir.to_owned(),
+            status: "ready".to_owned(),
+            target_names: None,
+            target_count: 1,
+            created_at: "2026-06-01T00:00:00Z".to_owned(),
+            updated_at: "2026-06-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn app_config_snapshot_item(
+        artifact_version: &str,
+        metadata: &str,
+        env_content: &str,
+    ) -> AppConfigSnapshotItem {
+        AppConfigSnapshotItem {
+            id: 1,
+            revision_no: 2,
+            snapshot_kind: "manual".to_owned(),
+            compose_content: String::new(),
+            env_content: env_content.to_owned(),
+            artifact_version: artifact_version.to_owned(),
+            config_hash: "hash".to_owned(),
+            metadata: metadata.to_owned(),
+            created_at: "2026-06-01T00:00:00Z".to_owned(),
         }
     }
 
@@ -8280,6 +9883,8 @@ services:
             unit_name: "easy-deploy-worker-bin.service".to_owned(),
             artifact_version: "v1.0.0".to_owned(),
             artifact_path: "/opt/easy-deploy/apps/worker-bin/releases/v1.0.0/worker-bin".to_owned(),
+            config_snapshot_id: Some(1),
+            config_revision_no: 1,
             release_strategy: "blue_green".to_owned(),
             active_slot: "blue".to_owned(),
             base_port: 8080,

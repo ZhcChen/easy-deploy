@@ -1,7 +1,10 @@
+#![recursion_limit = "256"]
+
 pub mod apps;
 pub mod auth;
 pub mod catalog;
 pub mod deploy;
+pub mod events;
 pub mod health;
 pub mod maintenance;
 pub mod migrations;

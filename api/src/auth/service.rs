@@ -1485,6 +1485,43 @@ impl AuthService {
         Ok(())
     }
 
+    pub async fn delete_revoked_api_token(
+        &self,
+        actor: &CurrentSession,
+        token_id: i64,
+    ) -> Result<(), AuthError> {
+        let row = sqlx::query(
+            r#"
+            DELETE FROM api_tokens
+            WHERE id = ?1
+              AND status = 'revoked'
+            RETURNING token_prefix, source
+            "#,
+        )
+        .bind(token_id)
+        .fetch_optional(&self.db)
+        .await?;
+        let Some(row) = row else {
+            return Err(AuthError::InvalidInput(
+                "API Token 不存在或尚未吊销".to_owned(),
+            ));
+        };
+        let token_prefix: String = row.get("token_prefix");
+        let source: String = row.get("source");
+        self.record_audit(AuditRecord {
+            actor_account_id: Some(actor.account.id),
+            actor_username: &actor.account.username,
+            action: "api_tokens.delete",
+            target_type: "api_token",
+            target_id: &token_id.to_string(),
+            message: &format!("delete revoked api token source={source} prefix={token_prefix}"),
+            ip: "",
+            user_agent: "",
+        })
+        .await?;
+        Ok(())
+    }
+
     pub async fn authenticate_api_token(
         &self,
         token: &str,

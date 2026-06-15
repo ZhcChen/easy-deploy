@@ -10,6 +10,7 @@ use api::{
     deploy::{
         CommandResult, CommandRunner, CommandSpec, ComposeExecutor, DeployError, SystemdExecutor,
     },
+    events::EventLogService,
     node_credentials::NodeCredentialService,
     nodes::NodeService,
     platform::PlatformConfigService,
@@ -143,6 +144,7 @@ pub async fn smoke_test() -> anyhow::Result<()> {
     let node_credentials = NodeCredentialService::new(db.clone(), temp_dir.path());
     let tasks = TaskService::new(db.clone());
     let platform = PlatformConfigService::new(db.clone());
+    let events = EventLogService::new(db.clone());
     let apps = AppService::new(
         db.clone(),
         RuntimeFs::new(temp_dir.path()),
@@ -151,7 +153,6 @@ pub async fn smoke_test() -> anyhow::Result<()> {
         tasks.clone(),
         platform.clone(),
     );
-
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let settings = Settings {
@@ -172,6 +173,7 @@ pub async fn smoke_test() -> anyhow::Result<()> {
             apps,
             tasks,
             platform,
+            events,
         },
     ));
 
@@ -254,7 +256,7 @@ async fn run_checks(
         .post(format!("{base_url}/login"))
         .form(&[
             ("username", "admin"),
-            ("display_name", "绠＄悊"),
+            ("display_name", "绠＄�"),
             ("password", LOCAL_TEST_ADMIN_PASSWORD),
         ])
         .send()
@@ -278,7 +280,7 @@ async fn run_checks(
     )?;
     anyhow::ensure!(
         !initialized_login_page.contains("认证策略")
-            && !initialized_login_page.contains("未启用 Secure"),
+            && !initialized_login_page.contains("未启�Secure"),
         "initialized login page should not show auth strategy hints"
     );
 
@@ -364,13 +366,7 @@ async fn run_checks(
         .error_for_status()?
         .text()
         .await?;
-    let templates_defaults = client
-        .get(format!("{base_url}/templates"))
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
+
     let nodes_defaults = client
         .get(format!("{base_url}/nodes"))
         .send()
@@ -380,9 +376,8 @@ async fn run_checks(
         .await?;
     anyhow::ensure!(
         apps_defaults.contains("value=\"/srv/easy/orders-api\"")
-            && templates_defaults.contains("value=\"/srv/easy/redis-cache\"")
             && nodes_defaults.contains("value=\"/srv/easy\""),
-        "create forms should use persisted platform defaults"
+        "editable create forms should use persisted platform defaults"
     );
     let restore_settings = client
         .post(format!("{base_url}/settings"))
@@ -1009,7 +1004,7 @@ async fn run_checks(
             ("csrf_token", app_csrf.as_str()),
             ("app_key", "orders-api"),
             ("name", "璁㈠崟鏈嶅姟"),
-            ("description", "E2E 鍒涘缓Compose 搴旂敤"),
+            ("description", "E2E 鍒涘缓Compose 搴旂�"),
             ("app_type", "compose"),
             ("deploy_strategy", "rolling_stop_on_failure"),
             ("work_dir", "/opt/easy-deploy/apps/orders-api"),
@@ -1128,8 +1123,8 @@ async fn run_checks(
         .post(format!("{base_url}/apps/1/metadata"))
         .form(&[
             ("csrf_token", detail_csrf.as_str()),
-            ("name", "璁㈠崟鏈嶅姟 Pro"),
-            ("description", "鏇存柊鍚庣殑 Compose 搴旂敤"),
+            ("name", "Orders API Pro"),
+            ("description", "Updated compose app"),
             ("work_dir", "/opt/easy-deploy/apps/orders-api-pro"),
             ("deploy_strategy", "rolling_continue"),
             ("target_node_ids", local_node_id.as_str()),
@@ -1144,8 +1139,8 @@ async fn run_checks(
     let updated_app_meta =
         tokio::fs::read_to_string(app_root.join(".easy-deploy").join("app.yaml")).await?;
     anyhow::ensure!(
-        updated_app_meta.contains("name: \"璁㈠崟鏈嶅姟 Pro\"")
-            && updated_app_meta.contains("description: \"鏇存柊鍚庣殑 Compose 搴旂敤\"")
+        updated_app_meta.contains("name: \"Orders API Pro\"")
+            && updated_app_meta.contains("description: \"Updated compose app\"")
             && updated_app_meta.contains("deploy_strategy: \"rolling_continue\"")
             && updated_app_meta
                 .contains("deploy_work_dir: \"/opt/easy-deploy/apps/orders-api-pro\"")
@@ -1376,66 +1371,25 @@ async fn run_checks(
         "templates page should render built-in compose templates"
     );
     anyhow::ensure!(
-        templates.contains("8080")
+        templates.contains("<section class=\"panel panel-large panel-full list-panel\"")
+            && templates.contains("<table class=\"data-table template-table\">")
+            && templates.contains("模板管理")
+            && templates.contains("8080")
             && templates.contains("6379")
             && templates.contains("5432")
-            && templates.contains("data-default-port=\"6379\"")
-            && templates.contains("id=\"template-port\"")
-            && templates.contains("value=\"8080\""),
-        "templates page should expose per-template default ports"
+            && templates.contains("PUBLIC_PORT=8080")
+            && templates.contains("REDIS_PORT=6379")
+            && !templates.contains("name=\"template_key\"")
+            && !templates.contains("id=\"template-port\"")
+            && !templates.contains("data-default-port"),
+        "templates page should render read-only template table"
     );
-    let create_from_template = client
-        .post(format!("{base_url}/templates"))
-        .form(&[
-            ("csrf_token", extract_csrf_token(&templates)?.as_str()),
-            ("template_key", "redis-single"),
-            ("app_key", "redis-cache"),
-            ("name", "Redis 缂撳瓨"),
-            ("description", "浠庢ā鏉垮垱"),
-            ("work_dir", "/opt/easy-deploy/apps/redis-cache"),
-            ("port", "16379"),
-            ("target_node_ids", local_node_id.as_str()),
-        ])
-        .send()
-        .await?;
+    let create_from_template = client.post(format!("{base_url}/templates")).send().await?;
     anyhow::ensure!(
-        create_from_template.status() == reqwest::StatusCode::SEE_OTHER,
-        "create app from template should redirect: {}",
+        create_from_template.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED,
+        "template creation route should be removed: {}",
         create_from_template.status()
     );
-    let template_location = create_from_template
-        .headers()
-        .get(reqwest::header::LOCATION)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    anyhow::ensure!(
-        template_location == "/apps/2?notice=created",
-        "template create should redirect to guided app detail: {template_location}"
-    );
-    let redis_root = data_dir.join("apps").join("redis-cache");
-    let redis_compose = tokio::fs::read_to_string(redis_root.join("compose.yaml")).await?;
-    let redis_env = tokio::fs::read_to_string(redis_root.join(".env")).await?;
-    anyhow::ensure!(
-        redis_compose.contains("redis:7-alpine")
-            && redis_compose.contains("${REDIS_PORT:-16379}:6379")
-            && redis_env.contains("REDIS_PORT=16379"),
-        "template-created redis runtime files should be written"
-    );
-    let redis_detail = client
-        .get(format!("{base_url}/apps/2?notice=created"))
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    anyhow::ensure!(
-        redis_detail.contains("redis-cache")
-            && redis_detail.contains("redis:7-alpine")
-            && redis_detail.contains("REDIS_PORT=16379")
-            && redis_detail.contains("/apps/2/compose/up/confirm"),
-        "template-created app detail should render generated compose and first deploy guidance"
-    );
-
     let roles = client
         .get(format!("{base_url}/admin/roles"))
         .send()
@@ -1554,7 +1508,7 @@ async fn run_checks(
             ("csrf_token", csrf_token.as_str()),
             ("role_code", "qa_deployer"),
             ("role_name", "楠屾敹閮ㄧ讲"),
-            ("description", "鐢ㄤ簬 E2E 楠屾敹鐨勮"),
+            ("description", "鐢ㄤ�E2E 楠屾敹鐨勮"),
             ("permission_ids", dashboard_view_permission_id.as_str()),
             ("permission_ids", apps_view_permission_id.as_str()),
         ])
@@ -1632,7 +1586,7 @@ async fn run_checks(
             ("csrf_token", csrf_token.as_str()),
             ("role_code", "log_viewer"),
             ("role_name", "鏃ュ織鍙"),
-            ("description", "鍙兘鏌ョ湅鏈嶅姟鍒楄〃鍜屾湇鍔℃棩"),
+            ("description", "鍙兘鏌ョ湅鏈嶅姟鍒楄〃鍜屾湇鍔℃�"),
             ("permission_ids", dashboard_view_permission_id.as_str()),
             ("permission_ids", apps_view_permission_id.as_str()),
             ("permission_ids", services_view_permission_id.as_str()),
@@ -1652,7 +1606,7 @@ async fn run_checks(
             ("csrf_token", csrf_token.as_str()),
             ("role_code", "logs_action_only"),
             ("role_name", "日志动作权限"),
-            ("description", "只提交日志操作权限，服务端自动补齐页面依赖"),
+            ("description", "只提交日志操作权限，服务端自动补齐页面依�"),
             ("permission_ids", services_logs_permission_id.as_str()),
         ])
         .send()
@@ -1803,7 +1757,7 @@ async fn run_checks(
         .form(&[
             ("csrf_token", csrf_token.as_str()),
             ("username", "rbacviewer"),
-            ("display_name", "鏉冮檺鍙楠屾敹"),
+            ("display_name", "鏉冮檺鍙楠屾�"),
             ("password", LOCAL_TEST_ADMIN_PASSWORD),
             ("role_ids", rbac_viewer_role_id.as_str()),
         ])
@@ -2435,24 +2389,11 @@ async fn run_checks(
     );
     let forbidden_template_create = viewer_client
         .post(format!("{base_url}/templates"))
-        .form(&[
-            (
-                "csrf_token",
-                extract_csrf_token(&viewer_templates)?.as_str(),
-            ),
-            ("template_key", "redis-single"),
-            ("app_key", "forbidden-template"),
-            ("name", "Forbidden Template"),
-            ("description", "nope"),
-            ("work_dir", "/tmp/forbidden-template"),
-            ("port", "16380"),
-            ("target_node_ids", local_node_id.as_str()),
-        ])
         .send()
         .await?;
     anyhow::ensure!(
-        forbidden_template_create.status() == reqwest::StatusCode::FORBIDDEN,
-        "viewer should receive 403 for template creation: {}",
+        forbidden_template_create.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED,
+        "template creation route should be unavailable for every role: {}",
         forbidden_template_create.status()
     );
     let forbidden_config_update = viewer_client
@@ -2913,7 +2854,7 @@ async fn run_checks(
             ),
             ("app_key", "edge-compose"),
             ("name", "Edge SSH Compose"),
-            ("description", "閮ㄧ讲SSH 鑺傜偣Compose 搴旂敤"),
+            ("description", "閮ㄧ讲SSH 鑺傜偣Compose 搴旂�"),
             ("app_type", "compose"),
             ("work_dir", "/opt/easy-deploy/apps/edge-compose"),
             (
@@ -3232,7 +3173,7 @@ async fn run_checks(
             'failed',
             'failed',
             'systemctl restart easy-deploy-worker-bin-blue.service',
-            '鑺傜偣 鏈満鑺傜偣 鏈€氳繃 Caddy 鑳藉姏鎺㈡祴锛屽凡鍚敤鍙嶅悜浠ｇ悊鍒囨祦锛岄妫€闃绘柇閮ㄧ讲',
+            '鑺傜�鏈満鑺傜�鏈€氳�Caddy 鑳藉姏鎺㈡祴锛屽凡鍚敤鍙嶅悜浠ｇ悊鍒囨祦锛岄妫€闃绘柇閮ㄧ讲',
             1,
             'admin',
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
@@ -3259,11 +3200,11 @@ async fn run_checks(
         VALUES (
             ?1,
             ?2,
-            '鏈満鑺傜偣',
+            '鏈満鑺傜�",
             'local',
             'local',
             'failed',
-            '鑺傜偣 鏈満鑺傜偣 鏈€氳繃 Caddy 鑳藉姏鎺㈡祴锛屽凡鍚敤鍙嶅悜浠ｇ悊鍒囨祦锛岄妫€闃绘柇閮ㄧ讲',
+            '鑺傜�鏈満鑺傜�鏈€氳�Caddy 鑳藉姏鎺㈡祴锛屽凡鍚敤鍙嶅悜浠ｇ悊鍒囨祦锛岄妫€闃绘柇閮ㄧ讲',
             0
         )
         "#,
@@ -3612,7 +3553,7 @@ async fn run_checks(
         .form(&[
             ("csrf_token", extract_csrf_token(&apps_for_binary)?.as_str()),
             ("app_key", "worker-bin"),
-            ("name", "Worker 浜岃繘"),
+            ("name", "Worker 浜岃�"),
             ("description", "systemd 绠＄悊鐨勪簩杩涘埗鏈嶅姟"),
             ("app_type", "binary"),
             ("work_dir", binary_target_dir_str.as_str()),
@@ -3668,7 +3609,7 @@ async fn run_checks(
             "worker.example.com",
             binary_caddy_config.as_str(),
             "href=\"/apps/5/binary/restart/confirm\"",
-            "action=\"/apps/5/binary/upload\"",
+            "href=\"/artifacts\"",
         ],
         "binary app detail should render binary configuration",
     )?;
@@ -3783,11 +3724,28 @@ async fn run_checks(
             && binary_app_meta.contains("release_file: \"releases/v1.0.0/release.yaml\""),
         "binary app metadata should include runtime file references"
     );
+    let upload_page = client
+        .get(format!("{base_url}/artifacts"))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    ensure_contains_all(
+        &upload_page,
+        &[
+            "action=\"/artifacts/upload\"",
+            "name=\"app_id\"",
+            "name=\"artifact_file\"",
+        ],
+        "artifacts page should render upload form",
+    )?;
     let upload_binary = client
-        .post(format!("{base_url}/apps/5/binary/upload"))
+        .post(format!("{base_url}/artifacts/upload"))
         .multipart(
             reqwest::multipart::Form::new()
-                .text("csrf_token", extract_csrf_token(&binary_detail)?)
+                .text("csrf_token", extract_csrf_token(&upload_page)?)
+                .text("app_id", "5")
                 .text("artifact_version", "v1.1.0")
                 .text("entry_file", "")
                 .part(
@@ -3819,7 +3777,7 @@ async fn run_checks(
             "ExecStart=",
             &format!("{binary_deploy_dir}/releases/v1.1.0/worker-bin-v1.1.0"),
             "binary/releases/",
-            "/activate",
+            "/deploy",
         ],
         "uploaded binary release should be shown as current",
     )?;
@@ -3912,15 +3870,16 @@ async fn run_checks(
             && empty_artifacts.contains("name=\"status\""),
         "artifacts page should render empty state for unmatched filters"
     );
-    let old_release_path = extract_binary_release_rollback_path(&uploaded_detail, "v1.0.0")?;
+    let old_release_path = extract_binary_release_deploy_path(&uploaded_detail, "v1.0.0")?;
 
-    let mut upload_form_detail = uploaded_detail.clone();
+    let mut upload_form_page = artifacts_page.clone();
     for version in ["v1.2.0", "v1.3.0", "v1.4.0", "v1.5.0"] {
         let upload = client
-            .post(format!("{base_url}/apps/5/binary/upload"))
+            .post(format!("{base_url}/artifacts/upload"))
             .multipart(
                 reqwest::multipart::Form::new()
-                    .text("csrf_token", extract_csrf_token(&upload_form_detail)?)
+                    .text("csrf_token", extract_csrf_token(&upload_form_page)?)
+                    .text("app_id", "5")
                     .text("artifact_version", version)
                     .text("entry_file", "")
                     .part(
@@ -3938,8 +3897,8 @@ async fn run_checks(
             "upload retained binary artifact {version} should redirect: {}",
             upload.status()
         );
-        upload_form_detail = client
-            .get(format!("{base_url}/apps/5"))
+        upload_form_page = client
+            .get(format!("{base_url}/artifacts"))
             .send()
             .await?
             .error_for_status()?
@@ -4048,17 +4007,18 @@ async fn run_checks(
     anyhow::ensure!(
         !config_editor_binary_detail.contains("action=\"/apps/5/binary/upload\"")
             && !config_editor_binary_detail.contains("/binary/releases/")
-            && !config_editor_binary_detail.contains("/activate"),
+            && !config_editor_binary_detail.contains("/deploy"),
         "config editor should not see artifact upload or rollback actions"
     );
     let forbidden_binary_upload = config_editor_client
-        .post(format!("{base_url}/apps/5/binary/upload"))
+        .post(format!("{base_url}/artifacts/upload"))
         .multipart(
             reqwest::multipart::Form::new()
                 .text(
                     "csrf_token",
                     extract_csrf_token(&config_editor_binary_detail)?,
                 )
+                .text("app_id", "5")
                 .text("artifact_version", "v-denied")
                 .text("entry_file", "")
                 .part(
@@ -4111,7 +4071,7 @@ async fn run_checks(
         .await?;
     ensure_contains_all(
         &rollbacker_binary_detail,
-        &["worker-bin", "/binary/releases/", "/activate"],
+        &["worker-bin", "/binary/releases/", "/deploy"],
         "rollbacker should see rollback action",
     )?;
     anyhow::ensure!(
@@ -4121,7 +4081,7 @@ async fn run_checks(
             && !rollbacker_binary_detail.contains("action=\"/apps/5/binary/upload\""),
         "rollbacker should not see app config edit controls"
     );
-    let activate_old = rollbacker_client
+    let deploy_old = rollbacker_client
         .post(format!("{base_url}{old_release_path}"))
         .form(&[(
             "csrf_token",
@@ -4130,20 +4090,20 @@ async fn run_checks(
         .send()
         .await?;
     anyhow::ensure!(
-        activate_old.status() == reqwest::StatusCode::SEE_OTHER,
-        "rollback old binary release should redirect: {}",
-        activate_old.status()
+        deploy_old.status() == reqwest::StatusCode::SEE_OTHER,
+        "deploy old binary release should redirect: {}",
+        deploy_old.status()
     );
-    let activate_old_location = activate_old
+    let deploy_old_location = deploy_old
         .headers()
         .get(reqwest::header::LOCATION)
         .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| anyhow::anyhow!("rollback old binary release redirect missing location"))?;
-    let rollback_task_id = extract_task_id_from_location(activate_old_location)?;
-    let rollback_task_detail = wait_for_task_detail_page(
+        .ok_or_else(|| anyhow::anyhow!("deploy old binary release redirect missing location"))?;
+    let deploy_old_task_id = extract_task_id_from_location(deploy_old_location)?;
+    let deploy_old_task_detail = wait_for_task_detail_page(
         &client,
         &base_url,
-        rollback_task_id,
+        deploy_old_task_id,
         &[
             "v1.0.0",
             "systemctl link",
@@ -4154,11 +4114,11 @@ async fn run_checks(
     )
     .await?;
     anyhow::ensure!(
-        rollback_task_detail.contains("Worker")
-            && rollback_task_detail.contains("Blue/Green")
-            && rollback_task_detail.contains("tone-success")
-            && rollback_task_detail.contains("systemctl daemon-reload"),
-        "rollback binary task detail should show successful completion"
+        deploy_old_task_detail.contains("Worker")
+            && deploy_old_task_detail.contains("Blue/Green")
+            && deploy_old_task_detail.contains("tone-success")
+            && deploy_old_task_detail.contains("systemctl daemon-reload"),
+        "deploy old binary task detail should show successful completion"
     );
     let reactivated_detail = client
         .get(format!("{base_url}/apps/5"))
@@ -4529,8 +4489,8 @@ async fn run_checks(
         .form(&[
             ("csrf_token", extract_csrf_token(&ssh_binary_apps)?.as_str()),
             ("app_key", "edge-bin"),
-            ("name", "Edge SSH 浜岃繘"),
-            ("description", "SSH 鑺傜偣 systemd 绠＄悊鐨勪簩杩涘埗鏈嶅姟"),
+            ("name", "Edge SSH 浜岃�"),
+            ("description", "SSH 鑺傜�systemd 绠＄悊鐨勪簩杩涘埗鏈嶅姟"),
             ("app_type", "binary"),
             ("work_dir", "/opt/easy-deploy/apps/edge-bin"),
             ("compose_content", ""),
@@ -5295,7 +5255,7 @@ async fn run_checks(
         .error_for_status()?
         .text()
         .await?;
-    sqlx::query("UPDATE apps SET status = 'deploying' WHERE id = 1")
+    sqlx::query("UPDATE app_runtime_states SET runtime_status = 'deploying' WHERE app_id = 1")
         .execute(&db)
         .await?;
     let deploying_app_detail = client
@@ -5368,7 +5328,7 @@ async fn run_checks(
         "deploying app should reject duplicate deployment: {}",
         deploying_submit.status()
     );
-    sqlx::query("UPDATE apps SET status = 'running' WHERE id = 1")
+    sqlx::query("UPDATE app_runtime_states SET runtime_status = 'healthy' WHERE app_id = 1")
         .execute(&db)
         .await?;
     let update_to_disabled_node = client
@@ -5379,7 +5339,7 @@ async fn run_checks(
                 extract_csrf_token(&local_app_detail_disabled_node)?.as_str(),
             ),
             ("name", "璁㈠崟鏈嶅姟 Pro"),
-            ("description", "鏇存柊鍚庣殑 Compose 搴旂敤"),
+            ("description", "鏇存柊鍚庣殑 Compose 搴旂�"),
             ("work_dir", "/opt/easy-deploy/apps/orders-api-pro"),
             ("target_node_ids", ssh_node_id.as_str()),
         ])
@@ -5624,7 +5584,7 @@ async fn run_checks(
         .form(&[
             ("csrf_token", extract_csrf_token(&archived_apps)?.as_str()),
             ("app_key", "archived-compose"),
-            ("name", "褰掓。娴嬭瘯搴旂敤"),
+            ("name", "褰掓。娴嬭瘯搴旂�"),
             ("description", "鐢ㄤ簬楠岃瘉搴旂敤杞仠"),
             ("app_type", "compose"),
             ("work_dir", "/opt/easy-deploy/apps/archived-compose"),
@@ -5781,8 +5741,8 @@ async fn run_checks(
         .form(&[
             ("csrf_token", extract_csrf_token(&multi_node_apps)?.as_str()),
             ("app_key", "multi-node-compose"),
-            ("name", "澶氳妭鐐归儴鍒嗗け"),
-            ("description", "楠岃瘉澶辫触鍚庡墿浣欒妭鐐圭姸"),
+            ("name", "澶氳妭鐐归儴鍒嗗�"),
+            ("description", "楠岃瘉澶辫触鍚庡墿浣欒妭鐐圭�"),
             ("app_type", "compose"),
             ("deploy_strategy", "rolling_stop_on_failure"),
             ("work_dir", "/opt/easy-deploy/apps/multi-node-compose"),
@@ -5830,10 +5790,10 @@ async fn run_checks(
         &client,
         &base_url,
         &[
-            "澶氳妭鐐归儴鍒嗗け",
+            "澶氳妭鐐归儴鍒嗗�",
             "local preflight failed before ssh node",
             "鐢熶骇鑺傜偣 A: 鍓嶅簭鑺傜偣澶辫触锛屾湭鎵ц鏈浠诲姟",
-            "澶辫触",
+            "澶辫�",
         ],
     )
     .await?;
@@ -5844,7 +5804,7 @@ async fn run_checks(
         && multi_node_tasks.contains("tone-warning");
     if !multi_node_tasks_stable {
         anyhow::ensure!(
-            multi_node_tasks.contains("鏈満鑺傜偣: Compose 閰嶇疆棰勬澶辫触")
+            multi_node_tasks.contains("鏈満鑺傜� Compose 閰嶇疆棰勬澶辫�")
                 && multi_node_tasks
                     .contains("鐢熶骇鑺傜偣 A: 鍓嶅簭鑺傜偣澶辫触锛屾湭鎵ц鏈浠诲姟"),
             "multi-node failed task should summarize failed and skipped nodes"
@@ -5854,20 +5814,24 @@ async fn run_checks(
         &client,
         &base_url,
         multi_node_task_id,
-        &["鑺傜偣缁撴灉", "澶辫触", "宸茶烦"],
+        &[
+            "local preflight failed before ssh node",
+            "prod-a",
+            "tone-warning",
+        ],
     )
     .await?;
     let multi_node_task_detail_stable = multi_node_task_detail
         .contains("local preflight failed before ssh node")
         && multi_node_task_detail.contains("local · local")
-        && multi_node_task_detail.contains("prod-a · ssh · 0 条命令");
+        && multi_node_task_detail.contains("prod-a · ssh · 0");
     if !multi_node_task_detail_stable {
         anyhow::ensure!(
-            multi_node_task_detail.contains("鏈満鑺傜偣")
+            multi_node_task_detail.contains("鏈満鑺傜�")
                 && multi_node_task_detail.contains("閮ㄧ讲绛栫暐: 婊氬姩閮ㄧ讲锛屽け璐ュ仠")
-                && multi_node_task_detail.contains("local 路 local 路")
+                && multi_node_task_detail.contains("local �local �")
                 && multi_node_task_detail.contains("鐢熶骇鑺傜偣 A")
-                && multi_node_task_detail.contains("prod-a 路 ssh 路 0 鏉″懡")
+                && multi_node_task_detail.contains("prod-a �ssh �0 鏉″懡")
                 && multi_node_task_detail.contains("鍓嶅簭鑺傜偣澶辫触锛屾湭鎵ц鏈浠诲姟"),
             "multi-node task detail should show per-node failed and skipped results"
         );
@@ -5876,11 +5840,11 @@ async fn run_checks(
         &client,
         &format!("{base_url}/apps/8"),
         &[
-            "鏈満鑺傜偣",
-            "寮傚父",
-            "Compose 閰嶇疆棰勬澶辫触",
+            "鏈満鑺傜�",
+            "寮傚�",
+            "Compose 閰嶇疆棰勬澶辫�",
             "鐢熶骇鑺傜偣 A",
-            "鏈煡",
+            "鏈�",
             "鍓嶅簭鑺傜偣澶辫触锛屾湭鎵ц鏈浠诲姟",
         ],
     )
@@ -5892,7 +5856,7 @@ async fn run_checks(
         && multi_node_detail_after.contains(&format!("/services/8/web/logs?node_id={ssh_node_id}"));
     if !multi_node_detail_after_stable {
         anyhow::ensure!(
-        !multi_node_detail_after.contains("鐢熶骇鑺傜偣 A</span>\n                        <strong>\n                          <span class=\"badge tone-active\">閮ㄧ讲/span>")
+        !multi_node_detail_after.contains("鐢熶骇鑺傜偣 A</span>\n                        <strong>\n                          <span class=\"badge tone-active\">閮ㄧ�span>")
             && multi_node_detail_after.contains("鍓嶅簭鑺傜偣澶辫触锛屾湭鎵ц鏈浠诲姟"),
         "unexecuted node should not remain deploying after partial failure"
     );
@@ -5957,20 +5921,20 @@ async fn run_checks(
         && multi_node_services.contains("tone-warning");
     if !multi_node_services_stable {
         anyhow::ensure!(
-            multi_node_services.contains("澶氳妭鐐归儴鍒嗗け")
+            multi_node_services.contains("澶氳妭鐐归儴鍒嗗�")
                 && multi_node_services
                     .contains(&format!("/services/8/web/logs?node_id={local_node_id}"))
                 && multi_node_services
                     .contains(&format!("/services/8/web/logs?node_id={ssh_node_id}"))
-                && multi_node_services.contains("寮傚父 1 路 鏈煡 1")
-                && multi_node_services.contains("鐗堟湰 鏈儴")
+                && multi_node_services.contains("寮傚�1 �鏈�1")
+                && multi_node_services.contains("鐗堟�鏈�")
                 && multi_node_services.contains("鏈満鑺傜偣鏃ュ織")
-                && multi_node_services.contains("鐢熶骇鑺傜偣 A鏃ュ織")
-                && multi_node_services.contains("鏈満鑺傜偣")
+                && multi_node_services.contains("鐢熶骇鑺傜偣 A鏃ュ�")
+                && multi_node_services.contains("鏈満鑺傜�")
                 && multi_node_services.contains("鐢熶骇鑺傜偣 A")
                 && multi_node_services.contains("鍓嶅簭鑺傜偣澶辫触锛屾湭鎵ц鏈浠诲姟")
-                && multi_node_services.contains("绛夊緟棣栨閮ㄧ讲")
-                && multi_node_services.contains("鏌ョ湅骞堕噸锟?")
+                && multi_node_services.contains("绛夊緟棣栨閮ㄧ�")
+                && multi_node_services.contains("鏌ョ湅骞堕噸�")
                 && multi_node_services.contains("鏈€杩戜换锟?")
                 && multi_node_services.contains(&format!("/nodes/{local_node_id}"))
                 && multi_node_services.contains(&format!("/nodes/{ssh_node_id}")),
@@ -6019,8 +5983,8 @@ async fn run_checks(
         && multi_node_local_logs.contains("local multi node log line");
     if !multi_node_local_logs_stable {
         anyhow::ensure!(
-            multi_node_local_logs.contains("澶氳妭鐐归儴鍒嗗け")
-                && multi_node_local_logs.contains("鏈満鑺傜偣")
+            multi_node_local_logs.contains("澶氳妭鐐归儴鍒嗗�")
+                && multi_node_local_logs.contains("鏈満鑺傜�")
                 && multi_node_local_logs.contains("local")
                 && multi_node_local_logs.contains("鍒囨崲鑺傜偣")
                 && multi_node_local_logs
@@ -6028,7 +5992,7 @@ async fn run_checks(
                 && multi_node_local_logs.contains("鑺傜偣鐘讹拷?")
                 && multi_node_local_logs.contains("鏈€杩戠粨锟?")
                 && multi_node_local_logs.contains("鍓嶅簭鑺傜偣澶辫触锛屾湭鎵ц鏈浠诲姟")
-                && multi_node_local_logs.contains("鏌ョ湅骞堕噸锟?")
+                && multi_node_local_logs.contains("鏌ョ湅骞堕噸�")
                 && multi_node_local_logs.contains(&format!("/nodes/{local_node_id}"))
                 && multi_node_local_logs.contains("local multi node log line"),
             "multi-node local service logs should render selected node logs and switcher"
@@ -6077,7 +6041,7 @@ async fn run_checks(
         && multi_node_ssh_logs.contains("ssh multi node log line");
     if !multi_node_ssh_logs_stable {
         anyhow::ensure!(
-            multi_node_ssh_logs.contains("澶氳妭鐐归儴鍒嗗け")
+            multi_node_ssh_logs.contains("澶氳妭鐐归儴鍒嗗�")
                 && multi_node_ssh_logs.contains("鐢熶骇鑺傜偣 A")
                 && multi_node_ssh_logs.contains("prod-a")
                 && multi_node_ssh_logs.contains("鑺傜偣鐘讹拷?")
@@ -6129,8 +6093,8 @@ async fn run_checks(
                 extract_csrf_token(&continue_strategy_apps)?.as_str(),
             ),
             ("app_key", "multi-node-continue"),
-            ("name", "澶氳妭鐐圭户缁儴"),
-            ("description", "楠岃瘉澶辫触缁х画绛栫暐"),
+            ("name", "澶氳妭鐐圭户缁�"),
+            ("description", "楠岃瘉澶辫触缁х画绛栫�"),
             ("app_type", "compose"),
             ("deploy_strategy", "rolling_continue"),
             ("work_dir", "/opt/easy-deploy/apps/multi-node-continue"),
@@ -6205,8 +6169,8 @@ async fn run_checks(
         &[
             "continue strategy local preflight failed",
             "remote deploy still executed",
-            "閮ㄧ讲绛栫暐: 閫愯妭鐐圭户缁紝鏈€缁堟眹鎬诲け",
-            "鏈満鑺傜偣",
+            "閮ㄧ讲绛栫暐: 閫愯妭鐐圭户缁紝鏈€缁堟眹鎬诲�",
+            "鏈満鑺傜�",
             "鐢熶骇鑺傜偣 A",
         ],
     )
@@ -6219,10 +6183,10 @@ async fn run_checks(
         && continue_strategy_task_detail.contains("tone-warning");
     if !continue_strategy_task_detail_stable {
         anyhow::ensure!(
-            continue_strategy_task_detail.contains("鏈満鑺傜偣")
-                && continue_strategy_task_detail.contains("澶辫触")
+            continue_strategy_task_detail.contains("鏈満鑺傜�")
+                && continue_strategy_task_detail.contains("澶辫�")
                 && continue_strategy_task_detail.contains("鐢熶骇鑺傜偣 A")
-                && continue_strategy_task_detail.contains("鎴愬姛")
+                && continue_strategy_task_detail.contains("鎴愬�")
                 && !continue_strategy_task_detail
                     .contains("鍓嶅簭鑺傜偣澶辫触锛屾湭鎵ц鏈浠诲姟"),
             "continue strategy should execute remaining nodes after an earlier node fails"
@@ -6232,10 +6196,10 @@ async fn run_checks(
         &client,
         &format!("{base_url}/apps/9"),
         &[
-            "鏈満鑺傜偣",
-            "寮傚父",
+            "鏈満鑺傜�",
+            "寮傚�",
             "鐢熶骇鑺傜偣 A",
-            "鍋ュ悍",
+            "鍋ュ�",
             &format!("/tasks/{continue_strategy_task_id}"),
         ],
     )
@@ -6280,8 +6244,8 @@ async fn run_checks(
         .form(&[
             ("csrf_token", app_csrf.as_str()),
             ("app_key", "default-dir-compose"),
-            ("name", "榛樿鐩綍搴旂敤"),
-            ("description", "楠岃瘉绌洪儴缃茬洰褰曢粯锟?"),
+            ("name", "榛樿鐩綍搴旂�"),
+            ("description", "楠岃瘉绌洪儴缃茬洰褰曢粯�"),
             ("app_type", "compose"),
             ("deploy_strategy", "rolling_stop_on_failure"),
             ("work_dir", ""),
@@ -6320,7 +6284,7 @@ async fn run_checks(
         && sessions.contains("admin");
     if !sessions_has_current_session {
         anyhow::ensure!(
-            sessions.contains("浼氳瘽绠＄悊") && sessions.contains("绠＄悊"),
+            sessions.contains("浼氳瘽绠＄悊") && sessions.contains("绠＄�"),
             "sessions page did not render current session"
         );
     }
@@ -6329,7 +6293,7 @@ async fn run_checks(
     if !sessions_has_filters {
         anyhow::ensure!(
             sessions.contains("浼氳瘽锟?")
-                && sessions.contains("椋庨櫓")
+                && sessions.contains("椋庨�")
                 && sessions.contains("鏈満"),
             "sessions page should render session filters and risk labels"
         );
@@ -6419,7 +6383,7 @@ async fn run_checks(
         "deploy.compose_up",
         "deploy.binary_restart",
         "artifacts.upload",
-        "services.rollback",
+        "services.deploy",
         "nodes.install",
         "tasks.retry",
         "apps.update",
@@ -6432,13 +6396,13 @@ async fn run_checks(
     .all(|expected| audit_body.contains(expected));
     if !audit_has_expected_actions {
         for expected in [
-            "瀹¤鏃ュ織",
+            "瀹¤鏃ュ�",
             "鏃ュ織锟?",
             "rbac.account_create",
             "deploy.compose_up",
             "deploy.binary_restart",
             "artifacts.upload",
-            "services.rollback",
+            "services.deploy",
             "nodes.install",
             "tasks.retry",
             "apps.update",
@@ -6446,12 +6410,12 @@ async fn run_checks(
             "settings.update",
             "rbac.role_create",
             "rbac.role_permissions",
-            "褰掓。娴嬭瘯搴旂敤 鐘讹拷?鑽夌",
-            "褰掓。娴嬭瘯搴旂敤 鐘讹拷?宸插仠锟?",
+            "褰掓。娴嬭瘯搴旂�鐘讹�鑽夌�",
+            "褰掓。娴嬭瘯搴旂�鐘讹�宸插仠锟?",
             "寰呴儴锟?",
-            "搴旂敤 #1 鍒涘缓 Compose 浠诲姟",
-            "搴旂敤 #5 鍒涘缓浜岃繘鍒朵换锟?",
-            "鑺傜偣 鐢熶骇鑺傜偣 A 鍒涘缓 Docker Engine 瀹夎浠诲姟",
+            "搴旂�#1 鍒涘�Compose 浠诲�",
+            "搴旂�#5 鍒涘缓浜岃繘鍒朵换锟?",
+            "鑺傜�鐢熶骇鑺傜偣 A 鍒涘�Docker Engine 瀹夎浠诲姟",
         ] {
             anyhow::ensure!(
                 audit.contains(expected),
@@ -6460,15 +6424,16 @@ async fn run_checks(
         }
     }
     let rollback_audit = client
-        .get(format!("{base_url}/audit?action=services.rollback"))
+        .get(format!("{base_url}/audit?action=services.deploy&q=v1.0.0"))
         .send()
         .await?
         .error_for_status()?
         .text()
         .await?;
     let rollback_audit_body = html_table_body(&rollback_audit)?;
-    if rollback_audit.contains("value=\"services.rollback\" selected")
-        && rollback_audit_body.contains("services.rollback")
+    if rollback_audit.contains("value=\"services.deploy\" selected")
+        && rollback_audit.contains("value=\"v1.0.0\"")
+        && rollback_audit_body.contains("services.deploy")
         && rollback_audit_body.contains("v1.0.0")
         && !rollback_audit_body.contains("artifacts.upload")
     {
@@ -6476,9 +6441,10 @@ async fn run_checks(
         // do not count as false positives.
     } else {
         anyhow::ensure!(
-            rollback_audit.contains("value=\"services.rollback\" selected")
-                && rollback_audit.contains("鍥炴粴搴旂敤 #5 鍒颁簩杩涘埗鐗堟湰 v1.0.0")
-                && !rollback_audit.contains("涓婁紶浜岃繘鍒跺埗"),
+            rollback_audit.contains("value=\"services.deploy\" selected")
+                && rollback_audit.contains("value=\"v1.0.0\"")
+                && rollback_audit.contains("鍥炴粴搴旂敤 #5 鍒颁簩杩涘埗鐗堟�v1.0.0")
+                && !rollback_audit.contains("涓婁紶浜岃繘鍒跺�"),
             "audit action filter should only show selected action"
         );
     }
@@ -6529,7 +6495,7 @@ async fn run_checks(
         anyhow::ensure!(
             role_create_audit.contains("value=\"rbac.role_create\" selected")
                 && role_create_audit
-                    .contains("鍒涘缓瑙掕壊 楠屾敹閮ㄧ讲 (qa_deployer)锛屽垵濮嬫潈锟?2 锟?"),
+                    .contains("鍒涘缓瑙掕壊 楠屾敹閮ㄧ讲 (qa_deployer)锛屽垵濮嬫潈�2 �"),
             "role create audit filter should show initial permission count"
         );
     }
@@ -6554,7 +6520,7 @@ async fn run_checks(
         anyhow::ensure!(
             account_create_audit.contains("value=\"rbac.account_create\" selected")
                 && account_create_audit
-                    .contains("鍒涘缓璐﹀彿 閮ㄧ讲鐢ㄦ埛 (deployer)锛屽垵濮嬭鑹诧細閮ㄧ讲浜哄憳"),
+                    .contains("鍒涘缓璐﹀�閮ㄧ讲鐢ㄦ埛 (deployer)锛屽垵濮嬭鑹诧細閮ㄧ讲浜哄�"),
             "account create audit filter should show target account and initial roles"
         );
     }
@@ -6579,7 +6545,7 @@ async fn run_checks(
         anyhow::ensure!(
             account_status_audit.contains("value=\"rbac.account_status\" selected")
                 && account_status_audit
-                    .contains("鏇存柊璐﹀彿 閮ㄧ讲鐢ㄦ埛 (deployer) 鐘舵€佷负绂佺敤"),
+                    .contains("鏇存柊璐﹀�閮ㄧ讲鐢ㄦ埛 (deployer) 鐘舵€佷负绂佺敤"),
             "account status audit filter should show target account and next status"
         );
     }
@@ -6602,7 +6568,7 @@ async fn run_checks(
     } else {
         anyhow::ensure!(
             session_revoke_audit.contains("value=\"rbac.session_revoke\" selected")
-                && session_revoke_audit.contains("寮哄埗涓嬬嚎浼氳瘽"),
+                && session_revoke_audit.contains("寮哄埗涓嬬嚎浼氳�"),
             "session revoke audit filter should show revoke action"
         );
     }
@@ -6624,9 +6590,9 @@ async fn run_checks(
     } else {
         anyhow::ensure!(
             task_audit.contains("value=\"task\" selected")
-                && task_audit.contains("搴旂敤 #1 鍒涘缓 Compose 浠诲姟")
-                && task_audit.contains("搴旂敤 #5 鍒涘缓浜岃繘鍒朵换锟?")
-                && !task_audit.contains("鍒涘缓璐﹀彿"),
+                && task_audit.contains("搴旂�#1 鍒涘�Compose 浠诲�")
+                && task_audit.contains("搴旂�#5 鍒涘缓浜岃繘鍒朵换锟?")
+                && !task_audit.contains("鍒涘缓璐﹀�"),
             "audit target filter should only show task target logs"
         );
     }
@@ -6656,9 +6622,9 @@ async fn run_checks(
             anyhow::ensure!(
                 actor_keyword_audit.contains("value=\"admin\"")
                     && actor_keyword_audit.contains("value=\"褰掓。娴嬭瘯搴旂敤\"")
-                    && actor_keyword_audit.contains("褰掓。娴嬭瘯搴旂敤 鐘讹拷?鑽夌")
-                    && actor_keyword_audit.contains("褰掓。娴嬭瘯搴旂敤 鐘讹拷?宸插仠锟?")
-                    && !actor_keyword_audit.contains("搴旂敤 #1 鍒涘缓 Compose 浠诲姟"),
+                    && actor_keyword_audit.contains("褰掓。娴嬭瘯搴旂�鐘讹�鑽夌�")
+                    && actor_keyword_audit.contains("褰掓。娴嬭瘯搴旂�鐘讹�宸插仠锟?")
+                    && !actor_keyword_audit.contains("搴旂�#1 鍒涘�Compose 浠诲�"),
                 "audit actor and keyword filters should narrow logs"
             );
         }
@@ -6850,7 +6816,7 @@ async fn wait_for_task_detail_page(
         if expected_parts.contains(&"鑺傜偣缁撴灉")
             && html.contains("local preflight failed before ssh node")
             && html.contains("prod-a")
-            && html.contains("0 条命令")
+            && html.contains("0 条命�")
         {
             return Ok(html);
         }
@@ -6880,7 +6846,7 @@ async fn wait_for_page(
             return Ok(html);
         }
         if url.contains("/apps/8")
-            && expected_parts.contains(&"Compose 閰嶇疆棰勬澶辫触")
+            && expected_parts.contains(&"Compose 閰嶇疆棰勬澶辫�")
             && html.contains("local")
             && html.contains("prod-a")
             && html.contains("/services/8/web/logs")
@@ -6962,7 +6928,7 @@ fn html_table_row_containing<'a>(html: &'a str, needle: &str) -> anyhow::Result<
     Ok(&html[row_start..row_end])
 }
 
-fn extract_binary_release_rollback_path(html: &str, version: &str) -> anyhow::Result<String> {
+fn extract_binary_release_deploy_path(html: &str, version: &str) -> anyhow::Result<String> {
     let version_start = html
         .find(version)
         .ok_or_else(|| anyhow::anyhow!("binary release version not found: {version}"))?;
@@ -6971,13 +6937,13 @@ fn extract_binary_release_rollback_path(html: &str, version: &str) -> anyhow::Re
     loop {
         let Some(action_start) = tail.find(marker) else {
             return Err(anyhow::anyhow!(
-                "rollback action not found for release {version}"
+                "deploy action not found for release {version}"
             ));
         };
         let rest = &tail[action_start + marker.len()..];
-        let action_end = rest.find('"').ok_or_else(|| {
-            anyhow::anyhow!("rollback action not terminated for release {version}")
-        })?;
+        let action_end = rest
+            .find('"')
+            .ok_or_else(|| anyhow::anyhow!("deploy action not terminated for release {version}"))?;
         let action = &rest[..action_end];
         if action.contains("/binary/releases/") {
             return Ok(action.to_owned());

@@ -45,6 +45,7 @@ pub struct AppRuntimeConfig {
     pub app_id: i64,
     pub name: String,
     pub description: String,
+    pub environment: String,
     pub app_type: String,
     pub deploy_mode: String,
     pub deploy_strategy: String,
@@ -386,6 +387,7 @@ fn render_app_metadata(config: &AppRuntimeConfig, root_dir: &Path) -> String {
     push_yaml_string(&mut output, "app_key", &config.app_key);
     push_yaml_string(&mut output, "name", &config.name);
     push_yaml_string(&mut output, "description", &config.description);
+    push_yaml_string(&mut output, "environment", &config.environment);
     push_yaml_string(&mut output, "app_type", &config.app_type);
     push_yaml_string(&mut output, "deploy_mode", &config.deploy_mode);
     push_yaml_string(&mut output, "deploy_strategy", &config.deploy_strategy);
@@ -775,7 +777,7 @@ fn sanitize_file_name(value: &str) -> Result<String, RuntimeFsError> {
         .and_then(|file_name| file_name.to_str())
         .map(str::trim)
     else {
-        return Err(RuntimeFsError::InvalidInput("制品文件名无效".to_owned()));
+        return Err(RuntimeFsError::InvalidInput("版本包文件名无效".to_owned()));
     };
     if file_name.is_empty()
         || file_name == "."
@@ -785,7 +787,7 @@ fn sanitize_file_name(value: &str) -> Result<String, RuntimeFsError> {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '+' | '@'))
     {
         return Err(RuntimeFsError::InvalidInput(
-            "制品文件名仅支持字母、数字、短横线、下划线、点、加号和 @".to_owned(),
+            "版本包文件名仅支持字母、数字、短横线、下划线、点、加号和 @".to_owned(),
         ));
     }
     Ok(file_name.to_owned())
