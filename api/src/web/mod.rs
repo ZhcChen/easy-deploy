@@ -5236,7 +5236,7 @@ async fn openapi_json() -> impl IntoResponse {
 }
 
 async fn openapi_docs() -> impl IntoResponse {
-    Html(openapi_docs_html())
+    Html(openapi_docs_public_html())
 }
 
 async fn render_api_tokens_page(
@@ -9232,6 +9232,7 @@ fn openapi_spec() -> serde_json::Value {
     })
 }
 
+#[allow(dead_code)]
 fn openapi_docs_html() -> String {
     r###"<!doctype html>
 <html lang="zh-CN">
@@ -9814,6 +9815,1124 @@ orders-api-prod_version_1_2_3.tar.gz</code></pre>
       </div>
     </section>
   </div>
+</body>
+</html>"###
+        .to_owned()
+}
+
+fn openapi_docs_public_html() -> String {
+    r###"<!doctype html>
+<html class="light" lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Easy Deploy OpenAPI 接入文档</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --panel: #ffffff;
+      --border: rgba(199, 196, 215, 0.28);
+      --text: #0d1c2e;
+      --muted: #54647a;
+      --muted-strong: #464554;
+      --primary: #2a14b4;
+      --success: #0f766e;
+      --success-soft: rgba(15, 118, 110, 0.12);
+      --warning: #a16207;
+      --warning-soft: rgba(161, 98, 7, 0.12);
+      --danger: #ba1a1a;
+      --danger-soft: rgba(186, 26, 26, 0.11);
+      --inverse-surface: #233144;
+      --inverse-text: #eaf1ff;
+      --sidebar-surface: rgba(246, 248, 252, 0.96);
+      --sidebar-surface-strong: rgba(255, 255, 255, 0.78);
+      --sidebar-input-surface: #ffffff;
+      --sidebar-border: rgba(224, 230, 239, 0.96);
+      --sidebar-text: #445468;
+      --sidebar-muted: #6b778c;
+      --sidebar-accent: #2f55c7;
+    }
+
+    * { box-sizing: border-box; }
+
+    html,
+    body {
+      margin: 0;
+      height: 100%;
+      min-height: 100%;
+      overflow: hidden;
+      scroll-behavior: smooth;
+    }
+
+    body {
+      background:
+        radial-gradient(circle at top left, rgba(208, 225, 251, 0.42), transparent 24%),
+        linear-gradient(180deg, rgba(255, 255, 255, 0.96) 0%, #f8f9ff 18%, #f8f9ff 100%);
+      color: var(--text);
+      font-family:
+        "Segoe UI",
+        "PingFang SC",
+        "Hiragino Sans GB",
+        "Microsoft YaHei",
+        "Noto Sans CJK SC",
+        sans-serif;
+      line-height: 1.72;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    input { font: inherit; }
+
+    code,
+    pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+
+    .layout-root {
+      display: flex;
+      flex-direction: column;
+      width: 100%;
+      height: 100%;
+    }
+
+    .site-header {
+      position: sticky;
+      top: 0;
+      z-index: 40;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      min-height: 64px;
+      padding: 12px 16px;
+      border-bottom: 1px solid rgba(224, 230, 239, 0.92);
+      background: rgba(255, 255, 255, 0.88);
+      backdrop-filter: blur(20px);
+    }
+
+    .site-header__brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .site-header__logo {
+      width: 40px;
+      height: 40px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 18px;
+      background: var(--primary);
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 800;
+      letter-spacing: 0.18em;
+      flex: none;
+    }
+
+    .site-header__eyebrow {
+      margin: 0 0 2px;
+      color: rgba(84, 100, 122, 0.72);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    .site-header__title {
+      margin: 0;
+      color: var(--text);
+      font-size: 16px;
+      font-weight: 650;
+      line-height: 1.35;
+    }
+
+    .workspace {
+      display: flex;
+      min-height: 0;
+      flex: 1 1 auto;
+      width: 100%;
+    }
+
+    .portal-sidebar {
+      width: 288px;
+      min-width: 288px;
+      height: 100%;
+      min-height: 0;
+      flex: none;
+      border-right: 1px solid var(--sidebar-border);
+      background: var(--sidebar-surface);
+    }
+
+    .portal-sidebar__inner {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      height: 100%;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 24px 16px;
+    }
+
+    .doc-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .doc-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 0 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.86);
+      color: var(--muted-strong);
+      font-size: 12px;
+      font-weight: 700;
+      outline: 1px solid rgba(219, 226, 237, 0.82);
+    }
+
+    .doc-badge--accent {
+      background: rgba(231, 238, 255, 0.9);
+      color: var(--sidebar-accent);
+      outline-color: rgba(47, 85, 199, 0.12);
+    }
+
+    .doc-ref {
+      display: inline-flex;
+      align-items: center;
+      width: max-content;
+      max-width: 100%;
+      min-height: 34px;
+      padding: 0 14px;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.82);
+      color: var(--text);
+      font-size: 13px;
+      outline: 1px solid rgba(219, 226, 237, 0.88);
+      word-break: break-all;
+    }
+
+    .nav-shell {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      min-height: 0;
+      flex: 1 1 auto;
+    }
+
+    .nav-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 0 6px;
+      margin-bottom: 12px;
+    }
+
+    .nav-head__title {
+      color: rgba(96, 108, 126, 0.92);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    .nav-head__count {
+      color: rgba(120, 132, 151, 0.90);
+      font-size: 12px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .portal-search-shell {
+      margin-bottom: 16px;
+      padding: 12px;
+      border-radius: 18px;
+      background: var(--sidebar-surface-strong);
+      outline: 1px solid rgba(223, 229, 238, 0.94);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
+    }
+
+    .portal-search-shell label {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--sidebar-muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .portal-search-input {
+      width: 100%;
+      min-height: 42px;
+      padding: 0 14px;
+      border: 0;
+      border-radius: 14px;
+      background: var(--sidebar-input-surface);
+      color: var(--text);
+      outline: 1px solid rgba(219, 226, 237, 0.88);
+      box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.96),
+        0 10px 20px rgba(114, 130, 153, 0.06);
+    }
+
+    .portal-search-input::placeholder {
+      color: rgba(107, 119, 140, 0.62);
+    }
+
+    .portal-search-input:focus {
+      outline: 2px solid rgba(42, 20, 180, 0.16);
+    }
+
+    .nav-tree {
+      min-height: 0;
+      overflow: auto;
+      padding: 0 6px 12px 0;
+    }
+
+    .nav-tree::-webkit-scrollbar {
+      width: 6px;
+    }
+
+    .nav-tree::-webkit-scrollbar-thumb {
+      border-radius: 999px;
+      background: rgba(146, 157, 177, 0.30);
+    }
+
+    .tree-section + .tree-section {
+      margin-top: 20px;
+    }
+
+    .tree-section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 0 8px;
+      margin-bottom: 6px;
+    }
+
+    .tree-section-title {
+      color: rgba(96, 108, 126, 0.92);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .tree-section-count {
+      color: rgba(120, 132, 151, 0.90);
+      font-size: 11px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .tree-section-body {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .tree-item {
+      display: block;
+      width: 100%;
+      min-height: 38px;
+      padding: 8px 10px 8px 12px;
+      border-radius: 10px;
+      color: var(--sidebar-text);
+      font-size: 13px;
+      line-height: 1.45;
+      text-align: left;
+      transition:
+        background 0.16s ease,
+        color 0.16s ease,
+        box-shadow 0.16s ease;
+    }
+
+    .tree-item:hover {
+      background: rgba(231, 238, 255, 0.48);
+      color: var(--sidebar-accent);
+    }
+
+    .tree-item.active {
+      box-shadow: inset 2px 0 0 var(--sidebar-accent);
+      background: rgba(231, 238, 255, 0.52);
+      color: var(--sidebar-accent);
+    }
+
+    .tree-item__label {
+      display: inline-flex;
+      align-items: center;
+      min-height: 1.2rem;
+      font-weight: 600;
+    }
+
+    .tree-empty {
+      padding: 18px 12px;
+      color: rgba(84, 100, 122, 0.72);
+      font-size: 13px;
+      line-height: 1.8;
+    }
+
+    .doc-main {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      flex: 1 1 auto;
+      overflow-y: auto;
+      background: rgba(255, 255, 255, 0.42);
+    }
+
+    .doc-main__inner {
+      width: min(1120px, 100%);
+      margin: 0 auto;
+      padding: 32px 24px 72px;
+    }
+
+    .doc-hero {
+      margin-bottom: 32px;
+      padding-bottom: 24px;
+      border-bottom: 1px solid rgba(224, 230, 239, 0.88);
+    }
+
+    .doc-title {
+      margin: 0;
+      color: var(--text);
+      font-size: 54px;
+      font-weight: 700;
+      line-height: 1.08;
+    }
+
+    .doc-meta {
+      margin-top: 20px;
+      align-items: center;
+    }
+
+    .doc-lead {
+      margin: 20px 0 0;
+      max-width: 1024px;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.96;
+    }
+
+    .doc-status {
+      margin-bottom: 24px;
+    }
+
+    .callout {
+      border-radius: 12px;
+      padding: 16px 18px;
+      font-size: 14px;
+      line-height: 1.85;
+      outline: 1px solid transparent;
+    }
+
+    .callout ul,
+    .callout ol {
+      margin: 0;
+      padding-left: 20px;
+    }
+
+    .callout.info {
+      background: rgba(208, 225, 251, 0.45);
+      color: var(--primary);
+      outline-color: rgba(42, 20, 180, 0.08);
+    }
+
+    .callout.warning {
+      background: var(--warning-soft);
+      color: var(--warning);
+      outline-color: rgba(161, 98, 7, 0.12);
+    }
+
+    .callout.danger {
+      background: var(--danger-soft);
+      color: var(--danger);
+      outline-color: rgba(186, 26, 26, 0.12);
+    }
+
+    .doc-body {
+      display: flex;
+      flex-direction: column;
+      gap: 72px;
+    }
+
+    .section {
+      margin: 0;
+      scroll-margin-top: 88px;
+    }
+
+    .section-header {
+      margin-bottom: 32px;
+    }
+
+    .section-header h2 {
+      margin: 0 0 12px;
+      color: var(--text);
+      font-size: 24px;
+      line-height: 1.3;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    .section-header p {
+      margin: 0;
+      max-width: 58rem;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.96;
+    }
+
+    .section-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    .section-card {
+      border-radius: 12px;
+      background: var(--panel);
+      outline: 1px solid var(--border);
+    }
+
+    .section-card__body {
+      padding: 16px;
+    }
+
+    .section-card__body > :first-child {
+      margin-top: 0;
+    }
+
+    .section-card__body > :last-child {
+      margin-bottom: 0;
+    }
+
+    .section-card__body p,
+    .section-card__body ul,
+    .section-card__body ol {
+      color: var(--text);
+      font-size: 16px;
+      line-height: 1.92;
+    }
+
+    .section-card__body ul,
+    .section-card__body ol {
+      margin: 0;
+      padding-left: 20px;
+    }
+
+    .section-card__body li + li {
+      margin-top: 8px;
+    }
+
+    .section-card__body code {
+      padding: 2px 6px;
+      border-radius: 6px;
+      background: #eef2ff;
+      color: #1e3a8a;
+      font-size: 13px;
+    }
+
+    .code-shell {
+      overflow: hidden;
+      border-radius: 14px;
+      background: var(--inverse-surface);
+      outline: 1px solid rgba(199, 196, 215, 0.18);
+    }
+
+    .code-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 16px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .code-toolbar-label {
+      color: #c9e6ff;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .code-block {
+      margin: 0;
+      overflow: auto;
+      padding: 18px 20px;
+      color: var(--inverse-text);
+      font-size: 13px;
+      line-height: 1.9;
+      white-space: pre;
+      word-break: normal;
+      tab-size: 2;
+    }
+
+    .table-wrap {
+      overflow: auto;
+      border-radius: 14px;
+      background: var(--panel);
+      outline: 1px solid rgba(199, 196, 215, 0.24);
+    }
+
+    table {
+      width: 100%;
+      min-width: 720px;
+      border-collapse: separate;
+      border-spacing: 0;
+    }
+
+    th,
+    td {
+      padding: 14px 16px;
+      border-bottom: 1px solid rgba(199, 196, 215, 0.18);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: rgba(239, 244, 255, 0.75);
+      color: rgba(84, 100, 122, 0.88);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+    }
+
+    td {
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.78;
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    .endpoint-list {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .endpoint-card {
+      display: grid;
+      grid-template-columns: 92px minmax(0, 1fr);
+      gap: 12px 16px;
+      align-items: start;
+      padding: 18px;
+      border-radius: 16px;
+      background: rgba(248, 250, 255, 0.84);
+      outline: 1px solid rgba(219, 226, 237, 0.84);
+    }
+
+    .endpoint-card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.84;
+      grid-column: 2;
+    }
+
+    .method {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 72px;
+      min-height: 30px;
+      padding: 0 10px;
+      border-radius: 999px;
+      background: rgba(231, 238, 255, 0.90);
+      color: var(--sidebar-accent);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    @media (max-width: 1100px) {
+      .portal-sidebar {
+        width: 260px;
+        min-width: 260px;
+      }
+
+      .doc-title {
+        font-size: 46px;
+      }
+    }
+
+    @media (max-width: 960px) {
+      html,
+      body {
+        overflow: auto;
+      }
+
+      .workspace {
+        display: block;
+      }
+
+      .portal-sidebar {
+        width: 100%;
+        min-width: 0;
+        height: auto;
+        border-right: none;
+        border-bottom: 1px solid var(--sidebar-border);
+      }
+
+      .portal-sidebar__inner {
+        height: auto;
+        overflow: visible;
+      }
+
+      .doc-main {
+        overflow: visible;
+      }
+
+      .doc-main__inner {
+        padding: 28px 16px 48px;
+      }
+
+      .doc-title {
+        font-size: 38px;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .site-header {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+
+      .endpoint-card {
+        grid-template-columns: 1fr;
+      }
+
+      .endpoint-card p {
+        grid-column: 1;
+      }
+
+      table {
+        min-width: 560px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout-root">
+    <header class="site-header">
+      <div class="site-header__brand">
+        <span class="site-header__logo" aria-hidden="true">E</span>
+        <div>
+          <p class="site-header__eyebrow">Easy Deploy 开放接口文档</p>
+          <h1 class="site-header__title">OpenAPI 接入文档</h1>
+        </div>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="portal-sidebar" aria-label="接口文档导航">
+        <div class="portal-sidebar__inner">
+          <section class="nav-shell">
+            <div class="nav-head">
+              <span class="nav-head__title">文档导航</span>
+              <span id="nav-count" class="nav-head__count">0</span>
+            </div>
+            <div class="portal-search-shell">
+              <label for="nav-search">搜索文档</label>
+              <input id="nav-search" class="portal-search-input" type="search" placeholder="搜索章节、接口、字段">
+            </div>
+            <div id="nav-tree" class="nav-tree"></div>
+          </section>
+        </div>
+      </aside>
+
+      <main class="doc-main">
+        <div class="doc-main__inner">
+          <header class="doc-hero">
+            <h1 class="doc-title">Easy Deploy OpenAPI 接入文档</h1>
+            <div class="doc-meta">
+              <span class="doc-badge doc-badge--accent">接口文档</span>
+              <span class="doc-badge">给开发者和 AI 使用</span>
+              <span class="doc-badge">版本包驱动部署</span>
+              <code class="doc-ref">Authorization: Bearer $EASY_DEPLOY_TOKEN</code>
+            </div>
+            <p class="doc-lead">这份文档无需登录即可访问。后台 API Token 页面负责创建调用凭证；业务项目或 AI 只需要保存平台地址、Token、服务标识和版本包路径，就可以自动创建应用、写入配置、上传包并发起部署。</p>
+          </header>
+
+          <section class="doc-status">
+            <div class="callout info">
+              建议 AI 固定使用 <code>service_key</code> 作为服务唯一标识，不要依赖应用 ID。部署时优先读取现有服务配置；不存在时再创建应用。
+            </div>
+          </section>
+
+          <div class="doc-body">
+            <section id="rules" class="section" data-nav-group="快速接入" data-nav-label="AI 执行总规则">
+              <header class="section-header">
+                <h2>AI 执行总规则</h2>
+                <p>给其他项目中的脚本或 AI 使用时，先按统一规则判断应用是否已存在，再决定是创建应用、更新配置，还是上传版本包并触发部署。</p>
+              </header>
+              <div class="section-stack">
+                <div class="section-card"><div class="section-card__body"><ol>
+                  <li>优先使用 <code>service_key</code> 作为服务唯一标识，不要依赖应用 ID。推荐格式：<code>项目名-环境</code>，例如 <code>orders-api-test</code>。</li>
+                  <li>先调用 <code>GET /api/v1/services/{service_key}/app</code>。返回 200 表示已存在；返回 404 才创建应用。</li>
+                  <li>配置属于平台，不要把生产环境变量写死在业务仓库。业务项目只上传版本包，平台保存环境变量、启动参数、目标节点和健康检查等配置。</li>
+                  <li>二进制服务首次创建后，先 <code>PUT /api/v1/services/{service_key}/config</code> 写入运行参数，再上传版本包。</li>
+                  <li>上传版本包后，如需一键部署，使用 <code>auto_deploy=true</code>；否则再调用 <code>POST /api/v1/services/{service_key}/deploy</code>。</li>
+                  <li>部署接口返回 <code>task_id</code> 后，轮询 <code>GET /api/v1/tasks/{task_id}</code>。当任务状态为 <code>success</code>、<code>failed</code> 或 <code>canceled</code> 时停止。</li>
+                </ol></div></div>
+              </div>
+            </section>
+
+            <section id="auth" class="section" data-nav-group="快速接入" data-nav-label="认证">
+              <header class="section-header">
+                <h2>认证</h2>
+                <p>除文档和健康检查外，v1 接口都需要 API Token。建议为每个调用来源单独生成 Token，并填写来源标识方便追责。</p>
+              </header>
+              <div class="section-stack">
+                <div class="section-card"><div class="section-card__body">
+                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">Authorization Header</span></div><pre class="code-block"><code>Authorization: Bearer $EASY_DEPLOY_TOKEN</code></pre></div>
+                  <p>Token 在后台“API Token”页面创建。创建时建议填写来源，例如 <code>orders-api-ci</code>、<code>orders-api-local</code> 或 <code>ai-agent-local</code>。</p>
+                </div></div>
+              </div>
+            </section>
+
+            <section id="fields" class="section" data-nav-group="快速接入" data-nav-label="字段约定">
+              <header class="section-header">
+                <h2>字段约定</h2>
+                <p>先理解下面这些核心字段，再去写创建应用、更新配置和上传版本包的请求，能减少大部分接入错误。</p>
+              </header>
+              <div class="section-stack">
+                <div class="section-card"><div class="section-card__body">
+                  <div class="table-wrap"><table>
+                    <thead><tr><th>字段</th><th>说明</th></tr></thead>
+                    <tbody>
+                      <tr><td><code>service_key</code></td><td>服务唯一标识。创建后不要随意变更。接口路径中的 <code>{service_key}</code> 就是它。</td></tr>
+                      <tr><td><code>environment</code></td><td>固定枚举：<code>production</code> 正式环境，<code>test</code> 测试环境。默认建议用 <code>test</code>。</td></tr>
+                      <tr><td><code>app_type</code></td><td><code>compose</code> 表示 Docker Compose 服务，可不上传版本包直接部署；<code>binary</code> 表示二进制包 + systemd 部署。</td></tr>
+                      <tr><td><code>target_node_keys</code></td><td>目标节点标识数组。未传时默认 <code>["local"]</code>。AI 应优先使用节点 key，而不是节点 ID。</td></tr>
+                      <tr><td><code>deploy_strategy</code></td><td><code>rolling_stop_on_failure</code> 或 <code>rolling_continue</code>。多节点推荐默认 <code>rolling_stop_on_failure</code>。</td></tr>
+                      <tr><td><code>health_check_kind</code></td><td><code>none</code>、<code>compose_running</code>、<code>systemd_active</code>、<code>http</code>、<code>tcp</code>。二进制服务常用 <code>systemd_active</code> 或 <code>http</code>。</td></tr>
+                      <tr><td><code>versionCode</code></td><td>版本排序数字，越大越新。未传时平台会优先从规范包名解析。</td></tr>
+                      <tr><td><code>publishedAt</code></td><td>发布时间，建议 ISO 8601，例如 <code>2026-06-15T10:30:00Z</code>。</td></tr>
+                    </tbody>
+                  </table></div>
+                </div></div>
+              </div>
+            </section>
+
+            <section id="package-name" class="section" data-nav-group="快速接入" data-nav-label="版本包命名规范">
+              <header class="section-header">
+                <h2>版本包命名规范</h2>
+                <p>平台通过包名解析版本号和 service_key。命名不规范时，OpenAPI 接口会直接返回错误，不会登记错误版本。</p>
+              </header>
+              <div class="section-stack">
+                <div class="section-card"><div class="section-card__body">
+                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">Package Name</span></div><pre class="code-block"><code>{service_key}_version_{x_y_z}.tar.gz
+orders-api-prod_version_1_2_3.tar.gz</code></pre></div>
+                  <p>平台会解析出 <code>release_version=1.2.3</code> 和可排序的 <code>versionCode</code>。如果请求里传了 <code>release_version</code>，必须和文件名解析结果一致。</p>
+                  <div class="callout warning">常见错误码：<code>INVALID_PACKAGE_VERSION_NAME</code>、<code>PACKAGE_SERVICE_KEY_MISMATCH</code>、<code>PACKAGE_VERSION_CONFLICT</code>。</div>
+                </div></div>
+              </div>
+            </section>
+
+            <section id="binary-flow" class="section" data-nav-group="推荐流程" data-nav-label="推荐流程：二进制服务">
+              <header class="section-header">
+                <h2>推荐流程：二进制服务</h2>
+                <p>适合 Go、Rust、Java 打包后可直接运行的应用。业务项目负责本地构建 tar.gz，easy-deploy 负责保存配置、同步文件和执行 systemd 操作。</p>
+              </header>
+              <div class="section-stack">
+                <div class="section-card"><div class="section-card__body"><ol>
+                  <li>生成服务标识，例如 <code>orders-api-test</code>。</li>
+                  <li>读取服务：<code>GET /api/v1/services/orders-api-test/app</code>。</li>
+                  <li>如果 404，创建应用：<code>POST /api/v1/apps</code>，<code>app_type</code> 填 <code>binary</code>。</li>
+                  <li>写入或更新配置：<code>PUT /api/v1/services/orders-api-test/config</code>。</li>
+                  <li>业务项目本地构建 tar.gz，按规范命名。</li>
+                  <li>上传版本包：<code>POST /api/v1/services/orders-api-test/packages</code>。</li>
+                  <li>如果上传时没传 <code>auto_deploy=true</code>，再调用部署：<code>POST /api/v1/services/orders-api-test/deploy</code>。</li>
+                  <li>轮询任务详情，读取 <code>steps</code> 和 <code>logs</code>。失败时把失败步骤和关联日志展示给用户。</li>
+                </ol></div></div>
+              </div>
+            </section>
+
+            <section id="compose-flow" class="section" data-nav-group="推荐流程" data-nav-label="推荐流程：Compose 服务">
+              <header class="section-header">
+                <h2>推荐流程：Compose 服务</h2>
+                <p>适合 Redis、Postgres、Nginx 这类不需要业务项目额外打版本包的基础组件，或者只维护 compose 配置的内部服务。</p>
+              </header>
+              <div class="section-stack">
+                <div class="section-card"><div class="section-card__body"><ol>
+                  <li>创建应用时 <code>app_type=compose</code>，写入 <code>compose_content</code> 和 <code>env_content</code>。</li>
+                  <li>Compose 服务不需要版本包。配置确认后直接调用 <code>deploy</code>，action 使用 <code>up</code> 或 <code>restart</code>。</li>
+                  <li>如果只是停止服务，action 使用 <code>down</code>。</li>
+                  <li>同样可以通过任务详情读取步骤输出，排查 compose 渲染、镜像拉取或容器启动失败。</li>
+                </ol></div></div>
+              </div>
+            </section>
+
+            <section id="decision-tree" class="section" data-nav-group="推荐流程" data-nav-label="给其他项目 AI 的最小决策树">
+              <header class="section-header">
+                <h2>给其他项目 AI 的最小决策树</h2>
+                <p>如果是让其他项目里的 AI 直接接入 easy-deploy，这个顺序已经足够覆盖第一次创建、后续更新和失败排查。</p>
+              </header>
+              <div class="section-stack">
+                <div class="section-card"><div class="section-card__body">
+                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">Decision Tree</span></div><pre class="code-block"><code>1. 读取环境变量 EASY_DEPLOY_URL 和 EASY_DEPLOY_TOKEN
+2. 确定 service_key
+3. GET /api/v1/services/{service_key}/app
+4. 若 404，POST /api/v1/apps 创建
+5. PUT /api/v1/services/{service_key}/config 写入或更新运行配置
+6. 若 app_type=compose，POST /deploy action=up 或 restart
+7. 若 app_type=binary，上传 {service_key}_version_x_y_z.tar.gz
+8. 拿到 task_id 后轮询 /api/v1/tasks/{task_id}
+9. 失败时输出 failed step + logs</code></pre></div>
+                </div></div>
+              </div>
+            </section>
+
+            <section id="endpoints" class="section" data-nav-group="接口与示例" data-nav-label="接口清单">
+              <header class="section-header">
+                <h2>接口清单</h2>
+                <p>下面这些是业务项目和 AI 最常用的最小接口集合。第一次接入通常只需要节点读取、应用读取、应用创建、配置更新、版本上传、部署触发和任务轮询。</p>
+              </header>
+              <div class="section-stack">
+                <div class="section-card"><div class="section-card__body"><div class="endpoint-list">
+                  <div class="endpoint-card"><span class="method">GET</span><code>/api/v1/nodes</code><p>读取节点，AI 可用它确认 <code>target_node_keys</code>。</p></div>
+                  <div class="endpoint-card"><span class="method">GET</span><code>/api/v1/services/{service_key}/app</code><p>按服务标识读取应用详情。不存在返回 404。</p></div>
+                  <div class="endpoint-card"><span class="method">POST</span><code>/api/v1/apps</code><p>创建应用和初始部署配置。</p></div>
+                  <div class="endpoint-card"><span class="method">PUT</span><code>/api/v1/services/{service_key}/config</code><p>更新 Compose、环境变量、二进制启动参数和健康检查。</p></div>
+                  <div class="endpoint-card"><span class="method">POST</span><code>/api/v1/services/{service_key}/packages</code><p>上传二进制版本包。支持字段别名：<code>package_file</code>/<code>file</code>/<code>artifact_file</code>、<code>release_version</code>/<code>artifact_version</code>、<code>versionCode</code>/<code>version_code</code>、<code>publishedAt</code>/<code>published_at</code>。</p></div>
+                  <div class="endpoint-card"><span class="method">POST</span><code>/api/v1/services/{service_key}/deploy</code><p>创建部署任务。Compose action：<code>up</code>、<code>down</code>、<code>restart</code>。二进制 action：<code>binary_restart</code>、<code>binary_stop</code>。</p></div>
+                  <div class="endpoint-card"><span class="method">GET</span><code>/api/v1/tasks/{task_id}</code><p>读取任务状态、步骤和日志。<code>logs.step_id</code> 对应 <code>steps.id</code>。</p></div>
+                </div></div></div>
+              </div>
+            </section>
+
+            <section id="create-app" class="section" data-nav-group="接口与示例" data-nav-label="创建二进制应用示例">
+              <header class="section-header">
+                <h2>创建二进制应用示例</h2>
+                <p>第一次创建应用时，建议同时把环境、目标节点、部署策略、systemd 运行参数和健康检查一起写进去。</p>
+              </header>
+              <div class="section-stack">
+                <div class="section-card"><div class="section-card__body">
+                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">POST /api/v1/apps</span></div><pre class="code-block"><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/apps" \
+  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"app_key":"orders-api-test","name":"订单 API 测试","environment":"test","app_type":"binary","target_node_keys":["qfy-sc-test"],"deploy_strategy":"rolling_stop_on_failure","binary_exec_args":"--config /etc/orders-api/config.toml","binary_service_user":"root","binary_unit_name":"orders-api-test.service","health_check_kind":"http","health_endpoint":"http://127.0.0.1:8080/health","health_timeout_secs":5,"health_expected_status":200}'</code></pre></div>
+                </div></div>
+              </div>
+            </section>
+
+            <section id="update-config" class="section" data-nav-group="接口与示例" data-nav-label="更新配置示例">
+              <header class="section-header">
+                <h2>更新配置示例</h2>
+                <p>配置可以独立演进。你可以在不上传新版本包的前提下，先更新环境变量、启动参数或健康检查。</p>
+              </header>
+              <div class="section-stack">
+                <div class="section-card"><div class="section-card__body">
+                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">PUT /api/v1/services/{service_key}/config</span></div><pre class="code-block"><code>curl -X PUT "$EASY_DEPLOY_URL/api/v1/services/orders-api-test/config" \
+  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"env_content":"RUST_LOG=info\nDATABASE_URL=sqlite:///data/orders.db\n","binary_exec_args":"--port 8080","health_check_kind":"http","health_endpoint":"http://127.0.0.1:8080/health"}'</code></pre></div>
+                  <p>注意：更新配置会记录配置版本。不同版本包可以复用同一份配置，也可以在上传新版本包前先更新配置。</p>
+                </div></div>
+              </div>
+            </section>
+
+            <section id="upload-package" class="section" data-nav-group="接口与示例" data-nav-label="上传版本包并自动部署">
+              <header class="section-header">
+                <h2>上传版本包并自动部署</h2>
+                <p>这是业务项目最常用的调用方式：先本地构建包，再通过 multipart 直接传给平台，平台登记版本后顺手触发部署。</p>
+              </header>
+              <div class="section-stack">
+                <div class="section-card"><div class="section-card__body">
+                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">POST /api/v1/services/{service_key}/packages</span></div><pre class="code-block"><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/services/orders-api-test/packages" \
+  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
+  -F "package_file=@./dist/orders-api-test_version_1_2_3.tar.gz" \
+  -F "entry_file=orders-api" \
+  -F "source=local-build" \
+  -F "auto_deploy=true"</code></pre></div>
+                  <p>成功响应会包含 <code>task_id</code>。如果 <code>auto_deploy=false</code> 或不传，则只上传版本包，不创建部署任务。</p>
+                </div></div>
+              </div>
+            </section>
+
+            <section id="deploy" class="section" data-nav-group="接口与示例" data-nav-label="手动触发部署">
+              <header class="section-header">
+                <h2>手动触发部署</h2>
+                <p>如果你想把“上传版本包”和“上线部署”拆开做，可以在版本包已登记后单独调用部署接口。</p>
+              </header>
+              <div class="section-stack">
+                <div class="section-card"><div class="section-card__body">
+                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">POST /api/v1/services/{service_key}/deploy</span></div><pre class="code-block"><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/services/orders-api-test/deploy" \
+  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"binary_restart"}'</code></pre></div>
+                </div></div>
+              </div>
+            </section>
+
+            <section id="task-logs" class="section" data-nav-group="接口与示例" data-nav-label="轮询任务和读取步骤日志">
+              <header class="section-header">
+                <h2>轮询任务和读取步骤日志</h2>
+                <p>部署动作都是异步任务。AI 或脚本拿到 <code>task_id</code> 后，需要继续轮询任务状态，并在失败时读取具体步骤和日志。</p>
+              </header>
+              <div class="section-stack">
+                <div class="section-card"><div class="section-card__body">
+                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">GET /api/v1/tasks/{task_id}</span></div><pre class="code-block"><code>curl -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
+  "$EASY_DEPLOY_URL/api/v1/tasks/123"</code></pre></div>
+                  <p>AI 判断规则：</p>
+                  <ul>
+                    <li><code>data.task.status=queued/running</code>：继续等待，建议 2 秒后重试。</li>
+                    <li><code>success</code>：部署完成。</li>
+                    <li><code>failed</code>：读取 <code>steps</code> 里 status 为 <code>failed</code> 的步骤，再用 <code>logs.step_id</code> 过滤相关日志，给用户展示失败命令和输出。</li>
+                  </ul>
+                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">Failed Task Example</span></div><pre class="code-block"><code>{"data":{"task":{"id":123,"status":"failed","summary":"远程 systemctl daemon-reload 失败"},"steps":[{"id":9,"step_no":3,"title":"准备 orders-node-1 的二进制运行文件","status":"failed","command":"sync runtime files && systemctl link && daemon-reload","exit_code":1}],"logs":[{"id":41,"step_id":9,"stream":"system","content":"systemctl daemon-reload · 退出码 1"},{"id":42,"step_id":9,"stream":"combined","content":"Failed to reload daemon"}]}}</code></pre></div>
+                </div></div>
+              </div>
+            </section>
+
+            <section id="errors" class="section" data-nav-group="接口与示例" data-nav-label="错误处理">
+              <header class="section-header">
+                <h2>错误处理</h2>
+                <p>下面这些错误码是业务项目和 AI 在接入时最容易碰到的几类，建议把它们纳入自动提示和重试策略。</p>
+              </header>
+              <div class="section-stack">
+                <div class="section-card"><div class="section-card__body">
+                  <div class="callout danger"><ul>
+                    <li>401/403：Token 无效或权限不足。请让用户在后台创建或调整 API Token。</li>
+                    <li>404：服务不存在。AI 可以在确认 <code>service_key</code> 正确后创建应用。</li>
+                    <li>400 且 <code>code=INVALID_PACKAGE_VERSION_NAME</code>：版本包命名不符合规范，重新打包命名。</li>
+                    <li>400 且 <code>code=PACKAGE_SERVICE_KEY_MISMATCH</code>：包名里的 <code>service_key</code> 和接口路径不一致。</li>
+                    <li>400 且 <code>code=PACKAGE_VERSION_CONFLICT</code>：请求传入版本和包名解析版本不一致。</li>
+                  </ul></div>
+                </div></div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+      const sections = Array.from(document.querySelectorAll(".section"));
+      const navTree = document.getElementById("nav-tree");
+      const navCount = document.getElementById("nav-count");
+      const navSearch = document.getElementById("nav-search");
+      const docMain = document.querySelector(".doc-main");
+
+      if (!sections.length || !navTree || !navCount || !navSearch || !docMain) {
+        return;
+      }
+
+      const groups = [];
+      const groupMap = new Map();
+
+      sections.forEach((section) => {
+        const id = section.id;
+        const group = section.dataset.navGroup || "未分组";
+        const label = section.dataset.navLabel || id;
+        const item = { id, group, label };
+        if (!groupMap.has(group)) {
+          const nextGroup = { name: group, items: [] };
+          groupMap.set(group, nextGroup);
+          groups.push(nextGroup);
+        }
+        groupMap.get(group).items.push(item);
+      });
+
+      const navLinks = [];
+
+      function renderTree(filterText) {
+        const keyword = filterText.trim().toLowerCase();
+        navTree.innerHTML = "";
+        navLinks.length = 0;
+        let visibleCount = 0;
+
+        groups.forEach((group) => {
+          const items = group.items.filter((item) => {
+            if (!keyword) {
+              return true;
+            }
+            return item.label.toLowerCase().includes(keyword) || item.id.toLowerCase().includes(keyword);
+          });
+
+          if (!items.length) {
+            return;
+          }
+
+          const sectionEl = document.createElement("section");
+          sectionEl.className = "tree-section";
+
+          const head = document.createElement("div");
+          head.className = "tree-section-head";
+          head.innerHTML = '<span class="tree-section-title"></span><span class="tree-section-count"></span>';
+          head.querySelector(".tree-section-title").textContent = group.name;
+          head.querySelector(".tree-section-count").textContent = String(items.length);
+          sectionEl.appendChild(head);
+
+          const body = document.createElement("div");
+          body.className = "tree-section-body";
+
+          items.forEach((item) => {
+            const link = document.createElement("a");
+            link.className = "tree-item";
+            link.href = `#${item.id}`;
+            link.dataset.target = item.id;
+            link.innerHTML = '<span class="tree-item__label"></span>';
+            link.querySelector(".tree-item__label").textContent = item.label;
+            body.appendChild(link);
+            navLinks.push(link);
+            visibleCount += 1;
+          });
+
+          sectionEl.appendChild(body);
+          navTree.appendChild(sectionEl);
+        });
+
+        if (visibleCount === 0) {
+          const empty = document.createElement("div");
+          empty.className = "tree-empty";
+          empty.textContent = "没有匹配的章节。";
+          navTree.appendChild(empty);
+        }
+
+        navCount.textContent = String(visibleCount);
+        syncActiveLink();
+      }
+
+      function syncActiveLink() {
+        const current = sections.find((section) => {
+          const rect = section.getBoundingClientRect();
+          return rect.top <= 180 && rect.bottom >= 180;
+        }) || sections[0];
+
+        navLinks.forEach((link) => {
+          link.classList.toggle("active", current && link.dataset.target === current.id);
+        });
+      }
+
+      navSearch.addEventListener("input", () => {
+        renderTree(navSearch.value);
+      });
+
+      docMain.addEventListener("scroll", syncActiveLink, { passive: true });
+      window.addEventListener("hashchange", syncActiveLink);
+
+      renderTree("");
+    })();
+  </script>
 </body>
 </html>"###
         .to_owned()
