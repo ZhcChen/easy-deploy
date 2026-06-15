@@ -9233,152 +9233,600 @@ fn openapi_spec() -> serde_json::Value {
 }
 
 fn openapi_docs_html() -> String {
-    concat!(
-        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">"#,
-        r#"<meta name="viewport" content="width=device-width, initial-scale=1">"#,
-        r#"<title>Easy Deploy OpenAPI 接入文档</title>"#,
-        r#"<style>
-body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#f6f7f9;color:#172033;line-height:1.68}
-header{background:#101828;color:#fff;padding:32px 22px}
-header div,main{max-width:1120px;margin:0 auto}
-header p{max-width:820px;color:#d0d5dd}
-main{padding:22px;display:grid;gap:16px}
-section{background:#fff;border:1px solid #dfe4ec;border-radius:8px;padding:20px}
-h1,h2,h3{line-height:1.25;margin:0 0 10px}
-p,ul,ol{margin-top:0}
-li{margin:4px 0}
-code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
-code{background:#eef2f7;border-radius:4px;padding:2px 5px}
-pre{background:#101828;color:#e5e7eb;padding:14px;border-radius:8px;overflow:auto}
-pre code{background:transparent;color:inherit;padding:0}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
-.note{border-left:4px solid #3154d4;background:#f5f7ff}
-.danger{border-left:4px solid #d92d20;background:#fff8f7}
-.endpoint{display:grid;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid #edf0f4}
-.method{font-weight:700;color:#3154d4}
-table{width:100%;border-collapse:collapse;font-size:14px}
-th,td{padding:9px 10px;border-bottom:1px solid #edf0f4;text-align:left;vertical-align:top}
-th{color:#475467;background:#f8fafc}
-a{color:#3154d4}
-</style></head><body><header><div><h1>Easy Deploy OpenAPI 接入文档</h1>"#,
-        r#"<p>面向开发者、CI 脚本和其他项目中的 AI。AI 读取本文后，应能完成：识别服务、创建应用、写入部署配置、上传版本包、触发部署、轮询任务和定位失败步骤。</p>"#,
-        r#"<p>OpenAPI JSON: <a href="/openapi.json">/openapi.json</a></p></div></header><main>"#,
-        r#"<section class="note"><h2>AI 执行总规则</h2><ol>"#,
-        r#"<li>优先使用 <code>service_key</code> 作为服务唯一标识，不要依赖应用 ID。推荐格式：<code>项目名-环境</code>，例如 <code>orders-api-test</code>。</li>"#,
-        r#"<li>先调用 <code>GET /api/v1/services/{service_key}/app</code>。返回 200 表示已存在；返回 404 才创建应用。</li>"#,
-        r#"<li>配置属于平台，不要把生产环境变量写死在业务仓库。业务项目只上传版本包，平台保存环境变量、启动参数、目标节点、健康检查等配置。</li>"#,
-        r#"<li>二进制服务首次创建后，先 <code>PUT /api/v1/services/{service_key}/config</code> 写入运行参数，再上传版本包。</li>"#,
-        r#"<li>上传版本包后，如需一键部署，使用 <code>auto_deploy=true</code>；否则再调用 <code>POST /api/v1/services/{service_key}/deploy</code>。</li>"#,
-        r#"<li>部署接口返回 <code>task_id</code> 后，轮询 <code>GET /api/v1/tasks/{task_id}</code>。当任务状态为 <code>success</code>、<code>failed</code> 或 <code>canceled</code> 时停止。</li>"#,
-        r#"</ol></section>"#,
-        r#"<section><h2>认证</h2><p>除文档和健康检查外，v1 接口都需要 API Token。</p>"#,
-        r#"<pre><code>Authorization: Bearer $EASY_DEPLOY_TOKEN</code></pre>"#,
-        r#"<p>Token 在后台「API Token」页面创建。创建时填写来源，例如 <code>orders-api-ci</code> 或 <code>ai-agent-local</code>，方便后续追责。</p></section>"#,
-        r#"<section><h2>字段约定</h2><table><thead><tr><th>字段</th><th>说明</th></tr></thead><tbody>"#,
-        r#"<tr><td><code>service_key</code></td><td>服务唯一标识。创建后不要随意变更。接口路径中的 <code>{service_key}</code> 就是它。</td></tr>"#,
-        r#"<tr><td><code>environment</code></td><td>固定枚举：<code>production</code> 正式环境，<code>test</code> 测试环境。默认建议用 <code>test</code>。</td></tr>"#,
-        r#"<tr><td><code>app_type</code></td><td><code>compose</code> 表示 Docker Compose 服务，可不上传版本包直接部署；<code>binary</code> 表示二进制包 + systemd 部署。</td></tr>"#,
-        r#"<tr><td><code>target_node_keys</code></td><td>目标节点标识数组。未传时默认 <code>[&quot;local&quot;]</code>。AI 应优先使用节点 key，而不是节点 ID。</td></tr>"#,
-        r#"<tr><td><code>deploy_strategy</code></td><td><code>rolling_stop_on_failure</code> 或 <code>rolling_continue</code>。多节点推荐默认 <code>rolling_stop_on_failure</code>。</td></tr>"#,
-        r#"<tr><td><code>health_check_kind</code></td><td><code>none</code>、<code>compose_running</code>、<code>systemd_active</code>、<code>http</code>、<code>tcp</code>。二进制服务常用 <code>systemd_active</code> 或 <code>http</code>。</td></tr>"#,
-        r#"<tr><td><code>versionCode</code></td><td>版本排序数字，越大越新。未传时平台会优先从规范包名解析。</td></tr>"#,
-        r#"<tr><td><code>publishedAt</code></td><td>发布时间，建议 ISO 8601，例如 <code>2026-06-15T10:30:00Z</code>。</td></tr>"#,
-        r#"</tbody></table></section>"#,
-        r#"<section><h2>版本包命名规范</h2><p>二进制版本包必须按服务名和版本命名，否则平台会返回明确错误。</p>"#,
-        r#"<pre><code>{service_key}_version_{x_y_z}.tar.gz"#,
-        "\n",
-        r#"orders-api-prod_version_1_2_3.tar.gz</code></pre>"#,
-        r#"<p>平台会解析出 <code>release_version=1.2.3</code> 和可排序的 <code>versionCode</code>。如果请求里传了 <code>release_version</code>，必须和文件名解析结果一致。</p>"#,
-        r#"<p>常见错误码：<code>INVALID_PACKAGE_VERSION_NAME</code>、<code>PACKAGE_SERVICE_KEY_MISMATCH</code>、<code>PACKAGE_VERSION_CONFLICT</code>。</p></section>"#,
-        r#"<section><h2>推荐流程：二进制服务</h2><ol>"#,
-        r#"<li>生成服务标识，例如 <code>orders-api-test</code>。</li>"#,
-        r#"<li>读取服务：<code>GET /api/v1/services/orders-api-test/app</code>。</li>"#,
-        r#"<li>如果 404，创建应用：<code>POST /api/v1/apps</code>，<code>app_type</code> 填 <code>binary</code>。</li>"#,
-        r#"<li>写入或更新配置：<code>PUT /api/v1/services/orders-api-test/config</code>。</li>"#,
-        r#"<li>业务项目本地构建 tar.gz，按规范命名。</li>"#,
-        r#"<li>上传版本包：<code>POST /api/v1/services/orders-api-test/packages</code>。</li>"#,
-        r#"<li>如果上传时没有 <code>auto_deploy=true</code>，再调用部署：<code>POST /api/v1/services/orders-api-test/deploy</code>。</li>"#,
-        r#"<li>轮询任务详情，读取 <code>steps</code> 和 <code>logs</code>。失败时把失败步骤和关联日志展示给用户。</li>"#,
-        r#"</ol></section>"#,
-        r#"<section><h2>推荐流程：Compose 服务</h2><ol>"#,
-        r#"<li>适合 Redis、Postgres、Nginx 或只有 compose 配置的服务。</li>"#,
-        r#"<li>创建应用时 <code>app_type=compose</code>，写入 <code>compose_content</code> 和 <code>env_content</code>。</li>"#,
-        r#"<li>Compose 服务不需要版本包。配置确认后直接调用 <code>deploy</code>，action 使用 <code>up</code> 或 <code>restart</code>。</li>"#,
-        r#"<li>如果只是停止服务，action 使用 <code>down</code>。</li>"#,
-        r#"</ol></section>"#,
-        r#"<section><h2>接口清单</h2><div class="endpoint"><span class="method">GET</span><code>/api/v1/nodes</code><p>读取节点，AI 可用它确认 <code>target_node_keys</code>。</p></div>"#,
-        r#"<div class="endpoint"><span class="method">GET</span><code>/api/v1/services/{service_key}/app</code><p>按服务标识读取应用详情。不存在返回 404。</p></div>"#,
-        r#"<div class="endpoint"><span class="method">POST</span><code>/api/v1/apps</code><p>创建应用和初始部署配置。</p></div>"#,
-        r#"<div class="endpoint"><span class="method">PUT</span><code>/api/v1/services/{service_key}/config</code><p>更新 Compose、环境变量、二进制启动参数、健康检查、Blue/Green 配置。</p></div>"#,
-        r#"<div class="endpoint"><span class="method">POST</span><code>/api/v1/services/{service_key}/packages</code><p>上传二进制版本包。支持字段别名：<code>package_file</code>/<code>file</code>/<code>artifact_file</code>，<code>release_version</code>/<code>artifact_version</code>，<code>versionCode</code>/<code>version_code</code>，<code>publishedAt</code>/<code>published_at</code>。</p></div>"#,
-        r#"<div class="endpoint"><span class="method">POST</span><code>/api/v1/services/{service_key}/deploy</code><p>创建部署任务。Compose action：<code>up</code>、<code>down</code>、<code>restart</code>。二进制 action：<code>binary_restart</code>、<code>binary_stop</code>。</p></div>"#,
-        r#"<div class="endpoint"><span class="method">GET</span><code>/api/v1/tasks/{task_id}</code><p>读取任务状态、步骤和日志。<code>logs.step_id</code> 对应 <code>steps.id</code>。</p></div></section>"#,
-        r#"<section><h2>创建二进制应用示例</h2><pre><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/apps" \"#,
-        "\n",
-        r#"  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \"#,
-        "\n",
-        r#"  -H "Content-Type: application/json" \"#,
-        "\n",
-        r#"  -d '{"app_key":"orders-api-test","name":"订单 API 测试","environment":"test","app_type":"binary","target_node_keys":["qfy-sc-test"],"deploy_strategy":"rolling_stop_on_failure","binary_exec_args":"--config /etc/orders-api/config.toml","binary_service_user":"root","binary_unit_name":"orders-api-test.service","health_check_kind":"http","health_endpoint":"http://127.0.0.1:8080/health","health_timeout_secs":5,"health_expected_status":200}'</code></pre></section>"#,
-        r#"<section><h2>更新配置示例</h2><pre><code>curl -X PUT "$EASY_DEPLOY_URL/api/v1/services/orders-api-test/config" \"#,
-        "\n",
-        r#"  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \"#,
-        "\n",
-        r#"  -H "Content-Type: application/json" \"#,
-        "\n",
-        r#"  -d '{"env_content":"RUST_LOG=info\nDATABASE_URL=sqlite:///data/orders.db\n","binary_exec_args":"--port 8080","health_check_kind":"http","health_endpoint":"http://127.0.0.1:8080/health"}'</code></pre>"#,
-        r#"<p>注意：更新配置会记录配置版本。不同版本包可以复用同一份配置，也可以在上传新版本包前先更新配置。</p></section>"#,
-        r#"<section><h2>上传版本包并自动部署</h2><pre><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/services/orders-api-test/packages" \"#,
-        "\n",
-        r#"  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \"#,
-        "\n",
-        r#"  -F "package_file=@./dist/orders-api-test_version_1_2_3.tar.gz" \"#,
-        "\n",
-        r#"  -F "entry_file=orders-api" \"#,
-        "\n",
-        r#"  -F "source=local-build" \"#,
-        "\n",
-        r#"  -F "auto_deploy=true"</code></pre>"#,
-        r#"<p>成功响应会包含 <code>task_id</code>。如果 <code>auto_deploy=false</code> 或不传，则只上传版本包，不创建部署任务。</p></section>"#,
-        r#"<section><h2>手动触发部署</h2><pre><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/services/orders-api-test/deploy" \"#,
-        "\n",
-        r#"  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \"#,
-        "\n",
-        r#"  -H "Content-Type: application/json" \"#,
-        "\n",
-        r#"  -d '{"action":"binary_restart"}'</code></pre></section>"#,
-        r#"<section><h2>轮询任务和读取步骤日志</h2><pre><code>curl -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \"#,
-        "\n",
-        r#"  "$EASY_DEPLOY_URL/api/v1/tasks/123"</code></pre>"#,
-        r#"<p>AI 判断规则：</p><ul><li><code>data.task.status=queued/running</code>：继续等待，建议 2 秒后重试。</li><li><code>success</code>：部署完成。</li><li><code>failed</code>：读取 <code>steps</code> 中 status 为 <code>failed</code> 的步骤，再用 <code>logs.step_id</code> 过滤相关日志，给用户展示失败命令和输出。</li></ul>"#,
-        r#"<pre><code>{"data":{"task":{"id":123,"status":"failed","summary":"远程 systemctl daemon-reload 失败"},"steps":[{"id":9,"step_no":3,"title":"准备 orders-node-1 的二进制运行文件","status":"failed","command":"sync runtime files && systemctl link && daemon-reload","exit_code":1}],"logs":[{"id":41,"step_id":9,"stream":"system","content":"systemctl daemon-reload · 退出码 1"},{"id":42,"step_id":9,"stream":"combined","content":"Failed to reload daemon"}]}}</code></pre></section>"#,
-        r#"<section class="danger"><h2>错误处理</h2><ul>"#,
-        r#"<li>401/403：Token 无效或权限不足。请让用户在后台创建或调整 API Token。</li>"#,
-        r#"<li>404：服务不存在。AI 可以在确认 service_key 正确后创建应用。</li>"#,
-        r#"<li>400 且 code 为 <code>INVALID_PACKAGE_VERSION_NAME</code>：版本包命名不符合规范，重新打包命名。</li>"#,
-        r#"<li>400 且 code 为 <code>PACKAGE_SERVICE_KEY_MISMATCH</code>：包名里的 service_key 和接口路径不一致。</li>"#,
-        r#"<li>400 且 code 为 <code>PACKAGE_VERSION_CONFLICT</code>：请求传入版本和包名解析版本不一致。</li>"#,
-        r#"</ul></section>"#,
-        r#"<section><h2>给其他项目 AI 的最小决策树</h2><pre><code>1. 读取环境变量 EASY_DEPLOY_URL 和 EASY_DEPLOY_TOKEN"#,
-        "\n",
-        r#"2. 确定 service_key"#,
-        "\n",
-        r#"3. GET /api/v1/services/{service_key}/app"#,
-        "\n",
-        r#"4. 若 404，POST /api/v1/apps 创建"#,
-        "\n",
-        r#"5. PUT /api/v1/services/{service_key}/config 写入或更新运行配置"#,
-        "\n",
-        r#"6. 若 app_type=compose，POST /deploy action=up 或 restart"#,
-        "\n",
-        r#"7. 若 app_type=binary，上传 {service_key}_version_x_y_z.tar.gz"#,
-        "\n",
-        r#"8. 拿到 task_id 后轮询 /api/v1/tasks/{task_id}"#,
-        "\n",
-        r#"9. 失败时输出 failed step + logs</code></pre></section>"#,
-        r#"</main></body></html>"#
-    )
-    .to_owned()
+    r###"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Easy Deploy OpenAPI 接入文档</title>
+  <style>
+    :root {
+      --ed-bg: #f5f7fb;
+      --ed-panel: #ffffff;
+      --ed-border: #eef0f3;
+      --ed-border-strong: #dbe2ea;
+      --ed-text: #172033;
+      --ed-muted: #64748b;
+      --ed-strong: #334155;
+      --ed-accent: #3154d4;
+      --ed-accent-soft: #eef4ff;
+      --ed-danger: #d92d20;
+      --ed-danger-soft: #fff6f4;
+      --ed-code: #111827;
+      --ed-radius: 8px;
+      --ed-shadow: 0 18px 48px rgba(15, 23, 42, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--ed-bg);
+      color: var(--ed-text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.68;
+    }
+
+    a { color: var(--ed-accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    h1, h2, h3 { margin: 0; line-height: 1.25; color: #0f172a; }
+    h1 { font-size: 22px; letter-spacing: 0; }
+    h2 { font-size: 20px; }
+    h3 { font-size: 15px; }
+    p, ul, ol { margin-top: 0; }
+    li { margin: 5px 0; }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+    }
+    code {
+      padding: 2px 6px;
+      border-radius: 5px;
+      background: #eef2f7;
+      color: #1e293b;
+    }
+    pre {
+      margin: 12px 0 0;
+      padding: 14px 16px;
+      overflow: auto;
+      border-radius: var(--ed-radius);
+      background: var(--ed-code);
+      color: #e5e7eb;
+      line-height: 1.6;
+    }
+    pre code {
+      padding: 0;
+      border-radius: 0;
+      background: transparent;
+      color: inherit;
+      font-size: inherit;
+    }
+
+    .openapi-docs-page {
+      width: 100%;
+      min-height: 100vh;
+      padding: 24px;
+    }
+    .openapi-docs-embed {
+      width: min(1440px, 100%);
+      margin: 0 auto;
+    }
+    .openapi-docs-embed__shell {
+      overflow: hidden;
+      border: 1px solid var(--ed-border);
+      border-radius: var(--ed-radius);
+      background: var(--ed-panel);
+      box-shadow: var(--ed-shadow);
+    }
+    .openapi-docs-embed__toolbar {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--ed-border);
+      background: #ffffff;
+    }
+    .openapi-docs-embed__title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 6px;
+    }
+    .openapi-docs-embed__mark {
+      width: 28px;
+      height: 28px;
+      display: inline-grid;
+      place-items: center;
+      border-radius: 6px;
+      background: linear-gradient(135deg, #111827 0%, #3154d4 58%, #0ea5e9 100%);
+      color: #ffffff;
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .openapi-docs-embed__tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 2px 8px;
+      border: 1px solid #dbeafe;
+      border-radius: 5px;
+      background: #eff6ff;
+      color: #1d4ed8;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .openapi-docs-embed__summary {
+      max-width: 860px;
+      margin: 0;
+      color: var(--ed-muted);
+      font-size: 14px;
+    }
+    .openapi-docs-embed__actions {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
+      flex: none;
+    }
+    .openapi-docs-embed__button {
+      min-height: 34px;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 12px;
+      border: 1px solid var(--ed-border-strong);
+      border-radius: 6px;
+      background: #ffffff;
+      color: #334155;
+      font-size: 13px;
+      font-weight: 650;
+      text-decoration: none;
+    }
+    .openapi-docs-embed__button:hover {
+      border-color: #b8c2d2;
+      background: #f8fafc;
+      text-decoration: none;
+    }
+    .openapi-docs-embed__button--primary {
+      border-color: var(--ed-accent);
+      background: var(--ed-accent);
+      color: #ffffff;
+    }
+    .openapi-docs-embed__button--primary:hover {
+      background: #2444bd;
+      color: #ffffff;
+    }
+    .openapi-docs-embed__layout {
+      display: grid;
+      grid-template-columns: 300px minmax(0, 1fr);
+      gap: 16px;
+      min-height: min(760px, calc(100vh - 210px));
+      padding: 16px;
+      background: #fbfcfe;
+    }
+    .openapi-docs-embed__nav,
+    .openapi-docs-embed__content {
+      min-height: 0;
+      border: 1px solid var(--ed-border);
+      border-radius: var(--ed-radius);
+      background: #ffffff;
+    }
+    .openapi-docs-embed__nav {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .openapi-docs-embed__navHead {
+      flex: none;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--ed-border);
+      color: var(--ed-strong);
+      font-weight: 700;
+    }
+    .openapi-docs-embed__tree {
+      flex: 1 1 auto;
+      min-height: 0;
+      margin: 0;
+      padding: 10px 8px 12px;
+      overflow: auto;
+      list-style: none;
+    }
+    .openapi-docs-embed__tree ul {
+      margin: 4px 0 8px 0;
+      padding-left: 12px;
+      list-style: none;
+    }
+    .openapi-docs-embed__tree li { margin: 0; }
+    .openapi-docs-embed__treeSection {
+      display: block;
+      padding: 8px 8px 5px;
+      color: var(--ed-strong);
+      cursor: default;
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .openapi-docs-embed__tree a {
+      display: block;
+      padding: 7px 8px;
+      border-radius: 6px;
+      color: #475569;
+      font-size: 13px;
+      text-decoration: none;
+    }
+    .openapi-docs-embed__tree a:hover {
+      background: #f1f5f9;
+      color: #0f172a;
+    }
+    .openapi-docs-embed__content {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .openapi-docs-embed__description {
+      flex: none;
+      margin: 0;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--ed-border);
+      color: #475569;
+      font-size: 14px;
+    }
+    .openapi-docs-embed__article {
+      flex: 1 1 auto;
+      min-height: 0;
+      padding: 18px;
+      overflow: auto;
+      background: #ffffff;
+    }
+    .openapi-docs-embed__section {
+      padding: 18px 0;
+      border-top: 1px solid var(--ed-border);
+      scroll-margin-top: 18px;
+    }
+    .openapi-docs-embed__section:first-child {
+      padding-top: 0;
+      border-top: 0;
+    }
+    .openapi-docs-embed__section > p:last-child,
+    .openapi-docs-embed__section > ul:last-child,
+    .openapi-docs-embed__section > ol:last-child {
+      margin-bottom: 0;
+    }
+    .openapi-docs-embed__callout {
+      margin-top: 12px;
+      padding: 14px 16px;
+      border: 1px solid #dbeafe;
+      border-left: 4px solid var(--ed-accent);
+      border-radius: var(--ed-radius);
+      background: var(--ed-accent-soft);
+    }
+    .openapi-docs-embed__callout--danger {
+      border-color: #fee4df;
+      border-left-color: var(--ed-danger);
+      background: var(--ed-danger-soft);
+    }
+    .openapi-docs-embed__grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .openapi-docs-embed__metric {
+      min-height: 86px;
+      padding: 14px;
+      border: 1px solid var(--ed-border);
+      border-radius: var(--ed-radius);
+      background: #ffffff;
+    }
+    .openapi-docs-embed__metric strong {
+      display: block;
+      margin-bottom: 4px;
+      color: #0f172a;
+    }
+    .openapi-docs-embed__metric span {
+      color: var(--ed-muted);
+      font-size: 13px;
+    }
+    .endpoint {
+      display: grid;
+      grid-template-columns: 96px minmax(0, 1fr);
+      gap: 10px 12px;
+      align-items: start;
+      padding: 13px 0;
+      border-top: 1px solid var(--ed-border);
+    }
+    .endpoint:first-of-type { border-top: 0; }
+    .method {
+      width: max-content;
+      min-width: 70px;
+      display: inline-flex;
+      justify-content: center;
+      padding: 3px 8px;
+      border: 1px solid #c7d2fe;
+      border-radius: 5px;
+      background: #eef2ff;
+      color: var(--ed-accent);
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .endpoint p {
+      grid-column: 2;
+      margin: -4px 0 0;
+      color: var(--ed-muted);
+      font-size: 14px;
+    }
+    .doc-table-wrap {
+      margin-top: 12px;
+      overflow: auto;
+      border: 1px solid var(--ed-border);
+      border-radius: var(--ed-radius);
+    }
+    table {
+      width: 100%;
+      min-width: 760px;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th, td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--ed-border);
+      text-align: left;
+      vertical-align: top;
+    }
+    tr:last-child td { border-bottom: 0; }
+    th {
+      background: #f8fafc;
+      color: #475569;
+      font-weight: 700;
+    }
+
+    @media (max-width: 992px) {
+      .openapi-docs-page { padding: 12px; }
+      .openapi-docs-embed__toolbar { flex-direction: column; }
+      .openapi-docs-embed__actions { justify-content: flex-start; }
+      .openapi-docs-embed__layout {
+        grid-template-columns: 1fr;
+        min-height: auto;
+        padding: 12px;
+      }
+      .openapi-docs-embed__nav { max-height: 320px; }
+      .openapi-docs-embed__article { max-height: none; }
+      .endpoint { grid-template-columns: 1fr; }
+      .endpoint p { grid-column: 1; margin-top: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="openapi-docs-page">
+    <section class="openapi-docs-embed">
+      <div class="openapi-docs-embed__shell">
+        <header class="openapi-docs-embed__toolbar">
+          <div>
+            <div class="openapi-docs-embed__title">
+              <span class="openapi-docs-embed__mark">ED</span>
+              <h1>Easy Deploy OpenAPI 接入文档</h1>
+              <span class="openapi-docs-embed__tag">Public Docs</span>
+            </div>
+            <p class="openapi-docs-embed__summary">面向开发者、CI 脚本和其他项目中的 AI。AI 读取本文后，应能完成：识别服务、创建应用、写入部署配置、上传版本包、触发部署、轮询任务和定位失败步骤。</p>
+          </div>
+          <div class="openapi-docs-embed__actions">
+            <a class="openapi-docs-embed__button" href="/docs/openapi">刷新</a>
+            <a class="openapi-docs-embed__button" href="/openapi.json" target="_blank" rel="noreferrer">OpenAPI JSON</a>
+            <a class="openapi-docs-embed__button openapi-docs-embed__button--primary" href="/openapi.json" download="easy-deploy-openapi.json">下载 JSON</a>
+          </div>
+        </header>
+
+        <div class="openapi-docs-embed__layout">
+          <aside class="openapi-docs-embed__nav" aria-label="接口文档目录">
+            <div class="openapi-docs-embed__navHead">目录</div>
+            <ul class="openapi-docs-embed__tree">
+              <li>
+                <span class="openapi-docs-embed__treeSection">快速接入</span>
+                <ul>
+                  <li><a href="#rules">AI 执行总规则</a></li>
+                  <li><a href="#auth">认证</a></li>
+                  <li><a href="#fields">字段约定</a></li>
+                  <li><a href="#package-name">版本包命名规范</a></li>
+                </ul>
+              </li>
+              <li>
+                <span class="openapi-docs-embed__treeSection">推荐流程</span>
+                <ul>
+                  <li><a href="#binary-flow">推荐流程：二进制服务</a></li>
+                  <li><a href="#compose-flow">推荐流程：Compose 服务</a></li>
+                  <li><a href="#decision-tree">给其他项目 AI 的最小决策树</a></li>
+                </ul>
+              </li>
+              <li>
+                <span class="openapi-docs-embed__treeSection">接口与示例</span>
+                <ul>
+                  <li><a href="#endpoints">接口清单</a></li>
+                  <li><a href="#create-app">创建二进制应用示例</a></li>
+                  <li><a href="#update-config">更新配置示例</a></li>
+                  <li><a href="#upload-package">上传版本包并自动部署</a></li>
+                  <li><a href="#deploy">手动触发部署</a></li>
+                  <li><a href="#task-logs">轮询任务和读取步骤日志</a></li>
+                  <li><a href="#errors">错误处理</a></li>
+                </ul>
+              </li>
+            </ul>
+          </aside>
+
+          <main class="openapi-docs-embed__content">
+            <p class="openapi-docs-embed__description">这份文档无需登录即可访问。后台 API Token 页面负责创建调用凭证，业务项目或 AI 只需要保存平台地址、Token、服务标识和版本包路径。</p>
+            <article class="openapi-docs-embed__article">
+              <section id="rules" class="openapi-docs-embed__section">
+                <h2>AI 执行总规则</h2>
+                <div class="openapi-docs-embed__callout">
+                  <ol>
+                    <li>优先使用 <code>service_key</code> 作为服务唯一标识，不要依赖应用 ID。推荐格式：<code>项目名-环境</code>，例如 <code>orders-api-test</code>。</li>
+                    <li>先调用 <code>GET /api/v1/services/{service_key}/app</code>。返回 200 表示已存在；返回 404 才创建应用。</li>
+                    <li>配置属于平台，不要把生产环境变量写死在业务仓库。业务项目只上传版本包，平台保存环境变量、启动参数、目标节点、健康检查等配置。</li>
+                    <li>二进制服务首次创建后，先 <code>PUT /api/v1/services/{service_key}/config</code> 写入运行参数，再上传版本包。</li>
+                    <li>上传版本包后，如需一键部署，使用 <code>auto_deploy=true</code>；否则再调用 <code>POST /api/v1/services/{service_key}/deploy</code>。</li>
+                    <li>部署接口返回 <code>task_id</code> 后，轮询 <code>GET /api/v1/tasks/{task_id}</code>。当任务状态为 <code>success</code>、<code>failed</code> 或 <code>canceled</code> 时停止。</li>
+                  </ol>
+                </div>
+                <div class="openapi-docs-embed__grid">
+                  <div class="openapi-docs-embed__metric"><strong>应用配置归平台管理</strong><span>环境变量、启动参数、目标节点和健康检查都由 easy-deploy 保存并记录配置版本。</span></div>
+                  <div class="openapi-docs-embed__metric"><strong>版本包归业务项目产出</strong><span>业务项目本地构建后上传规范命名的包，平台负责登记版本与部署。</span></div>
+                  <div class="openapi-docs-embed__metric"><strong>部署结果归任务追踪</strong><span>任务详情返回步骤与日志，失败时优先展示 failed step 和关联输出。</span></div>
+                </div>
+              </section>
+
+              <section id="auth" class="openapi-docs-embed__section">
+                <h2>认证</h2>
+                <p>除文档和健康检查外，v1 接口都需要 API Token。</p>
+                <pre><code>Authorization: Bearer $EASY_DEPLOY_TOKEN</code></pre>
+                <p>Token 在后台「API Token」页面创建。创建时填写来源，例如 <code>orders-api-ci</code> 或 <code>ai-agent-local</code>，方便后续追责。</p>
+              </section>
+
+              <section id="fields" class="openapi-docs-embed__section">
+                <h2>字段约定</h2>
+                <div class="doc-table-wrap">
+                  <table>
+                    <thead><tr><th>字段</th><th>说明</th></tr></thead>
+                    <tbody>
+                      <tr><td><code>service_key</code></td><td>服务唯一标识。创建后不要随意变更。接口路径中的 <code>{service_key}</code> 就是它。</td></tr>
+                      <tr><td><code>environment</code></td><td>固定枚举：<code>production</code> 正式环境，<code>test</code> 测试环境。默认建议用 <code>test</code>。</td></tr>
+                      <tr><td><code>app_type</code></td><td><code>compose</code> 表示 Docker Compose 服务，可不上传版本包直接部署；<code>binary</code> 表示二进制包 + systemd 部署。</td></tr>
+                      <tr><td><code>target_node_keys</code></td><td>目标节点标识数组。未传时默认 <code>[&quot;local&quot;]</code>。AI 应优先使用节点 key，而不是节点 ID。</td></tr>
+                      <tr><td><code>deploy_strategy</code></td><td><code>rolling_stop_on_failure</code> 或 <code>rolling_continue</code>。多节点推荐默认 <code>rolling_stop_on_failure</code>。</td></tr>
+                      <tr><td><code>health_check_kind</code></td><td><code>none</code>、<code>compose_running</code>、<code>systemd_active</code>、<code>http</code>、<code>tcp</code>。二进制服务常用 <code>systemd_active</code> 或 <code>http</code>。</td></tr>
+                      <tr><td><code>versionCode</code></td><td>版本排序数字，越大越新。未传时平台会优先从规范包名解析。</td></tr>
+                      <tr><td><code>publishedAt</code></td><td>发布时间，建议 ISO 8601，例如 <code>2026-06-15T10:30:00Z</code>。</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section id="package-name" class="openapi-docs-embed__section">
+                <h2>版本包命名规范</h2>
+                <p>二进制版本包必须按服务名和版本命名，否则平台会返回明确错误。</p>
+                <pre><code>{service_key}_version_{x_y_z}.tar.gz
+orders-api-prod_version_1_2_3.tar.gz</code></pre>
+                <p>平台会解析出 <code>release_version=1.2.3</code> 和可排序的 <code>versionCode</code>。如果请求里传了 <code>release_version</code>，必须和文件名解析结果一致。</p>
+                <p>常见错误码：<code>INVALID_PACKAGE_VERSION_NAME</code>、<code>PACKAGE_SERVICE_KEY_MISMATCH</code>、<code>PACKAGE_VERSION_CONFLICT</code>。</p>
+              </section>
+
+              <section id="binary-flow" class="openapi-docs-embed__section">
+                <h2>推荐流程：二进制服务</h2>
+                <ol>
+                  <li>生成服务标识，例如 <code>orders-api-test</code>。</li>
+                  <li>读取服务：<code>GET /api/v1/services/orders-api-test/app</code>。</li>
+                  <li>如果 404，创建应用：<code>POST /api/v1/apps</code>，<code>app_type</code> 填 <code>binary</code>。</li>
+                  <li>写入或更新配置：<code>PUT /api/v1/services/orders-api-test/config</code>。</li>
+                  <li>业务项目本地构建 tar.gz，按规范命名。</li>
+                  <li>上传版本包：<code>POST /api/v1/services/orders-api-test/packages</code>。</li>
+                  <li>如果上传时没有 <code>auto_deploy=true</code>，再调用部署：<code>POST /api/v1/services/orders-api-test/deploy</code>。</li>
+                  <li>轮询任务详情，读取 <code>steps</code> 和 <code>logs</code>。失败时把失败步骤和关联日志展示给用户。</li>
+                </ol>
+              </section>
+
+              <section id="compose-flow" class="openapi-docs-embed__section">
+                <h2>推荐流程：Compose 服务</h2>
+                <ol>
+                  <li>适合 Redis、Postgres、Nginx 或只有 compose 配置的服务。</li>
+                  <li>创建应用时 <code>app_type=compose</code>，写入 <code>compose_content</code> 和 <code>env_content</code>。</li>
+                  <li>Compose 服务不需要版本包。配置确认后直接调用 <code>deploy</code>，action 使用 <code>up</code> 或 <code>restart</code>。</li>
+                  <li>如果只是停止服务，action 使用 <code>down</code>。</li>
+                </ol>
+              </section>
+
+              <section id="endpoints" class="openapi-docs-embed__section">
+                <h2>接口清单</h2>
+                <div class="endpoint"><span class="method">GET</span><code>/api/v1/nodes</code><p>读取节点，AI 可用它确认 <code>target_node_keys</code>。</p></div>
+                <div class="endpoint"><span class="method">GET</span><code>/api/v1/services/{service_key}/app</code><p>按服务标识读取应用详情。不存在返回 404。</p></div>
+                <div class="endpoint"><span class="method">POST</span><code>/api/v1/apps</code><p>创建应用和初始部署配置。</p></div>
+                <div class="endpoint"><span class="method">PUT</span><code>/api/v1/services/{service_key}/config</code><p>更新 Compose、环境变量、二进制启动参数、健康检查、Blue/Green 配置。</p></div>
+                <div class="endpoint"><span class="method">POST</span><code>/api/v1/services/{service_key}/packages</code><p>上传二进制版本包。支持字段别名：<code>package_file</code>/<code>file</code>/<code>artifact_file</code>，<code>release_version</code>/<code>artifact_version</code>，<code>versionCode</code>/<code>version_code</code>，<code>publishedAt</code>/<code>published_at</code>。</p></div>
+                <div class="endpoint"><span class="method">POST</span><code>/api/v1/services/{service_key}/deploy</code><p>创建部署任务。Compose action：<code>up</code>、<code>down</code>、<code>restart</code>。二进制 action：<code>binary_restart</code>、<code>binary_stop</code>。</p></div>
+                <div class="endpoint"><span class="method">GET</span><code>/api/v1/tasks/{task_id}</code><p>读取任务状态、步骤和日志。<code>logs.step_id</code> 对应 <code>steps.id</code>。</p></div>
+              </section>
+
+              <section id="create-app" class="openapi-docs-embed__section">
+                <h2>创建二进制应用示例</h2>
+                <pre><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/apps" \
+  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"app_key":"orders-api-test","name":"订单 API 测试","environment":"test","app_type":"binary","target_node_keys":["qfy-sc-test"],"deploy_strategy":"rolling_stop_on_failure","binary_exec_args":"--config /etc/orders-api/config.toml","binary_service_user":"root","binary_unit_name":"orders-api-test.service","health_check_kind":"http","health_endpoint":"http://127.0.0.1:8080/health","health_timeout_secs":5,"health_expected_status":200}'</code></pre>
+              </section>
+
+              <section id="update-config" class="openapi-docs-embed__section">
+                <h2>更新配置示例</h2>
+                <pre><code>curl -X PUT "$EASY_DEPLOY_URL/api/v1/services/orders-api-test/config" \
+  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"env_content":"RUST_LOG=info\nDATABASE_URL=sqlite:///data/orders.db\n","binary_exec_args":"--port 8080","health_check_kind":"http","health_endpoint":"http://127.0.0.1:8080/health"}'</code></pre>
+                <p>注意：更新配置会记录配置版本。不同版本包可以复用同一份配置，也可以在上传新版本包前先更新配置。</p>
+              </section>
+
+              <section id="upload-package" class="openapi-docs-embed__section">
+                <h2>上传版本包并自动部署</h2>
+                <pre><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/services/orders-api-test/packages" \
+  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
+  -F "package_file=@./dist/orders-api-test_version_1_2_3.tar.gz" \
+  -F "entry_file=orders-api" \
+  -F "source=local-build" \
+  -F "auto_deploy=true"</code></pre>
+                <p>成功响应会包含 <code>task_id</code>。如果 <code>auto_deploy=false</code> 或不传，则只上传版本包，不创建部署任务。</p>
+              </section>
+
+              <section id="deploy" class="openapi-docs-embed__section">
+                <h2>手动触发部署</h2>
+                <pre><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/services/orders-api-test/deploy" \
+  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"binary_restart"}'</code></pre>
+              </section>
+
+              <section id="task-logs" class="openapi-docs-embed__section">
+                <h2>轮询任务和读取步骤日志</h2>
+                <pre><code>curl -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
+  "$EASY_DEPLOY_URL/api/v1/tasks/123"</code></pre>
+                <p>AI 判断规则：</p>
+                <ul>
+                  <li><code>data.task.status=queued/running</code>：继续等待，建议 2 秒后重试。</li>
+                  <li><code>success</code>：部署完成。</li>
+                  <li><code>failed</code>：读取 <code>steps</code> 中 status 为 <code>failed</code> 的步骤，再用 <code>logs.step_id</code> 过滤相关日志，给用户展示失败命令和输出。</li>
+                </ul>
+                <pre><code>{"data":{"task":{"id":123,"status":"failed","summary":"远程 systemctl daemon-reload 失败"},"steps":[{"id":9,"step_no":3,"title":"准备 orders-node-1 的二进制运行文件","status":"failed","command":"sync runtime files && systemctl link && daemon-reload","exit_code":1}],"logs":[{"id":41,"step_id":9,"stream":"system","content":"systemctl daemon-reload · 退出码 1"},{"id":42,"step_id":9,"stream":"combined","content":"Failed to reload daemon"}]}}</code></pre>
+              </section>
+
+              <section id="errors" class="openapi-docs-embed__section">
+                <h2>错误处理</h2>
+                <div class="openapi-docs-embed__callout openapi-docs-embed__callout--danger">
+                  <ul>
+                    <li>401/403：Token 无效或权限不足。请让用户在后台创建或调整 API Token。</li>
+                    <li>404：服务不存在。AI 可以在确认 service_key 正确后创建应用。</li>
+                    <li>400 且 code 为 <code>INVALID_PACKAGE_VERSION_NAME</code>：版本包命名不符合规范，重新打包命名。</li>
+                    <li>400 且 code 为 <code>PACKAGE_SERVICE_KEY_MISMATCH</code>：包名里的 service_key 和接口路径不一致。</li>
+                    <li>400 且 code 为 <code>PACKAGE_VERSION_CONFLICT</code>：请求传入版本和包名解析版本不一致。</li>
+                  </ul>
+                </div>
+              </section>
+
+              <section id="decision-tree" class="openapi-docs-embed__section">
+                <h2>给其他项目 AI 的最小决策树</h2>
+                <pre><code>1. 读取环境变量 EASY_DEPLOY_URL 和 EASY_DEPLOY_TOKEN
+2. 确定 service_key
+3. GET /api/v1/services/{service_key}/app
+4. 若 404，POST /api/v1/apps 创建
+5. PUT /api/v1/services/{service_key}/config 写入或更新运行配置
+6. 若 app_type=compose，POST /deploy action=up 或 restart
+7. 若 app_type=binary，上传 {service_key}_version_x_y_z.tar.gz
+8. 拿到 task_id 后轮询 /api/v1/tasks/{task_id}
+9. 失败时输出 failed step + logs</code></pre>
+              </section>
+            </article>
+          </main>
+        </div>
+      </div>
+    </section>
+  </div>
+</body>
+</html>"###
+        .to_owned()
 }
 
 async fn record_audit_event(
