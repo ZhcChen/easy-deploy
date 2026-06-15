@@ -24,7 +24,7 @@
 - 技术计划：`docs/plans/`
 - 解决方案/经验沉淀：`docs/solutions/`
 - CE 运行期中间产物：`.context/compound-engineering/`
-- 临时截图、浏览器调试产物、一次性导出、排障草稿等非正式交付物统一放入 `tmp/` 或其子目录。
+- 临时截图、浏览器调试产物、一次性导出预览、排障草稿等非正式交付物统一放入 `tmp/` 或其子目录；不要散放在仓库根目录。`tmp/` 必须保持在 `.gitignore` 中。
 - 所有文档路径引用使用仓库相对路径，不使用绝对路径。
 
 ## 开发与验证
@@ -37,6 +37,25 @@
 - 如果因环境、外部依赖或耗时原因无法完成完整验证，必须在最终回复中说明边界和已完成的验证。
 - 不提交明显编译失败、测试失败或半成品状态，除非用户明确要求保存现场；这种提交必须在 commit message 中标记 `WIP` 或阻塞点。
 
+## 正式环境部署约定
+- 当前 easy-deploy 的正式环境为服务器 SSH 别名 `qfy-sc-test`。
+- 正式访问域名为 `https://easy-deploy.quanxinfu.com`，由服务器现有 Caddy 托管 HTTPS 和反向代理。
+- 后续用户说“部署正式环境”“发正式”“部署生产”等同类指令时，默认目标就是 `qfy-sc-test` 上的 easy-deploy 正式环境，除非用户当次明确指定其他服务器或域名。
+- 正式环境服务使用 systemd 单机部署：
+  - systemd 服务：`easy-deploy.service`
+  - 后端监听：`127.0.0.1:9066`
+  - 程序文件：`/opt/easy-deploy/easy-deploy-api`
+  - 环境配置：`/etc/easy-deploy/easy-deploy.env`
+  - SQLite 数据库：`/var/lib/easy-deploy/easy-deploy.db`
+  - Caddy 配置：`/etc/caddy/Caddyfile.d/easy-deploy.quanxinfu.com.caddy`
+- 部署正式环境时，优先在本地或构建容器中产出 Linux x86_64 二进制，再上传到服务器执行 `scripts/deploy-systemd.sh`；不要在 `qfy-sc-test` 上直接 release 编译，服务器内存较小，容易拖垮 SSH 和系统负载。
+- 修改 Caddy 时只新增或调整 `easy-deploy.quanxinfu.com.caddy` 这一份独立配置，必须先执行 `caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile`，通过后再 `systemctl reload caddy`，不得影响 `/etc/caddy/Caddyfile.d/` 下其他项目配置。
+- 正式部署完成后至少验证：
+  - `systemctl is-active easy-deploy`
+  - `curl http://127.0.0.1:9066/healthz`
+  - `curl https://easy-deploy.quanxinfu.com/healthz`
+  - 必要时查看 `journalctl -u easy-deploy -n 80 --no-pager`
+
 ## SQL 迁移规范
 - SQLite 主库 migration 统一放在 `api/migrations/`。
 - 当前历史迁移使用 `NNNN_name.sql` 风格，后续继续追加递增编号，不改成时间戳格式。
@@ -48,6 +67,8 @@
 
 ## Git 提交规范
 - 提交说明默认使用简体中文，优先概括业务目的和改动范围。
+- 用户明确要求实现、修复、调整、完善、联调、继续任务或整理提交时，视为授权在任务达到稳定可验收状态后自行提交并推送；不要每次提交前反复询问用户。
+- 默认在当前分支开发、提交与推送；除非用户明确要求，不额外创建功能分支。
 - 默认采用类似 qfy-sc 的 Conventional Commit 风格：
   - `feat:` 新能力或用户可见能力
   - `fix:` 修复缺陷、断言失败、行为回归
@@ -59,10 +80,12 @@
   - `feat: 初始化部署平台基础能力`
   - `fix: 修复 e2e 会话与审计断言`
   - `docs: 同步项目协作与提交规则`
-- 一次任务包含多个相对独立功能点时，按功能边界、风险边界或可验证阶段拆分多个 commit；不要把无关改动混在同一个 commit。
+- 一次任务包含多个相对独立功能点时，按功能边界、风险边界或可验证阶段拆分多个 commit；每个 commit 应保持语义清晰、可独立说明，避免把无关改动混在一起。
+- 每个 commit 完成后立即 `git push` 到当前分支，降低本地机器故障导致代码丢失的风险；不要积压多个已完成 commit 长时间不推送。
 - 提交前必须查看 `git status` 和待提交 diff，只提交本次任务相关文件。
+- 提交前应完成与改动范围匹配的测试、构建、格式检查或页面验证；如果因环境、外部凭证、真实三方接口等原因无法验证，必须在最终回复中说明边界。
 - 工作区存在用户或其他任务留下的无关改动时，保留不动，不得顺手混入。
-- 用户明确要求“提交”“整理提交”时，视为授权创建 commit；是否推送按用户当次要求或远端状态执行。
+- 不提交明显编译失败、测试失败或半成品状态，除非用户明确要求保存现场；这种情况下 commit message 必须标明 `WIP` / 阻塞点，并仍需及时 push。
 
 ## 浏览器与 E2E
 - 浏览器是较重工具；源码、日志、HTTP 请求或现有测试足以完成任务时，不额外打开浏览器。

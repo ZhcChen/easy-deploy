@@ -1,4 +1,5 @@
 /target/
+/target-linux/
 /tmp/
 tmp/
 .context/
@@ -6,11 +7,13 @@ tmp/
 test-results/
 .compound-engineering/*.local.yaml
 /.easy-deploy/
+/.deploy.env
 /easy-deploy.db
 *.db
 *.db-shm
 *.db-wal
 *.tmp
 tmp_*.png
+ui-*-playwright.png
 *.log
 .DS_Store
