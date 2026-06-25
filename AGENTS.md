@@ -60,8 +60,9 @@
 - SQLite 主库 migration 统一放在 `api/migrations/`。
 - 当前历史迁移使用 `NNNN_name.sql` 风格，后续继续追加递增编号，不改成时间戳格式。
 - 新迁移通过 `cargo run -p api -- migrate create <snake_case_name>` 创建。
-- 发布或提交前优先执行 `cargo run -p api -- migrate status` 和 `cargo run -p api -- migrate guard`。
+- 发布或提交前优先执行 `cargo run -p api -- migrate status` 和 `cargo run -p api -- migrate guard origin/main`；若当前仓库没有 `origin/main`，再使用可用的基线分支或提交。
 - 历史 migration 禁止修改、删除、重命名；结构问题用新的补丁 migration 修复。
+- `migrate guard` 是基于 Git diff 的历史迁移保护；`migrate status` 中的 sqlx checksum 状态用于识别已应用迁移是否被改动，二者都要保留，不能互相替代。
 - 大批量 backfill、外部依赖修复、长时间数据修复不放进常规 migration，后续做成独立维护命令或任务。
 - 详细规则见 `docs/runbooks/api-migrations.md`。
 

@@ -18,7 +18,7 @@ api/migrations/
 cargo run -p api -- migrate status
 cargo run -p api -- migrate up
 cargo run -p api -- migrate create add_deployment_index
-cargo run -p api -- migrate guard
+cargo run -p api -- migrate guard origin/main
 ```
 
 指定数据库：
@@ -34,6 +34,8 @@ cargo run -p api -- --database-url sqlite://easy-deploy.db migrate up
 cargo run -p api -- migrate guard origin/main
 cargo run -p api -- migrate guard HEAD
 ```
+
+提交和部署前优先显式传入 `origin/main`，避免本地默认 ref 因分支状态不同而误判。若仓库没有 `origin/main`，再使用当前项目实际主干分支或明确的提交 SHA。
 
 ## 文件命名
 
@@ -67,7 +69,7 @@ NNNN_snake_case.sql
 ```text
 备份 SQLite 数据库
 -> cargo run -p api -- migrate status
--> cargo run -p api -- migrate guard
+-> cargo run -p api -- migrate guard origin/main
 -> cargo run -p api -- migrate up
 -> 启动或重启 api 服务
 -> 执行 smoke / e2e 验收
@@ -102,3 +104,5 @@ NNNN_snake_case.sql
 - 迁移目录内不允许放非 SQL 文件。
 
 默认对比 `origin/main`、`main`、`master` 或 `HEAD` 中可用的第一个 ref；也可以显式传入 base ref。
+
+`migrate guard` 只负责 Git 层面的变更保护，重点防止 AI 或人工误改、删除、重命名已经提交过的历史 migration。`migrate status` 会读取 sqlx 的 `_sqlx_migrations.checksum`，用于识别数据库已经应用过的迁移文件是否被改动；这是运行态检查，不能替代提交前的 Git guard。
