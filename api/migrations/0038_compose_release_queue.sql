@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS app_release_queue (
     config_snapshot_id INTEGER REFERENCES app_config_snapshots(id) ON DELETE SET NULL,
     queue_seq INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'queued'
-        CHECK (status IN ('scheduled', 'queued', 'running', 'success', 'failed', 'canceled')),
+        CHECK (status IN ('queued', 'running', 'success', 'failed', 'canceled')),
     triggered_by TEXT NOT NULL DEFAULT '',
     message TEXT NOT NULL DEFAULT '',
     task_id INTEGER REFERENCES operation_tasks(id) ON DELETE SET NULL,
