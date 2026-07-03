@@ -3407,7 +3407,6 @@ async fn artifacts_page(
             app_id: item.app_id,
             app_name: item.app_name.clone(),
             app_key: item.app_key.clone(),
-            release_id: item.release_id,
             version: item.version.clone(),
             version_code: item.version_code,
             status: queue_status_label(&item.status),
@@ -4707,117 +4706,6 @@ fn node_status_tone(status: &str) -> &'static str {
     }
 }
 
-fn node_page_row<'a>(node: &'a crate::nodes::NodeListItem, can_manage: bool) -> NodePageRow<'a> {
-    NodePageRow {
-        id: node.id,
-        name: &node.name,
-        node_key: &node.node_key,
-        node_type: node_type_label(&node.node_type),
-        address: &node.address,
-        ssh: if node.node_type == "ssh" {
-            format!("{}:{}", node.ssh_user, node.ssh_port)
-        } else {
-            "本地执行".to_owned()
-        },
-        ssh_port: node.ssh_port,
-        ssh_user: &node.ssh_user,
-        credential_id: node.credential_id.unwrap_or_default(),
-        credential_name: node_credential_display_name(node),
-        credential_fingerprint: node_credential_fingerprint(node),
-        work_dir: &node.work_dir,
-        region: if node.region.is_empty() {
-            "未分区"
-        } else {
-            &node.region
-        },
-        region_value: &node.region,
-        labels: if node.labels.is_empty() {
-            "未设置"
-        } else {
-            &node.labels
-        },
-        labels_value: &node.labels,
-        status: node_status_label(&node.status),
-        status_tone: node_status_tone(&node.status),
-        docker_status: &node.docker_status,
-        capability: node_capability_text(node),
-        os_info: node_probe_detail_text(node.last_os_info.as_deref(), "OS 未探测"),
-        disk_info: node_disk_detail_text(node.last_disk_info.as_deref(), "磁盘未探测"),
-        systemd_version: node_probe_detail_text(
-            node.last_systemd_version.as_deref(),
-            "systemd 未探测",
-        ),
-        proxy_version: node_proxy_version_text(node),
-        last_check_at: node.last_check_at.as_deref().unwrap_or("尚未探测"),
-        last_message: node.last_message.as_deref().unwrap_or("等待节点探测"),
-        can_manage,
-        is_ssh: node.node_type == "ssh",
-        can_check: node.status != "disabled",
-        toggle_status: node_status_toggle_value(&node.status),
-        toggle_label: node_status_toggle_label(&node.status),
-    }
-}
-
-fn node_check_history_row(check: &crate::nodes::NodeCheckHistoryItem) -> NodeCheckHistoryRow {
-    NodeCheckHistoryRow {
-        id: check.id,
-        status: node_check_status_label(&check.check_status),
-        status_tone: node_check_status_tone(&check.check_status),
-        message: display_text(check.message.clone(), "未记录"),
-        docker_version: display_text(check.docker_version.clone(), "未记录"),
-        compose_version: display_text(check.compose_version.clone(), "未记录"),
-        os_info: node_probe_detail_text(Some(&check.os_info), "OS 未探测"),
-        disk_info: node_disk_detail_text(Some(&check.disk_info), "磁盘未探测"),
-        systemd_version: node_probe_detail_text(Some(&check.systemd_version), "systemd 未探测"),
-        checked_at: check.checked_at.clone(),
-    }
-}
-
-fn node_app_runtime_row(app: &crate::nodes::NodeAppRuntimeItem) -> NodeAppRuntimeRow {
-    NodeAppRuntimeRow {
-        app_id: app.app_id,
-        app_name: app.app_name.clone(),
-        app_key: app.app_key.clone(),
-        app_type: app_type_label(&app.app_type),
-        app_status: app_enabled_status_label(&app.app_status),
-        app_status_tone: app_enabled_status_tone(&app.app_status),
-        runtime_status: runtime_status_label(&app.runtime_status),
-        runtime_status_tone: runtime_status_tone(&app.runtime_status),
-        active_version: display_text(app.active_version.clone(), "未部署"),
-        service_count: app.service_count,
-        message: display_text(app.message.clone(), "暂无运行信息"),
-        last_deploy_at: app
-            .last_deploy_at
-            .clone()
-            .unwrap_or_else(|| "未部署".to_owned()),
-        updated_at: app.updated_at.clone(),
-    }
-}
-
-fn node_task_row(task: &crate::nodes::NodeTaskItem) -> NodeTaskRow {
-    NodeTaskRow {
-        id: task.id,
-        title: task.title.clone(),
-        task_kind: task_kind_label(&task.task_kind),
-        app_name: display_text(task.app_name.clone(), "未关联应用"),
-        status: task_status_label(&task.status),
-        status_tone: task_status_tone(&task.status),
-        phase: task_phase_label(&task.phase),
-        summary: display_text(task.summary.clone(), "暂无摘要"),
-        created_by: task.created_by.clone(),
-        created_at: task.created_at.clone(),
-        updated_at: task.updated_at.clone(),
-    }
-}
-
-fn node_check_result_node_status_label(status: &str) -> &'static str {
-    if status == "passed" {
-        node_status_label("online")
-    } else {
-        node_status_label("offline")
-    }
-}
-
 fn node_check_result_node_status_tone(status: &str) -> &'static str {
     if status == "passed" {
         node_status_tone("online")
@@ -5478,104 +5366,11 @@ fn node_status_toggle_value(status: &str) -> &'static str {
     }
 }
 
-fn node_status_toggle_label(status: &str) -> &'static str {
-    if status == "disabled" {
-        "启用"
-    } else {
-        "禁用"
-    }
-}
-
-fn node_credential_display_name(node: &crate::nodes::NodeListItem) -> String {
-    if node.node_type != "ssh" {
-        return "本地执行".to_owned();
-    }
-    node.credential_name
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("系统 SSH 配置")
-        .to_owned()
-}
-
 fn node_credential_fingerprint(node: &crate::nodes::NodeListItem) -> String {
     node.credential_fingerprint
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("")
-        .to_owned()
-}
-
-fn node_capability_text(node: &crate::nodes::NodeListItem) -> String {
-    let executor = if node.node_type == "local" {
-        "本地执行"
-    } else {
-        "SSH 执行"
-    };
-    let docker = node
-        .last_docker_version
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .unwrap_or(node.docker_status.as_str());
-    let compose = node
-        .last_compose_version
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .unwrap_or("Compose 未探测");
-    let proxy = node_proxy_capability_text(node);
-    format!("{executor} · {docker} · {compose} · {proxy}")
-}
-
-fn node_proxy_capability_text(node: &crate::nodes::NodeListItem) -> String {
-    match (node.caddy_available == 1, node.nginx_available == 1) {
-        (true, true) => "Caddy/Nginx 可用".to_owned(),
-        (true, false) => "Caddy 可用".to_owned(),
-        (false, true) => "Nginx 可用".to_owned(),
-        (false, false) => "代理未探测".to_owned(),
-    }
-}
-
-fn node_proxy_version_text(node: &crate::nodes::NodeListItem) -> String {
-    let mut versions = Vec::new();
-    if let Some(caddy) = node
-        .last_caddy_version
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        versions.push(format!("Caddy {}", first_line(caddy)));
-    }
-    if let Some(nginx) = node
-        .last_nginx_version
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        versions.push(first_line(nginx).to_owned());
-    }
-    if versions.is_empty() {
-        "代理未探测".to_owned()
-    } else {
-        versions.join(" · ")
-    }
-}
-
-fn node_probe_detail_text(value: Option<&str>, fallback: &'static str) -> String {
-    let value = value.unwrap_or("").trim();
-    if value.is_empty() {
-        fallback.to_owned()
-    } else {
-        value.lines().next().unwrap_or(value).trim().to_owned()
-    }
-}
-
-fn node_disk_detail_text(value: Option<&str>, fallback: &'static str) -> String {
-    let value = value.unwrap_or("").trim();
-    if value.is_empty() {
-        return fallback.to_owned();
-    }
-    value
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with("Filesystem"))
-        .unwrap_or(value)
         .to_owned()
 }
 
@@ -5661,14 +5456,6 @@ fn capability_reason(value: Option<&str>, fallback: &'static str) -> String {
 
 fn first_line(value: &str) -> &str {
     value.lines().next().unwrap_or(value).trim()
-}
-
-fn node_check_status_label(status: &str) -> &'static str {
-    match status {
-        "passed" => "通过",
-        "failed" => "失败",
-        _ => "未知",
-    }
 }
 
 fn node_check_status_tone(status: &str) -> &'static str {
@@ -8885,46 +8672,6 @@ mod tests {
             deploy_strategy: "rolling_stop_on_failure".to_owned(),
             release_source: "manual".to_owned(),
             auto_queue_release: true,
-            work_dir: format!("/opt/easy-deploy/apps/{app_key}"),
-            target_node_ids: vec![1],
-            compose_content: String::new(),
-            env_content: "RUST_LOG=info".to_owned(),
-            deploy_scripts: DeployScriptSet::default(),
-            health_check: Default::default(),
-            binary_artifact_version: "v1.0.0".to_owned(),
-            binary_artifact_path: format!(
-                "/opt/easy-deploy/apps/{app_key}/releases/v1.0.0/{app_key}"
-            ),
-            binary_exec_args: "--port 8080".to_owned(),
-            binary_service_user: "deploy".to_owned(),
-            binary_unit_name: format!("easy-deploy-{app_key}.service"),
-            binary_release_strategy: "restart".to_owned(),
-            binary_active_slot: "blue".to_owned(),
-            binary_base_port: 8080,
-            binary_standby_port: 18080,
-            binary_proxy_enabled: false,
-            binary_proxy_kind: "none".to_owned(),
-            binary_proxy_domain: String::new(),
-            binary_proxy_config_path: String::new(),
-        })
-        .await
-        .expect("create binary app")
-    }
-
-    async fn create_binary_test_app_with_mode(
-        apps: &AppService,
-        app_key: &str,
-        auto_queue_release: bool,
-    ) -> i64 {
-        apps.create_app(CreateAppInput {
-            app_key: app_key.to_owned(),
-            name: format!("{app_key} app"),
-            description: String::new(),
-            environment: "test".to_owned(),
-            app_type: "binary".to_owned(),
-            deploy_strategy: "rolling_stop_on_failure".to_owned(),
-            release_source: "manual".to_owned(),
-            auto_queue_release,
             work_dir: format!("/opt/easy-deploy/apps/{app_key}"),
             target_node_ids: vec![1],
             compose_content: String::new(),

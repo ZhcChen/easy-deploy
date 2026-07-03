@@ -866,7 +866,6 @@ pub struct ReleaseQueueRow {
     pub app_id: i64,
     pub app_name: String,
     pub app_key: String,
-    pub release_id: i64,
     pub version: String,
     pub version_code: i64,
     pub status: &'static str,
