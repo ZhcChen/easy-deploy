@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod deploy;
 pub mod events;
 pub mod health;
+pub mod host_metrics;
 pub mod maintenance;
 pub mod migrations;
 pub mod node_credentials;
@@ -14,6 +15,7 @@ pub mod platform;
 pub mod runtimefs;
 pub mod settings;
 pub mod tasks;
+pub mod text;
 pub mod web;
 
 pub use settings::Settings;

@@ -80,46 +80,72 @@
         {% endif %}
       </div>
     </div>
-    {% if steps.len() > 0 %}
+    {% if phase_groups.len() > 0 %}
       <div class="task-step-list">
-        {% for step in steps %}
-          <details class="task-step-entry task-step-{{ step.status_tone }}" {% if step.is_open %}open{% endif %}>
+        {% for phase in phase_groups %}
+          <details class="task-phase-entry task-phase-{{ phase.status_tone }}" {% if phase.is_open %}open{% endif %}>
             <summary>
               <div class="task-step-main">
-                <span class="task-step-index">{{ step.step_no }}</span>
+                <span class="task-step-index">{{ phase.phase_no }}</span>
                 <div>
-                  <strong>{{ step.title }}</strong>
-                  <span>{{ step.node_name }} · {{ step.started_at }}{% if step.finished_at != "未结束" %} - {{ step.finished_at }}{% endif %}</span>
+                  <strong>{{ phase.title }}</strong>
+                  <span>{{ phase.phase_key }} · {{ phase.started_at }}{% if phase.finished_at != "未结束" %} - {{ phase.finished_at }}{% endif %}</span>
                 </div>
               </div>
               <div class="task-step-meta">
-                <span class="badge tone-{{ step.status_tone }}">{{ step.status }}</span>
-                <span>退出码 {{ step.exit_code }}</span>
+                <span class="badge tone-{{ phase.status_tone }}">{{ phase.status }}</span>
+                <span>{{ phase.summary }}</span>
               </div>
             </summary>
-            <pre class="code-block">{{ step.command }}</pre>
-            <div class="task-log-list compact-log-list">
-              {% for log in step.logs %}
-                <article class="task-log-entry">
-                  <div class="task-log-meta">
-                    <span class="badge tone-{{ log.stream_tone }}">{{ log.stream }}</span>
-                    <span>#{{ log.id }} · {{ log.created_at }}</span>
-                  </div>
-                  <pre class="code-block">{{ log.content }}</pre>
-                </article>
-              {% endfor %}
-              {% if !step.has_logs %}
-                <div class="empty-state">
-                  <strong>暂无步骤日志</strong>
-                  <span>该步骤尚未写入命令输出。</span>
-                </div>
-              {% endif %}
-            </div>
+            {% if phase.has_steps %}
+              <div class="task-phase-step-list">
+                {% for step in phase.steps %}
+                  <details class="task-step-entry task-step-{{ step.status_tone }}" {% if step.is_open %}open{% endif %}>
+                    <summary>
+                      <div class="task-step-main">
+                        <span class="task-step-index">{{ step.step_no }}</span>
+                        <div>
+                          <strong>{{ step.title }}</strong>
+                          <span>{{ step.node_name }} · {{ step.started_at }}{% if step.finished_at != "未结束" %} - {{ step.finished_at }}{% endif %}</span>
+                        </div>
+                      </div>
+                      <div class="task-step-meta">
+                        <span class="badge tone-{{ step.status_tone }}">{{ step.status }}</span>
+                        <span>退出码 {{ step.exit_code }}</span>
+                      </div>
+                    </summary>
+                    <pre class="code-block">{{ step.command }}</pre>
+                    <div class="task-log-list compact-log-list">
+                      {% for log in step.logs %}
+                        <article class="task-log-entry">
+                          <div class="task-log-meta">
+                            <span class="badge tone-{{ log.stream_tone }}">{{ log.stream }}</span>
+                            <span>#{{ log.id }} · {{ log.created_at }}</span>
+                          </div>
+                          <pre class="code-block">{{ log.content }}</pre>
+                        </article>
+                      {% endfor %}
+                      {% if !step.has_logs %}
+                        <div class="empty-state">
+                          <strong>暂无步骤日志</strong>
+                          <span>该步骤尚未写入命令输出。</span>
+                        </div>
+                      {% endif %}
+                    </div>
+                  </details>
+                {% endfor %}
+              </div>
+            {% else %}
+              <div class="empty-state">
+                <strong>暂无步骤</strong>
+                <span>该阶段尚未写入命令步骤。</span>
+              </div>
+            {% endif %}
           </details>
         {% endfor %}
       </div>
     {% endif %}
-    {% if logs.len() > 0 || steps.len() == 0 %}
+    {% if logs.len() > 0 || phase_groups.len() == 0 %}
       <div class="task-log-list">
         {% for log in logs %}
           <article class="task-log-entry">

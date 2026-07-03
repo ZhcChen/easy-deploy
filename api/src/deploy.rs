@@ -194,6 +194,46 @@ impl ComposeExecutor {
         self.run_compose(work_dir, &["restart"]).await
     }
 
+    pub async fn run_script(
+        &self,
+        work_dir: PathBuf,
+        script_relative_path: &str,
+        env: &[(String, String)],
+    ) -> Result<ComposeCommandOutput, DeployError> {
+        if !work_dir.is_dir() {
+            return Err(DeployError::InvalidInput(format!(
+                "Compose 工作目录不存在: {}",
+                work_dir.to_string_lossy()
+            )));
+        }
+        let script_relative_path = normalize_script_relative_path(script_relative_path)?;
+        let script_path = work_dir.join(&script_relative_path);
+        if !script_path.is_file() {
+            return Err(DeployError::InvalidInput(format!(
+                "部署脚本不存在: {}",
+                script_path.to_string_lossy()
+            )));
+        }
+        let mut args = normalized_env_args(env)?;
+        args.push("sh".to_owned());
+        args.push(script_relative_path);
+        let command = render_command("env", &args);
+        let result = self
+            .runner
+            .run(CommandSpec {
+                program: "env".to_owned(),
+                args,
+                current_dir: work_dir,
+            })
+            .await?;
+        Ok(ComposeCommandOutput {
+            command,
+            success: result.success(),
+            status_code: result.status_code,
+            output: result.combined_output(),
+        })
+    }
+
     pub async fn logs(&self, work_dir: PathBuf) -> Result<ComposeCommandOutput, DeployError> {
         self.logs_with_tail(work_dir, 200).await
     }
@@ -672,6 +712,34 @@ impl SshExecutor {
             local_work_dir,
             remote_work_dir,
             vec!["restart".to_owned()],
+        )
+        .await
+    }
+
+    pub async fn run_script(
+        &self,
+        target: &SshTarget,
+        local_work_dir: PathBuf,
+        remote_work_dir: &str,
+        script_relative_path: &str,
+        env: &[(String, String)],
+    ) -> Result<CommandOutput, DeployError> {
+        let remote_work_dir = normalize_remote_absolute_path(remote_work_dir)?;
+        let script_relative_path = normalize_script_relative_path(script_relative_path)?;
+        let remote_script_path = format!("{remote_work_dir}/{script_relative_path}");
+        let mut command = format!("cd {} && env", shell_quote(&remote_work_dir));
+        for (key, value) in normalized_env_pairs(env)? {
+            command.push(' ');
+            command.push_str(&key);
+            command.push('=');
+            command.push_str(&shell_quote(&value));
+        }
+        command.push_str(" sh ");
+        command.push_str(&shell_quote(&remote_script_path));
+        self.run_ssh(
+            target,
+            local_work_dir,
+            vec!["sh".to_owned(), "-lc".to_owned(), command],
         )
         .await
     }
@@ -1294,6 +1362,65 @@ fn render_command(program: &str, args: &[String]) -> String {
     }
 }
 
+fn normalize_script_relative_path(value: &str) -> Result<String, DeployError> {
+    let value = value.trim().replace('\\', "/");
+    if value.is_empty() || value.starts_with('/') || is_windows_absolute_path(&value) {
+        return Err(DeployError::InvalidInput(
+            "部署脚本路径必须是相对路径".to_owned(),
+        ));
+    }
+    if value.contains("//")
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '-' | '_' | '@'))
+    {
+        return Err(DeployError::InvalidInput(
+            "部署脚本路径仅支持字母、数字、斜线、点、短横线、下划线和 @".to_owned(),
+        ));
+    }
+    Ok(value)
+}
+
+fn normalized_env_args(env: &[(String, String)]) -> Result<Vec<String>, DeployError> {
+    normalized_env_pairs(env).map(|pairs| {
+        pairs
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect()
+    })
+}
+
+fn normalized_env_pairs(env: &[(String, String)]) -> Result<Vec<(String, String)>, DeployError> {
+    env.iter()
+        .map(|(key, value)| Ok((normalize_env_name(key)?, value.clone())))
+        .collect()
+}
+
+fn normalize_env_name(value: &str) -> Result<String, DeployError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return Err(DeployError::InvalidInput(
+            "部署脚本环境变量名仅支持大写字母、数字和下划线，且不能以数字开头".to_owned(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_owned();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn normalize_log_tail_lines(value: u16) -> u16 {
     value.clamp(50, 1000)
 }
@@ -1566,6 +1693,46 @@ mod tests {
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].program, "docker");
         assert_eq!(specs[0].args, ["info"]);
+        assert_eq!(specs[0].current_dir, work_dir.path());
+    }
+
+    #[tokio::test]
+    async fn compose_run_script_uses_env_and_relative_script_path() {
+        let work_dir = tempdir().expect("temp dir");
+        let scripts_dir = work_dir.path().join(".easy-deploy").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).expect("create scripts");
+        std::fs::write(scripts_dir.join("deploy.sh"), "#!/usr/bin/env sh\n").expect("write script");
+        let runner = Arc::new(RecordingRunner::default());
+        let executor = ComposeExecutor::new(runner.clone());
+
+        let output = executor
+            .run_script(
+                work_dir.path().to_path_buf(),
+                ".easy-deploy/scripts/deploy.sh",
+                &[
+                    ("ED_APP_KEY".to_owned(), "orders".to_owned()),
+                    ("ED_RELEASE_VERSION".to_owned(), "v1.2.3".to_owned()),
+                ],
+            )
+            .await
+            .expect("run script");
+
+        assert!(output.success);
+        assert_eq!(
+            output.command,
+            "env ED_APP_KEY=orders ED_RELEASE_VERSION=v1.2.3 sh .easy-deploy/scripts/deploy.sh"
+        );
+        let specs = runner.specs.lock().expect("lock specs");
+        assert_eq!(specs[0].program, "env");
+        assert_eq!(
+            specs[0].args,
+            [
+                "ED_APP_KEY=orders",
+                "ED_RELEASE_VERSION=v1.2.3",
+                "sh",
+                ".easy-deploy/scripts/deploy.sh"
+            ]
+        );
         assert_eq!(specs[0].current_dir, work_dir.path());
     }
 
@@ -1994,6 +2161,43 @@ mod tests {
                 "--connect-timeout",
                 "5",
                 "http://127.0.0.1:8080/healthz"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_executor_runs_remote_deploy_script_with_env() {
+        let work_dir = tempdir().expect("temp dir");
+        let runner = Arc::new(RecordingRunner::default());
+        let executor = SshExecutor::new(runner.clone());
+        let target = SshTarget::new("deploy", "10.0.2.11", 22).expect("valid ssh target");
+
+        let output = executor
+            .run_script(
+                &target,
+                work_dir.path().to_path_buf(),
+                "/opt/easy-deploy/apps/orders",
+                ".easy-deploy/scripts/deploy.sh",
+                &[
+                    ("ED_APP_KEY".to_owned(), "orders".to_owned()),
+                    ("ED_RELEASE_VERSION".to_owned(), "v1.2.3".to_owned()),
+                ],
+            )
+            .await
+            .expect("run remote deploy script");
+
+        assert!(output.success);
+        let specs = runner.specs.lock().expect("lock specs");
+        assert_eq!(specs[0].program, "ssh");
+        assert_eq!(
+            specs[0].args,
+            [
+                "-p",
+                "22",
+                "deploy@10.0.2.11",
+                "sh",
+                "-lc",
+                "cd '/opt/easy-deploy/apps/orders' && env ED_APP_KEY='orders' ED_RELEASE_VERSION='v1.2.3' sh '/opt/easy-deploy/apps/orders/.easy-deploy/scripts/deploy.sh'"
             ]
         );
     }

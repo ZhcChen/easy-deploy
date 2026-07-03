@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use chrono::{DateTime, FixedOffset, NaiveDateTime, SecondsFormat, Utc};
 use flate2::read::GzDecoder;
 use fs2::available_space;
 use serde_json::{Value as JsonValue, json};
@@ -12,7 +13,11 @@ use serde_yaml::Value;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tar::Archive;
-use tokio::{net::TcpStream, sync::mpsc};
+use tokio::{
+    net::TcpStream,
+    sync::mpsc,
+    time::{self, MissedTickBehavior},
+};
 use tracing::{error, warn};
 use url::Url;
 
@@ -24,7 +29,10 @@ use crate::{
     platform::{PlatformConfigError, PlatformConfigService},
     runtimefs::{
         AppRuntimeConfig, BinaryRuntimeConfig, BinaryRuntimeFiles, BinaryRuntimeMetadata,
-        META_DIR_NAME, RuntimeFs, RuntimeFsError, SYSTEMD_DIR_NAME, TargetNodeMetadata,
+        CLEANUP_SCRIPT_FILE_NAME, CURRENT_RELEASE_FILE_NAME, DEPLOY_STAGE_SCRIPT_FILE_NAME,
+        DeployScriptSet, META_DIR_NAME, POST_DEPLOY_SCRIPT_FILE_NAME, PRE_DEPLOY_SCRIPT_FILE_NAME,
+        RELEASES_DIR_NAME, ReleaseRuntimeMetadata, RuntimeFs, RuntimeFsError, SCRIPTS_DIR_NAME,
+        SWITCH_TRAFFIC_SCRIPT_FILE_NAME, SYSTEMD_DIR_NAME, TargetNodeMetadata,
     },
     tasks::{
         CreateTaskInput, RecordDeploymentRunInput, StartTaskStepInput, TaskError,
@@ -34,8 +42,10 @@ use crate::{
 
 const COMPOSE_TASK_QUEUE_CAPACITY: usize = 100;
 const MIN_COMPOSE_FREE_SPACE_BYTES: u64 = 512 * 1024 * 1024;
-pub const BINARY_PACKAGE_PATTERN: &str = "{service_key}_version_{x_y_z}.tar.gz";
-pub const BINARY_PACKAGE_EXAMPLE: &str = "orders-api-prod_version_1_2_3.tar.gz";
+pub const RELEASE_PACKAGE_PATTERN: &str = "{service_key}_version_{x_y_z}.tar.gz";
+pub const RELEASE_PACKAGE_EXAMPLE: &str = "orders-api-prod_version_1_2_3.tar.gz";
+pub const BINARY_PACKAGE_PATTERN: &str = RELEASE_PACKAGE_PATTERN;
+pub const BINARY_PACKAGE_EXAMPLE: &str = RELEASE_PACKAGE_EXAMPLE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeployStrategy {
@@ -74,10 +84,37 @@ pub fn normalize_deploy_strategy(value: &str) -> Result<String, AppError> {
     }
 }
 
+pub fn normalize_release_source(value: &str) -> Result<String, AppError> {
+    let source = value.trim();
+    if source.is_empty() {
+        return Ok("package_upload".to_owned());
+    }
+    match source {
+        "manual" | "package_upload" => Ok(source.to_owned()),
+        _ => Err(AppError::InvalidInput("发布来源不支持".to_owned())),
+    }
+}
+
 fn parse_deploy_strategy(value: &str) -> DeployStrategy {
     match value {
         "rolling_continue" => DeployStrategy::RollingContinue,
         _ => DeployStrategy::RollingStopOnFailure,
+    }
+}
+
+pub fn release_publish_mode_label(auto_queue_release: bool) -> &'static str {
+    if auto_queue_release {
+        "自动入队"
+    } else {
+        "手动发布"
+    }
+}
+
+fn release_status_after_upload(auto_queue_release: bool) -> &'static str {
+    if auto_queue_release {
+        "queued"
+    } else {
+        "received"
     }
 }
 
@@ -90,6 +127,7 @@ pub struct AppService {
     tasks: TaskService,
     compose_queue: ComposeTaskQueue,
     binary_queue: BinaryTaskQueue,
+    release_dispatch_queue: ReleaseDispatchQueue,
     platform: PlatformConfigService,
 }
 
@@ -181,11 +219,22 @@ struct BinaryTaskQueue {
     sender: mpsc::Sender<BinaryTaskJob>,
 }
 
+#[derive(Clone)]
+struct ReleaseDispatchQueue {
+    sender: mpsc::Sender<i64>,
+}
+
 #[derive(Clone, Debug)]
 struct ComposeTaskJob {
     task_id: i64,
     app_id: i64,
+    release_id: Option<i64>,
+    queue_id: Option<i64>,
     app_key: String,
+    app_name: String,
+    environment: String,
+    compose_strategy: String,
+    release_version: Option<String>,
     config_snapshot_id: Option<i64>,
     config_revision_no: i64,
     deploy_strategy: DeployStrategy,
@@ -196,6 +245,8 @@ struct ComposeTaskJob {
 struct BinaryTaskJob {
     task_id: i64,
     app_id: i64,
+    release_id: Option<i64>,
+    queue_id: Option<i64>,
     app_key: String,
     deploy_work_dir: String,
     unit_name: String,
@@ -275,10 +326,21 @@ impl ComposeTaskQueue {
         tasks: TaskService,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(COMPOSE_TASK_QUEUE_CAPACITY);
+        let queue = Self { sender };
+        let worker_queue = queue.clone();
         let _worker = tokio::spawn(async move {
-            compose_task_worker(receiver, db, runtime_fs, compose, systemd, tasks).await;
+            compose_task_worker(
+                receiver,
+                db,
+                runtime_fs,
+                compose,
+                systemd,
+                tasks,
+                worker_queue,
+            )
+            .await;
         });
-        Self { sender }
+        queue
     }
 
     async fn enqueue(&self, job: ComposeTaskJob) -> Result<(), AppError> {
@@ -312,6 +374,33 @@ impl BinaryTaskQueue {
     }
 }
 
+impl ReleaseDispatchQueue {
+    fn start(
+        db: SqlitePool,
+        runtime_fs: RuntimeFs,
+        tasks: TaskService,
+        compose_queue: ComposeTaskQueue,
+    ) -> Self {
+        let (sender, receiver) = mpsc::channel(COMPOSE_TASK_QUEUE_CAPACITY);
+        let timer_sender = sender.clone();
+        let schedule_db = db.clone();
+        let _worker = tokio::spawn(async move {
+            release_dispatch_worker(receiver, db, runtime_fs, tasks, compose_queue).await;
+        });
+        let _timer = tokio::spawn(async move {
+            release_schedule_worker(schedule_db, timer_sender).await;
+        });
+        Self { sender }
+    }
+
+    async fn enqueue(&self, app_id: i64) -> Result<(), AppError> {
+        self.sender
+            .send(app_id)
+            .await
+            .map_err(|_| AppError::Internal("后台发布调度队列不可用".to_owned()))
+    }
+}
+
 async fn compose_task_worker(
     mut receiver: mpsc::Receiver<ComposeTaskJob>,
     db: SqlitePool,
@@ -319,9 +408,19 @@ async fn compose_task_worker(
     compose: ComposeExecutor,
     systemd: SystemdExecutor,
     tasks: TaskService,
+    compose_queue: ComposeTaskQueue,
 ) {
     while let Some(job) = receiver.recv().await {
-        run_compose_task_job(&db, &runtime_fs, &compose, &systemd, &tasks, job).await;
+        run_compose_task_job(
+            &db,
+            &runtime_fs,
+            &compose,
+            &systemd,
+            &tasks,
+            &compose_queue,
+            job,
+        )
+        .await;
     }
 }
 
@@ -338,12 +437,292 @@ async fn binary_task_worker(
     }
 }
 
+async fn release_dispatch_worker(
+    mut receiver: mpsc::Receiver<i64>,
+    db: SqlitePool,
+    runtime_fs: RuntimeFs,
+    tasks: TaskService,
+    compose_queue: ComposeTaskQueue,
+) {
+    while let Some(app_id) = receiver.recv().await {
+        if let Err(err) =
+            dispatch_next_release_for_app(&db, &runtime_fs, &tasks, &compose_queue, app_id).await
+        {
+            error!(app_id, error = %err, "failed to dispatch next release");
+        }
+    }
+}
+
+async fn release_schedule_worker(db: SqlitePool, sender: mpsc::Sender<i64>) {
+    let mut interval = time::interval(Duration::from_secs(15));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let due_app_ids = match enqueue_due_scheduled_releases(&db).await {
+            Ok(app_ids) => app_ids,
+            Err(err) => {
+                error!(error = %err, "failed to enqueue scheduled releases");
+                continue;
+            }
+        };
+        for app_id in due_app_ids {
+            if sender.send(app_id).await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct DueScheduledQueueRow {
+    id: i64,
+    app_id: i64,
+}
+
+async fn enqueue_due_scheduled_releases(db: &SqlitePool) -> Result<Vec<i64>, AppError> {
+    let due_queue_items = sqlx::query_as::<_, DueScheduledQueueRow>(
+        r#"
+        SELECT id, app_id
+        FROM app_release_queue
+        WHERE scheduled_publish_at IS NOT NULL
+          AND scheduled_publish_at != ''
+          AND scheduled_publish_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+          AND status = 'scheduled'
+        ORDER BY scheduled_publish_at ASC, queue_seq ASC, id ASC
+        LIMIT 20
+        "#,
+    )
+    .fetch_all(db)
+    .await?;
+
+    let mut app_ids = Vec::new();
+    for item in due_queue_items {
+        let result = sqlx::query(
+            r#"
+            UPDATE app_release_queue
+            SET status = 'queued',
+                message = '到达计划发布时间，已自动进入发布队列',
+                scheduled_publish_at = NULL,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+              AND status = 'scheduled'
+            "#,
+        )
+        .bind(item.id)
+        .execute(db)
+        .await?;
+        if result.rows_affected() > 0 {
+            app_ids.push(item.app_id);
+        }
+    }
+    Ok(app_ids)
+}
+
+async fn dispatch_next_release_for_app(
+    db: &SqlitePool,
+    runtime_fs: &RuntimeFs,
+    tasks: &TaskService,
+    compose_queue: &ComposeTaskQueue,
+    app_id: i64,
+) -> Result<(), AppError> {
+    let has_running = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(1)
+        FROM app_release_queue
+        WHERE app_id = ?1
+          AND status = 'running'
+        "#,
+    )
+    .bind(app_id)
+    .fetch_one(db)
+    .await?;
+    if has_running > 0 {
+        return Ok(());
+    }
+
+    let queue_item = sqlx::query_as::<_, PendingReleaseQueueItem>(
+        r#"
+        SELECT
+            q.id,
+            q.release_id,
+            q.config_snapshot_id,
+            r.version,
+            r.version_code,
+            r.package_path,
+            r.published_at
+        FROM app_release_queue q
+        JOIN app_releases r ON r.id = q.release_id
+        WHERE q.app_id = ?1
+          AND q.status = 'queued'
+        ORDER BY q.queue_seq ASC, q.id ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(app_id)
+    .fetch_optional(db)
+    .await?;
+    let Some(queue_item) = queue_item else {
+        return Ok(());
+    };
+
+    let app = fetch_app_detail_by_id(db, app_id).await?;
+    ensure_app_enabled(&app)?;
+
+    let Some(snapshot_id) = queue_item.config_snapshot_id else {
+        finish_release_queue_item(
+            db,
+            queue_item.id,
+            queue_item.release_id,
+            "failed",
+            "发布队列缺少配置快照，无法执行部署",
+        )
+        .await?;
+        return Ok(());
+    };
+    let snapshot = sqlx::query_as::<_, AppConfigSnapshotItem>(
+        r#"
+        SELECT
+            id,
+            revision_no,
+            snapshot_kind,
+            compose_content,
+            env_content,
+            artifact_version,
+            config_hash,
+            metadata,
+            created_at
+        FROM app_config_snapshots
+        WHERE id = ?1
+          AND app_id = ?2
+        "#,
+    )
+    .bind(snapshot_id)
+    .bind(app_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| {
+        AppError::InvalidInput(format!("发布队列绑定的配置快照 {snapshot_id} 不存在"))
+    })?;
+
+    let target_nodes = target_node_metadata_for_app(db, app_id).await?;
+    ensure_has_enabled_targets(&app_target_nodes(db, app_id).await?)?;
+    let runtime_root = runtime_fs.app_root(&app.app_key)?;
+    let metadata_content =
+        render_runtime_metadata(&app, target_nodes, &runtime_root.to_string_lossy(), None);
+    runtime_fs
+        .save_app_runtime_files_with_scripts(
+            &app.app_key,
+            &snapshot.compose_content,
+            &snapshot.env_content,
+            &metadata_content,
+            &deploy_scripts_from_snapshot_metadata(&snapshot.metadata),
+        )
+        .await?;
+
+    let task_id = tasks
+        .create_task(CreateTaskInput {
+            task_kind: "release.deploy".to_owned(),
+            title: format!("发布版本 {} {}", queue_item.version, app.name),
+            app_id: Some(app.id),
+            release_id: Some(queue_item.release_id),
+            node_id: None,
+            created_by: "release-queue".to_owned(),
+        })
+        .await?;
+    if !mark_release_queue_running(db, queue_item.id, task_id).await? {
+        tasks
+            .fail_task(task_id, "发布队列状态已变化，无法继续派发")
+            .await?;
+        return Ok(());
+    }
+    sqlx::query(
+        r#"
+        UPDATE app_releases
+        SET status = 'deploying',
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ?1
+        "#,
+    )
+    .bind(queue_item.release_id)
+    .execute(db)
+    .await?;
+    tasks
+        .append_log(
+            task_id,
+            "system",
+            &format!(
+                "版本 {} 已进入串行发布队列，队列项 #{}",
+                queue_item.version, queue_item.id
+            ),
+        )
+        .await?;
+    tasks
+        .append_log(
+            task_id,
+            "system",
+            &format!("运行配置版本: config#{}", snapshot.revision_no),
+        )
+        .await?;
+    tasks
+        .append_log(
+            task_id,
+            "system",
+            &format!(
+                "版本包: {}，versionCode: {}，发布时间: {}",
+                queue_item.package_path, queue_item.version_code, queue_item.published_at
+            ),
+        )
+        .await?;
+    update_runtime_states_in_db(&RuntimeStatesUpdate {
+        db,
+        app_id: app.id,
+        runtime_status: "deploying",
+        service_count: None,
+        active_version: None,
+        message: "版本已进入串行发布执行阶段",
+        task_id: Some(task_id),
+        touch_deploy_time: false,
+    })
+    .await?;
+
+    let compose_strategy = load_app_compose_strategy(db, app.id).await?;
+    let job = ComposeTaskJob {
+        task_id,
+        app_id: app.id,
+        release_id: Some(queue_item.release_id),
+        queue_id: Some(queue_item.id),
+        app_key: app.app_key,
+        app_name: app.name,
+        environment: app.environment,
+        compose_strategy,
+        config_snapshot_id: Some(snapshot.id),
+        config_revision_no: snapshot.revision_no,
+        release_version: Some(queue_item.version),
+        deploy_strategy: parse_deploy_strategy(&app.deploy_strategy),
+        action: ComposeTaskAction::Up,
+    };
+    if let Err(err) = compose_queue.enqueue(job).await {
+        finish_release_queue_item(
+            db,
+            queue_item.id,
+            queue_item.release_id,
+            "failed",
+            err.message(),
+        )
+        .await?;
+        tasks.fail_task(task_id, err.message()).await?;
+        return Err(err);
+    }
+    Ok(())
+}
+
 async fn run_compose_task_job(
     db: &SqlitePool,
     runtime_fs: &RuntimeFs,
     compose: &ComposeExecutor,
     systemd: &SystemdExecutor,
     tasks: &TaskService,
+    compose_queue: &ComposeTaskQueue,
     job: ComposeTaskJob,
 ) {
     match tasks
@@ -447,7 +826,11 @@ async fn run_compose_task_job(
                     None
                 };
                 let active_version = if result.success {
-                    Some(format!("task-{}", job.task_id))
+                    Some(
+                        job.release_version
+                            .clone()
+                            .unwrap_or_else(|| format!("task-{}", job.task_id)),
+                    )
                 } else {
                     None
                 };
@@ -515,6 +898,66 @@ async fn run_compose_task_job(
     )
     .await;
 
+    if overall_success && let Some(release_version) = job.release_version.as_deref() {
+        match runtime_fs
+            .mark_current_release(&job.app_key, release_version)
+            .await
+        {
+            Ok(result) => {
+                if let Err(err) = tasks
+                    .append_log(
+                        job.task_id,
+                        "system",
+                        &format!(
+                            "已更新当前生效版本指针: {}",
+                            result.current_file.to_string_lossy()
+                        ),
+                    )
+                    .await
+                {
+                    error!(
+                        task_id = job.task_id,
+                        error = %err,
+                        "failed to append current release pointer log"
+                    );
+                }
+                if let Err(err) = sync_current_release_pointer_to_ssh_targets(
+                    tasks,
+                    job.task_id,
+                    &ssh,
+                    &work_dir,
+                    &job,
+                    &target_nodes,
+                )
+                .await
+                {
+                    overall_success = false;
+                    let message = err.message().to_owned();
+                    node_messages.push(message.clone());
+                    if let Err(log_err) = tasks.append_log(job.task_id, "stderr", &message).await {
+                        error!(
+                            task_id = job.task_id,
+                            error = %log_err,
+                            "failed to append current release pointer sync error"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                overall_success = false;
+                let message = format!("更新当前生效版本指针失败: {}", err.message());
+                node_messages.push(message.clone());
+                if let Err(log_err) = tasks.append_log(job.task_id, "stderr", &message).await {
+                    error!(
+                        task_id = job.task_id,
+                        error = %log_err,
+                        "failed to append current release pointer error"
+                    );
+                }
+            }
+        }
+    }
+
     let final_output = merge_command_outputs(outputs, overall_success, "Compose 部署");
     let deployment_status = if overall_success { "success" } else { "failed" };
     let deployment_message = if node_messages.is_empty() {
@@ -523,17 +966,28 @@ async fn run_compose_task_job(
         node_messages.join("；")
     };
     let final_output = prepend_failure_context(final_output, &deployment_message);
+    let artifact_version = job.release_version.as_deref().unwrap_or("");
+    let deploy_version_label = job
+        .release_version
+        .clone()
+        .unwrap_or_else(|| format!("task-{}", job.task_id));
+    let deploy_action = if job.release_id.is_some() {
+        "release_deploy"
+    } else {
+        job.action.deploy_action()
+    };
 
     if let Err(err) = tasks
         .record_deployment_run(RecordDeploymentRunInput {
             app_id: job.app_id,
             task_id: job.task_id,
-            deploy_action: job.action.deploy_action(),
+            release_id: job.release_id,
+            deploy_action,
             status: deployment_status,
             message: &deployment_message,
             config_snapshot_id: job.config_snapshot_id,
             config_revision_no: job.config_revision_no,
-            artifact_version: "",
+            artifact_version,
         })
         .await
     {
@@ -548,16 +1002,26 @@ async fn run_compose_task_job(
             db,
             job.app_id,
             &work_dir,
-            "compose_task",
-            &format!("task-{}", job.task_id),
-            "",
+            if job.release_id.is_some() {
+                "release_deploy"
+            } else {
+                "compose_task"
+            },
+            &deploy_version_label,
+            artifact_version,
             None,
         )
         .await
         {
             Ok(snapshot) => {
-                if let Err(err) =
-                    bind_deployment_run_snapshot(db, job.app_id, job.task_id, &snapshot, "").await
+                if let Err(err) = bind_deployment_run_snapshot(
+                    db,
+                    job.app_id,
+                    job.task_id,
+                    &snapshot,
+                    artifact_version,
+                )
+                .await
                 {
                     error!(
                         task_id = job.task_id,
@@ -583,6 +1047,42 @@ async fn run_compose_task_job(
             task_id = job.task_id,
             error = %err,
             "failed to finish compose task"
+        );
+    }
+    if let (Some(queue_id), Some(release_id)) = (job.queue_id, job.release_id) {
+        let queue_status = if overall_success { "success" } else { "failed" };
+        if let Err(err) =
+            finish_release_queue_item(db, queue_id, release_id, queue_status, &deployment_message)
+                .await
+        {
+            error!(
+                task_id = job.task_id,
+                queue_id,
+                release_id,
+                error = %err,
+                "failed to finish release queue item"
+            );
+        } else if overall_success
+            && let Err(err) =
+                dispatch_next_release_for_app(db, runtime_fs, tasks, compose_queue, job.app_id)
+                    .await
+        {
+            error!(
+                task_id = job.task_id,
+                app_id = job.app_id,
+                error = %err,
+                "failed to dispatch next queued release"
+            );
+        }
+    } else if overall_success
+        && let Err(err) =
+            dispatch_next_release_for_app(db, runtime_fs, tasks, compose_queue, job.app_id).await
+    {
+        error!(
+            task_id = job.task_id,
+            app_id = job.app_id,
+            error = %err,
+            "failed to dispatch queued release after compose task"
         );
     }
 }
@@ -949,6 +1449,7 @@ async fn run_binary_task_job(
         .record_deployment_run(RecordDeploymentRunInput {
             app_id: job.app_id,
             task_id: job.task_id,
+            release_id: None,
             deploy_action: job.action.deploy_action(),
             status: deployment_status,
             message: &deployment_message,
@@ -1013,6 +1514,21 @@ async fn run_binary_task_job(
             "failed to finish binary task"
         );
     }
+    if let (Some(queue_id), Some(release_id)) = (job.queue_id, job.release_id) {
+        let queue_status = if overall_success { "success" } else { "failed" };
+        if let Err(err) =
+            finish_release_queue_item(db, queue_id, release_id, queue_status, &deployment_message)
+                .await
+        {
+            error!(
+                task_id = job.task_id,
+                queue_id,
+                release_id,
+                error = %err,
+                "failed to finish release queue item"
+            );
+        }
+    }
 }
 
 async fn fail_compose_task(
@@ -1033,6 +1549,29 @@ async fn fail_compose_task(
         touch_deploy_time: false,
     })
     .await;
+    if let Ok(Some((queue_id, release_id))) = sqlx::query_as::<_, (i64, i64)>(
+        r#"
+        SELECT q.id, q.release_id
+        FROM app_release_queue q
+        WHERE q.task_id = ?1
+          AND q.status IN ('queued', 'running')
+        LIMIT 1
+        "#,
+    )
+    .bind(task_id)
+    .fetch_optional(db)
+    .await
+        && let Err(err) =
+            finish_release_queue_item(db, queue_id, release_id, "failed", message).await
+    {
+        error!(
+            task_id,
+            queue_id,
+            release_id,
+            error = %err,
+            "failed to mark compose release queue failed"
+        );
+    }
     if let Err(err) = tasks.fail_task(task_id, message).await {
         error!(
             task_id,
@@ -1060,6 +1599,29 @@ async fn fail_binary_task(
         touch_deploy_time: false,
     })
     .await;
+    if let Ok(Some((queue_id, release_id))) = sqlx::query_as::<_, (i64, i64)>(
+        r#"
+        SELECT q.id, q.release_id
+        FROM app_release_queue q
+        WHERE q.task_id = ?1
+          AND q.status IN ('queued', 'running')
+        LIMIT 1
+        "#,
+    )
+    .bind(task_id)
+    .fetch_optional(db)
+    .await
+        && let Err(err) =
+            finish_release_queue_item(db, queue_id, release_id, "failed", message).await
+    {
+        error!(
+            task_id,
+            queue_id,
+            release_id,
+            error = %err,
+            "failed to mark release queue failed"
+        );
+    }
     if let Err(err) = tasks.fail_task(task_id, message).await {
         error!(
             task_id,
@@ -1085,6 +1647,71 @@ struct ComposeTaskExecutionContext<'a> {
     task_id: i64,
     runtime_work_dir: &'a Path,
     job: &'a ComposeTaskJob,
+}
+
+#[derive(Clone, Copy)]
+enum DeployScriptSlot {
+    PreDeploy,
+    Deploy,
+    PostDeploy,
+    SwitchTraffic,
+    Cleanup,
+}
+
+impl DeployScriptSlot {
+    fn phase(self) -> &'static str {
+        match self {
+            Self::PreDeploy => "pre_deploy",
+            Self::Deploy => "deploy",
+            Self::PostDeploy => "post_deploy",
+            Self::SwitchTraffic => "switch_traffic",
+            Self::Cleanup => "cleanup",
+        }
+    }
+
+    fn step_key(self) -> &'static str {
+        match self {
+            Self::PreDeploy => "script.pre_deploy",
+            Self::Deploy => "script.deploy",
+            Self::PostDeploy => "script.post_deploy",
+            Self::SwitchTraffic => "script.switch_traffic",
+            Self::Cleanup => "script.cleanup",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::PreDeploy => "执行发布前脚本",
+            Self::Deploy => "执行部署脚本",
+            Self::PostDeploy => "执行发布后脚本",
+            Self::SwitchTraffic => "执行切流脚本",
+            Self::Cleanup => "执行清理脚本",
+        }
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::PreDeploy => PRE_DEPLOY_SCRIPT_FILE_NAME,
+            Self::Deploy => DEPLOY_STAGE_SCRIPT_FILE_NAME,
+            Self::PostDeploy => POST_DEPLOY_SCRIPT_FILE_NAME,
+            Self::SwitchTraffic => SWITCH_TRAFFIC_SCRIPT_FILE_NAME,
+            Self::Cleanup => CLEANUP_SCRIPT_FILE_NAME,
+        }
+    }
+
+    fn script_content<'a>(self, scripts: &'a DeployScriptSet) -> &'a str {
+        match self {
+            Self::PreDeploy => &scripts.pre_deploy,
+            Self::Deploy => &scripts.deploy,
+            Self::PostDeploy => &scripts.post_deploy,
+            Self::SwitchTraffic => &scripts.switch_traffic,
+            Self::Cleanup => &scripts.cleanup,
+        }
+    }
+
+    fn relative_path(self) -> String {
+        format!("{META_DIR_NAME}/{SCRIPTS_DIR_NAME}/{}", self.file_name())
+    }
 }
 
 async fn run_compose_task_on_node(
@@ -1215,23 +1842,67 @@ async fn run_compose_task_on_node(
     }
     outputs.extend(preflight.outputs);
 
+    let scripts = deploy_scripts_from_runtime_dir(context.runtime_work_dir);
+    if let Some(output) =
+        run_deploy_script_slot_on_node(context, node, DeployScriptSlot::PreDeploy, &scripts).await?
+    {
+        let success = output.success;
+        let message = deploy_script_step_message(DeployScriptSlot::PreDeploy, &output);
+        outputs.push(output);
+        if !success {
+            return Ok(ComposeNodeTaskResult {
+                success: false,
+                message,
+                outputs,
+            });
+        }
+    }
+
     context
         .tasks
-        .update_phase(context.task_id, "executing")
+        .update_phase(context.task_id, "deploy")
         .await?;
+    let deploy_script_configured = !DeployScriptSlot::Deploy
+        .script_content(&scripts)
+        .trim()
+        .is_empty();
+    let action_step_key = if deploy_script_configured {
+        DeployScriptSlot::Deploy.step_key()
+    } else {
+        "compose.action"
+    };
+    let action_step_title = if deploy_script_configured {
+        format!("{} {}", node.name, DeployScriptSlot::Deploy.title())
+    } else {
+        format!("{} {}", node.name, context.job.action.label())
+    };
+    let action_step_command = if deploy_script_configured {
+        format!("sh {}", DeployScriptSlot::Deploy.relative_path())
+    } else {
+        compose_action_command_label(context.job.action).to_owned()
+    };
     let action_step_id = start_task_step(
         context.tasks,
         context.task_id,
         Some(node),
-        "compose.action",
-        &format!("{} {}", node.name, context.job.action.label()),
-        compose_action_command_label(context.job.action),
+        action_step_key,
+        &action_step_title,
+        &action_step_command,
     )
     .await?;
-    let output = run_compose_action_on_node(context, node).await?;
+    let output = if deploy_script_configured {
+        run_deploy_script_command_on_node(context, node, DeployScriptSlot::Deploy).await?
+    } else {
+        run_compose_action_on_node(context, node).await?
+    };
     append_step_command_output(context.tasks, context.task_id, action_step_id, &output).await?;
     let command_success = output.success;
+    let script_command_message = deploy_script_configured
+        .then(|| deploy_script_step_message(DeployScriptSlot::Deploy, &output));
     let mut message = friendly_command_error(&output.output, "命令没有输出");
+    if let Some(script_message) = script_command_message {
+        message = script_message;
+    }
     finish_task_step(
         context.tasks,
         context.task_id,
@@ -1242,6 +1913,23 @@ async fn run_compose_task_on_node(
     )
     .await?;
     outputs.push(output);
+
+    if command_success
+        && let Some(output) =
+            run_deploy_script_slot_on_node(context, node, DeployScriptSlot::PostDeploy, &scripts)
+                .await?
+    {
+        let success = output.success;
+        message = deploy_script_step_message(DeployScriptSlot::PostDeploy, &output);
+        outputs.push(output);
+        if !success {
+            return Ok(ComposeNodeTaskResult {
+                success: false,
+                message,
+                outputs,
+            });
+        }
+    }
 
     if command_success && context.job.action.runs_health_check() {
         context
@@ -1261,11 +1949,46 @@ async fn run_compose_task_on_node(
         message = health.message.clone();
         finish_task_step_result(context.tasks, context.task_id, health_step_id, &health).await?;
         outputs.extend(health.outputs);
-        return Ok(ComposeNodeTaskResult {
-            success: health.success,
-            message,
-            outputs,
-        });
+        if !health.success {
+            return Ok(ComposeNodeTaskResult {
+                success: false,
+                message,
+                outputs,
+            });
+        }
+    }
+
+    if command_success && context.job.action == ComposeTaskAction::Up {
+        if let Some(output) =
+            run_deploy_script_slot_on_node(context, node, DeployScriptSlot::SwitchTraffic, &scripts)
+                .await?
+        {
+            let success = output.success;
+            message = deploy_script_step_message(DeployScriptSlot::SwitchTraffic, &output);
+            outputs.push(output);
+            if !success {
+                return Ok(ComposeNodeTaskResult {
+                    success: false,
+                    message,
+                    outputs,
+                });
+            }
+        }
+        if let Some(output) =
+            run_deploy_script_slot_on_node(context, node, DeployScriptSlot::Cleanup, &scripts)
+                .await?
+        {
+            let success = output.success;
+            message = deploy_script_step_message(DeployScriptSlot::Cleanup, &output);
+            outputs.push(output);
+            if !success {
+                return Ok(ComposeNodeTaskResult {
+                    success: false,
+                    message,
+                    outputs,
+                });
+            }
+        }
     }
 
     Ok(ComposeNodeTaskResult {
@@ -1343,6 +2066,157 @@ async fn run_compose_action_on_node(
             node.name, node.node_type
         ))),
     }
+}
+
+async fn run_deploy_script_slot_on_node(
+    context: &ComposeTaskExecutionContext<'_>,
+    node: &AppTargetNode,
+    slot: DeployScriptSlot,
+    scripts: &DeployScriptSet,
+) -> Result<Option<ComposeCommandOutput>, AppError> {
+    if slot.script_content(scripts).trim().is_empty() {
+        return Ok(None);
+    }
+    context
+        .tasks
+        .update_phase(context.task_id, slot.phase())
+        .await?;
+    let step_id = start_task_step(
+        context.tasks,
+        context.task_id,
+        Some(node),
+        slot.step_key(),
+        &format!("{} {}", node.name, slot.title()),
+        &format!("sh {}", slot.relative_path()),
+    )
+    .await?;
+    let output = run_deploy_script_command_on_node(context, node, slot).await?;
+    append_step_command_output(context.tasks, context.task_id, step_id, &output).await?;
+    let message = deploy_script_step_message(slot, &output);
+    finish_task_step(
+        context.tasks,
+        context.task_id,
+        step_id,
+        output.success,
+        output.status_code.map(i64::from),
+        &message,
+    )
+    .await?;
+    Ok(Some(output))
+}
+
+async fn run_deploy_script_command_on_node(
+    context: &ComposeTaskExecutionContext<'_>,
+    node: &AppTargetNode,
+    slot: DeployScriptSlot,
+) -> Result<ComposeCommandOutput, AppError> {
+    let env = compose_script_environment(context, node);
+    let script_path = slot.relative_path();
+    match node.node_type.as_str() {
+        "local" => context
+            .compose
+            .run_script(context.runtime_work_dir.to_path_buf(), &script_path, &env)
+            .await
+            .map_err(AppError::from),
+        "ssh" => {
+            let target = node.ssh_target()?;
+            let remote_work_dir = compose_node_deploy_work_dir(context.job, node);
+            context
+                .ssh
+                .run_script(
+                    &target,
+                    context.runtime_work_dir.to_path_buf(),
+                    &remote_work_dir,
+                    &script_path,
+                    &env,
+                )
+                .await
+                .map_err(AppError::from)
+        }
+        _ => Err(AppError::InvalidInput(format!(
+            "节点 {} 的类型 {} 不支持部署脚本",
+            node.name, node.node_type
+        ))),
+    }
+}
+
+fn deploy_script_step_message(slot: DeployScriptSlot, output: &ComposeCommandOutput) -> String {
+    if output.success {
+        format!("{}完成", slot.title())
+    } else {
+        friendly_command_error(&output.output, &format!("{}失败", slot.title()))
+    }
+}
+
+fn compose_script_environment(
+    context: &ComposeTaskExecutionContext<'_>,
+    node: &AppTargetNode,
+) -> Vec<(String, String)> {
+    let app_dir = compose_node_runtime_dir_for_script(context, node);
+    let release_id = context
+        .job
+        .release_id
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    let release_version = context.job.release_version.clone().unwrap_or_default();
+    let release_dir = if release_version.is_empty() {
+        String::new()
+    } else {
+        compose_script_join(&app_dir, &format!("{RELEASES_DIR_NAME}/{release_version}"))
+    };
+    let active_slot = "blue";
+    let standby = standby_slot(active_slot);
+    vec![
+        ("ED_APP_ID".to_owned(), context.job.app_id.to_string()),
+        ("ED_APP_KEY".to_owned(), context.job.app_key.clone()),
+        ("ED_APP_NAME".to_owned(), context.job.app_name.clone()),
+        ("ED_ENVIRONMENT".to_owned(), context.job.environment.clone()),
+        ("ED_APP_DIR".to_owned(), app_dir.clone()),
+        ("ED_RELEASE_ID".to_owned(), release_id),
+        ("ED_RELEASE_VERSION".to_owned(), release_version),
+        ("ED_RELEASE_DIR".to_owned(), release_dir.clone()),
+        (
+            "ED_RELEASE_BUNDLE_DIR".to_owned(),
+            compose_script_join(&release_dir, "bundle"),
+        ),
+        (
+            "ED_RELEASE_RENDER_DIR".to_owned(),
+            compose_script_join(&release_dir, "render"),
+        ),
+        (
+            "ED_CURRENT_LINK".to_owned(),
+            compose_script_join(&app_dir, CURRENT_RELEASE_FILE_NAME),
+        ),
+        ("ED_TARGET_NODE_KEY".to_owned(), node.node_key.clone()),
+        ("ED_TARGET_NODE_NAME".to_owned(), node.name.clone()),
+        (
+            "ED_COMPOSE_STRATEGY".to_owned(),
+            context.job.compose_strategy.clone(),
+        ),
+        ("ED_ACTIVE_SLOT".to_owned(), active_slot.to_owned()),
+        ("ED_STANDBY_SLOT".to_owned(), standby.to_owned()),
+    ]
+}
+
+fn compose_node_runtime_dir_for_script(
+    context: &ComposeTaskExecutionContext<'_>,
+    node: &AppTargetNode,
+) -> String {
+    if node.node_type == "ssh" {
+        compose_node_deploy_work_dir(context.job, node)
+    } else {
+        context
+            .runtime_work_dir
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+}
+
+fn compose_script_join(root: &str, relative: &str) -> String {
+    if root.trim().is_empty() {
+        return String::new();
+    }
+    remote_join(root, relative)
 }
 
 async fn run_compose_preflight_on_node(
@@ -1591,7 +2465,7 @@ async fn sync_compose_runtime_to_ssh_target(
 ) -> Result<Vec<ComposeCommandOutput>, AppError> {
     let target = node.ssh_target()?;
     let target_root = normalize_remote_target_root(&compose_node_deploy_work_dir(job, node))?;
-    let files = vec![
+    let mut files = vec![
         RemoteCopyFile {
             local_path: runtime_work_dir.join("compose.yaml"),
             remote_path: remote_join(&target_root, "compose.yaml"),
@@ -1605,6 +2479,40 @@ async fn sync_compose_runtime_to_ssh_target(
             remote_path: remote_join(&remote_join(&target_root, ".easy-deploy"), "app.yaml"),
         },
     ];
+    let meta_root = runtime_work_dir.join(META_DIR_NAME);
+    let legacy_deploy_script = meta_root.join("deploy.sh");
+    if legacy_deploy_script.is_file() {
+        files.push(RemoteCopyFile {
+            local_path: legacy_deploy_script,
+            remote_path: remote_join(&remote_join(&target_root, META_DIR_NAME), "deploy.sh"),
+        });
+    }
+    let scripts_dir = meta_root.join("scripts");
+    if scripts_dir.is_dir() {
+        files.extend(collect_remote_copy_files(
+            &scripts_dir,
+            &remote_join(&remote_join(&target_root, META_DIR_NAME), "scripts"),
+        )?);
+    }
+    if let Some(release_version) = job.release_version.as_deref() {
+        let release_dir = runtime_work_dir
+            .join(RELEASES_DIR_NAME)
+            .join(release_version);
+        files.extend(collect_remote_copy_files(
+            &release_dir,
+            &remote_join(
+                &remote_join(&target_root, RELEASES_DIR_NAME),
+                release_version,
+            ),
+        )?);
+    }
+    let current_release = runtime_work_dir.join(CURRENT_RELEASE_FILE_NAME);
+    if current_release.is_file() {
+        files.push(RemoteCopyFile {
+            local_path: current_release,
+            remote_path: remote_join(&target_root, CURRENT_RELEASE_FILE_NAME),
+        });
+    }
     let mut outputs = Vec::new();
     for dir in remote_parent_dirs(&files, &target_root) {
         let output = ssh
@@ -1650,6 +2558,44 @@ async fn sync_compose_runtime_to_ssh_target(
     Ok(outputs)
 }
 
+async fn sync_current_release_pointer_to_ssh_targets(
+    tasks: &TaskService,
+    task_id: i64,
+    ssh: &SshExecutor,
+    runtime_work_dir: &Path,
+    job: &ComposeTaskJob,
+    nodes: &[AppTargetNode],
+) -> Result<(), AppError> {
+    let current_file = runtime_work_dir.join(CURRENT_RELEASE_FILE_NAME);
+    if !current_file.is_file() {
+        return Err(AppError::Internal(format!(
+            "当前生效版本指针不存在: {}",
+            current_file.to_string_lossy()
+        )));
+    }
+    for node in nodes.iter().filter(|node| node.node_type == "ssh") {
+        let target = node.ssh_target()?;
+        let target_root = normalize_remote_target_root(&compose_node_deploy_work_dir(job, node))?;
+        let remote_path = remote_join(&target_root, CURRENT_RELEASE_FILE_NAME);
+        let output = ssh
+            .copy_file(
+                &target,
+                runtime_work_dir.to_path_buf(),
+                current_file.clone(),
+                &remote_path,
+            )
+            .await?;
+        append_intermediate_command_output_for_step(tasks, task_id, None, &output).await?;
+        if !output.success {
+            return Err(AppError::Internal(format!(
+                "SSH 同步当前生效版本指针到 {} 失败",
+                node.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn compose_node_deploy_work_dir(job: &ComposeTaskJob, node: &AppTargetNode) -> String {
     let app = target_work_dir_path(&node.work_dir, &job.app_key);
     if app.starts_with('/') {
@@ -1679,6 +2625,25 @@ fn count_compose_running_lines(output: &str) -> usize {
                 && !line.starts_with("---")
         })
         .count()
+}
+
+async fn load_app_compose_strategy(db: &SqlitePool, app_id: i64) -> Result<String, AppError> {
+    let strategy = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT compose_strategy
+        FROM apps
+        WHERE id = ?1
+        "#,
+    )
+    .bind(app_id)
+    .fetch_optional(db)
+    .await?
+    .unwrap_or_else(|| "recreate".to_owned());
+    let strategy = strategy.trim();
+    Ok(match strategy {
+        "blue_green" => "blue_green".to_owned(),
+        _ => "recreate".to_owned(),
+    })
 }
 
 #[derive(Debug)]
@@ -4243,6 +5208,7 @@ async fn record_deploy_config_snapshot(
 ) -> Result<RuntimeConfigSnapshotRecord, AppError> {
     let compose_content = fs::read_to_string(work_dir.join("compose.yaml")).unwrap_or_default();
     let env_content = fs::read_to_string(work_dir.join(".env")).unwrap_or_default();
+    let deploy_scripts = deploy_scripts_from_runtime_dir(work_dir);
     let mut tx = db.begin().await?;
     let snapshot = insert_runtime_config_snapshot(
         &mut tx,
@@ -4256,6 +5222,7 @@ async fn record_deploy_config_snapshot(
                 source,
                 work_dir.to_string_lossy(),
                 Some(version),
+                Some(&deploy_scripts),
                 binary,
             ),
         },
@@ -4362,6 +5329,9 @@ async fn fetch_app_detail_by_id(db: &SqlitePool, app_id: i64) -> Result<AppDetai
             a.app_type,
             a.deploy_mode,
             a.deploy_strategy,
+            a.release_source,
+            a.compose_strategy,
+            a.auto_queue_release,
             a.work_dir,
             a.status,
             GROUP_CONCAT(n.name, '、') AS target_names,
@@ -4697,6 +5667,7 @@ fn runtime_snapshot_metadata(
     source: &str,
     runtime_root: impl AsRef<str>,
     version: Option<&str>,
+    deploy_scripts: Option<&DeployScriptSet>,
     binary: Option<&BinaryConfigItem>,
 ) -> String {
     let mut metadata = json!({
@@ -4706,6 +5677,9 @@ fn runtime_snapshot_metadata(
     });
     if let Some(version) = version {
         metadata["version"] = json!(version);
+    }
+    if let Some(deploy_scripts) = deploy_scripts {
+        metadata["deploy_scripts"] = json!(deploy_scripts);
     }
     if let Some(binary) = binary {
         metadata["binary"] = json!({
@@ -5214,6 +6188,26 @@ fn binary_config_from_metadata(metadata: &str) -> BinaryConfigItem {
     }
 }
 
+fn deploy_scripts_from_snapshot_metadata(metadata: &str) -> DeployScriptSet {
+    serde_json::from_str::<JsonValue>(metadata)
+        .ok()
+        .and_then(|value| value.get("deploy_scripts").cloned())
+        .and_then(|value| serde_json::from_value::<DeployScriptSet>(value).ok())
+        .unwrap_or_default()
+}
+
+fn deploy_scripts_from_runtime_dir(work_dir: &Path) -> DeployScriptSet {
+    let scripts_dir = work_dir.join(META_DIR_NAME).join("scripts");
+    DeployScriptSet {
+        pre_deploy: fs::read_to_string(scripts_dir.join("pre_deploy.sh")).unwrap_or_default(),
+        deploy: fs::read_to_string(scripts_dir.join("deploy.sh")).unwrap_or_default(),
+        post_deploy: fs::read_to_string(scripts_dir.join("post_deploy.sh")).unwrap_or_default(),
+        switch_traffic: fs::read_to_string(scripts_dir.join("switch_traffic.sh"))
+            .unwrap_or_default(),
+        cleanup: fs::read_to_string(scripts_dir.join("cleanup.sh")).unwrap_or_default(),
+    }
+}
+
 fn yaml_string(value: &Value, key: &str) -> String {
     value
         .get(key)
@@ -5240,6 +6234,9 @@ pub struct AppListItem {
     pub app_type: String,
     pub deploy_mode: String,
     pub deploy_strategy: String,
+    pub release_source: String,
+    pub compose_strategy: String,
+    pub auto_queue_release: i64,
     pub work_dir: String,
     pub status: String,
     pub runtime_status: String,
@@ -5260,6 +6257,9 @@ pub struct AppDetailItem {
     pub app_type: String,
     pub deploy_mode: String,
     pub deploy_strategy: String,
+    pub release_source: String,
+    pub compose_strategy: String,
+    pub auto_queue_release: i64,
     pub work_dir: String,
     pub status: String,
     pub target_names: Option<String>,
@@ -5281,6 +6281,7 @@ pub struct AppConfigDetail {
     pub runtime_root: String,
     pub compose_content: String,
     pub env_content: String,
+    pub deploy_scripts: DeployScriptSet,
     pub metadata_content: String,
     pub service_names: Vec<String>,
     pub binary_runtime: BinaryRuntimeFiles,
@@ -5308,6 +6309,59 @@ pub struct AppDeploymentRunItem {
     pub artifact_version: String,
     pub started_at: String,
     pub finished_at: Option<String>,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct AppReleaseItem {
+    pub id: i64,
+    pub app_id: i64,
+    pub app_name: String,
+    pub app_key: String,
+    pub version: String,
+    pub version_code: i64,
+    pub package_name: String,
+    pub package_path: String,
+    pub extract_dir: String,
+    pub status: String,
+    pub source: String,
+    pub checksum_sha256: String,
+    pub size_bytes: i64,
+    pub published_at: String,
+    pub received_at: String,
+    pub scheduled_publish_at: Option<String>,
+    pub metadata: String,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct AppReleaseQueueItem {
+    pub id: i64,
+    pub app_id: i64,
+    pub app_name: String,
+    pub app_key: String,
+    pub release_id: i64,
+    pub version: String,
+    pub version_code: i64,
+    pub config_snapshot_id: Option<i64>,
+    pub queue_seq: i64,
+    pub status: String,
+    pub triggered_by: String,
+    pub message: String,
+    pub task_id: Option<i64>,
+    pub scheduled_publish_at: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+struct PendingReleaseQueueItem {
+    id: i64,
+    release_id: i64,
+    config_snapshot_id: Option<i64>,
+    version: String,
+    version_code: i64,
+    package_path: String,
+    published_at: String,
 }
 
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -5450,28 +6504,6 @@ pub struct BinaryReleaseDeployResult {
 }
 
 #[derive(Clone, Debug, sqlx::FromRow)]
-pub struct ArtifactListItem {
-    pub id: i64,
-    pub app_id: i64,
-    pub app_name: String,
-    pub app_key: String,
-    pub version: String,
-    pub version_code: i64,
-    pub artifact_path: String,
-    pub artifact_kind: String,
-    pub status: String,
-    pub metadata: String,
-    pub published_at: String,
-    pub created_at: String,
-}
-
-impl ArtifactListItem {
-    pub fn metadata_value(&self, key: &str) -> String {
-        artifact_metadata_value(&self.metadata, key)
-    }
-}
-
-#[derive(Clone, Debug, sqlx::FromRow)]
 pub struct AppNodeOption {
     pub id: i64,
     pub name: String,
@@ -5532,10 +6564,14 @@ pub struct CreateAppInput {
     pub environment: String,
     pub app_type: String,
     pub deploy_strategy: String,
+    pub release_source: String,
+    pub auto_queue_release: bool,
     pub work_dir: String,
     pub target_node_ids: Vec<i64>,
     pub compose_content: String,
     pub env_content: String,
+    pub deploy_scripts: DeployScriptSet,
+    pub health_check: HealthCheckConfig,
     pub binary_artifact_version: String,
     pub binary_artifact_path: String,
     pub binary_exec_args: String,
@@ -5556,6 +6592,7 @@ pub struct UpdateAppConfigInput {
     pub app_id: i64,
     pub compose_content: String,
     pub env_content: String,
+    pub deploy_scripts: DeployScriptSet,
     pub binary_artifact_version: String,
     pub binary_artifact_path: String,
     pub binary_exec_args: String,
@@ -5580,6 +6617,8 @@ pub struct UpdateAppMetadataInput {
     pub environment: String,
     pub work_dir: String,
     pub deploy_strategy: String,
+    pub release_source: String,
+    pub auto_queue_release: bool,
     pub target_node_ids: Vec<i64>,
 }
 
@@ -5587,6 +6626,18 @@ pub struct UpdateAppMetadataInput {
 pub struct UploadBinaryArtifactInput {
     pub app_id: i64,
     pub artifact_version: String,
+    pub version_code: Option<i64>,
+    pub published_at: String,
+    pub file_name: String,
+    pub bytes: Vec<u8>,
+    pub entry_file: String,
+    pub source: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct UploadReleasePackageInput {
+    pub app_id: i64,
+    pub release_version: String,
     pub version_code: Option<i64>,
     pub published_at: String,
     pub file_name: String,
@@ -5610,6 +6661,8 @@ struct RegisterBinaryArtifactInput {
 pub struct UploadBinaryArtifactResult {
     pub app_id: i64,
     pub app_key: String,
+    pub release_id: i64,
+    pub queue_id: Option<i64>,
     pub artifact_version: String,
     pub version_code: i64,
     pub artifact_path: String,
@@ -5617,14 +6670,37 @@ pub struct UploadBinaryArtifactResult {
     pub published_at: String,
     pub config_snapshot_id: i64,
     pub config_revision_no: i64,
+    pub queued: bool,
+    pub publish_status: String,
+    pub scheduled_publish_at: Option<String>,
 }
 
 #[derive(Clone, Debug)]
-pub struct ParsedBinaryPackageName {
+pub struct UploadReleasePackageResult {
+    pub app_id: i64,
+    pub app_key: String,
+    pub release_id: i64,
+    pub queue_id: Option<i64>,
+    pub release_version: String,
+    pub version_code: i64,
+    pub package_path: String,
+    pub package_kind: String,
+    pub published_at: String,
+    pub config_snapshot_id: i64,
+    pub config_revision_no: i64,
+    pub queued: bool,
+    pub publish_status: String,
+    pub scheduled_publish_at: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ParsedReleasePackageName {
     pub service_key: String,
     pub release_version: String,
     pub version_code: i64,
 }
+
+pub type ParsedBinaryPackageName = ParsedReleasePackageName;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BinaryPackageNameError {
@@ -5700,6 +6776,12 @@ impl AppService {
             systemd.clone(),
             tasks.clone(),
         );
+        let release_dispatch_queue = ReleaseDispatchQueue::start(
+            db.clone(),
+            runtime_fs.clone(),
+            tasks.clone(),
+            compose_queue.clone(),
+        );
         Self {
             db,
             runtime_fs,
@@ -5708,6 +6790,7 @@ impl AppService {
             tasks,
             compose_queue,
             binary_queue,
+            release_dispatch_queue,
             platform,
         }
     }
@@ -5735,6 +6818,9 @@ impl AppService {
                 a.app_type,
                 a.deploy_mode,
                 a.deploy_strategy,
+                a.release_source,
+                a.compose_strategy,
+                a.auto_queue_release,
                 a.work_dir,
                 a.status,
                 CASE
@@ -5844,6 +6930,7 @@ impl AppService {
             runtime_root: runtime_files.root_dir.to_string_lossy().to_string(),
             compose_content: runtime_files.compose_content,
             env_content: runtime_files.env_content,
+            deploy_scripts: runtime_files.deploy_scripts,
             metadata_content: runtime_files.metadata_content,
             service_names,
             binary_runtime,
@@ -6190,31 +7277,357 @@ impl AppService {
         .map_err(AppError::from)
     }
 
-    pub async fn list_artifacts(&self) -> Result<Vec<ArtifactListItem>, AppError> {
-        sqlx::query_as::<_, ArtifactListItem>(
+    pub async fn list_app_releases(&self) -> Result<Vec<AppReleaseItem>, AppError> {
+        sqlx::query_as::<_, AppReleaseItem>(
             r#"
             SELECT
-                ba.id,
-                ba.app_id,
+                r.id,
+                r.app_id,
                 a.name AS app_name,
                 a.app_key,
-                ba.version,
-                ba.version_code,
-                ba.artifact_path,
-                ba.artifact_kind,
-                ba.status,
-                ba.metadata,
-                ba.published_at,
-                ba.created_at
-            FROM binary_artifacts ba
-            JOIN apps a ON a.id = ba.app_id
-            ORDER BY ba.version_code DESC, ba.published_at DESC, ba.id DESC
+                r.version,
+                r.version_code,
+                r.package_name,
+                r.package_path,
+                r.extract_dir,
+                r.status,
+                r.source,
+                r.checksum_sha256,
+                r.size_bytes,
+                r.published_at,
+                r.received_at,
+                (
+                    SELECT q.scheduled_publish_at
+                    FROM app_release_queue q
+                    WHERE q.release_id = r.id
+                      AND q.status IN ('scheduled', 'queued', 'running')
+                    ORDER BY q.id DESC
+                    LIMIT 1
+                ) AS scheduled_publish_at,
+                r.metadata
+            FROM app_releases r
+            JOIN apps a ON a.id = r.app_id
+            ORDER BY r.version_code DESC, r.published_at DESC, r.id DESC
             LIMIT 100
             "#,
         )
         .fetch_all(&self.db)
         .await
         .map_err(AppError::from)
+    }
+
+    pub async fn list_app_release_queue(&self) -> Result<Vec<AppReleaseQueueItem>, AppError> {
+        sqlx::query_as::<_, AppReleaseQueueItem>(
+            r#"
+            SELECT
+                q.id,
+                q.app_id,
+                a.name AS app_name,
+                a.app_key,
+                q.release_id,
+                r.version,
+                r.version_code,
+                q.config_snapshot_id,
+                q.queue_seq,
+                q.status,
+                q.triggered_by,
+                q.message,
+                q.task_id,
+                q.scheduled_publish_at,
+                q.created_at,
+                q.started_at,
+                q.finished_at
+            FROM app_release_queue q
+            JOIN apps a ON a.id = q.app_id
+            JOIN app_releases r ON r.id = q.release_id
+            ORDER BY q.queue_seq ASC, q.id ASC
+            LIMIT 100
+            "#,
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(AppError::from)
+    }
+
+    pub async fn publish_release_now(
+        &self,
+        release_id: i64,
+        actor: &str,
+    ) -> Result<Option<i64>, AppError> {
+        let release = sqlx::query_as::<_, AppReleaseItem>(
+            r#"
+            SELECT
+                r.id,
+                r.app_id,
+                a.name AS app_name,
+                a.app_key,
+                r.version,
+                r.version_code,
+                r.package_name,
+                r.package_path,
+                r.extract_dir,
+                r.status,
+                r.source,
+                r.checksum_sha256,
+                r.size_bytes,
+                r.published_at,
+                r.received_at,
+                (
+                    SELECT q.scheduled_publish_at
+                    FROM app_release_queue q
+                    WHERE q.release_id = r.id
+                      AND q.status IN ('scheduled', 'queued', 'running')
+                    ORDER BY q.id DESC
+                    LIMIT 1
+                ) AS scheduled_publish_at,
+                r.metadata
+            FROM app_releases r
+            JOIN apps a ON a.id = r.app_id
+            WHERE r.id = ?1
+            "#,
+        )
+        .bind(release_id)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or_else(|| AppError::InvalidInput("发布版本不存在".to_owned()))?;
+
+        let app = self.fetch_app_detail(release.app_id).await?;
+        ensure_app_enabled(&app)?;
+        self.ensure_compose_app(&app)?;
+        if matches!(release.status.as_str(), "queued" | "deploying") {
+            return Err(AppError::Conflict("该发布版本已经在发布队列中".to_owned()));
+        }
+
+        let snapshot_id = self
+            .resolve_release_snapshot_id(release.app_id, &release.metadata)
+            .await?;
+        let mut tx = self.db.begin().await?;
+        let queue_id = enqueue_app_release(
+            &mut tx,
+            release.app_id,
+            release.id,
+            snapshot_id,
+            actor,
+            "手动加入发布队列",
+            "queued",
+            None,
+        )
+        .await
+        .map(Some)
+        .or_else(|err| match err {
+            sqlx::Error::Database(db_err) if db_err.is_unique_violation() => Ok(None),
+            other => Err(other),
+        })?;
+        sqlx::query(
+            r#"
+            UPDATE app_releases
+            SET status = 'queued',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+            "#,
+        )
+        .bind(release.id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.enqueue_release_dispatch(release.app_id).await?;
+        Ok(queue_id)
+    }
+
+    pub async fn schedule_release_publish(
+        &self,
+        release_id: i64,
+        scheduled_publish_at: &str,
+    ) -> Result<String, AppError> {
+        let scheduled_publish_at = normalize_published_at(scheduled_publish_at)?
+            .ok_or_else(|| AppError::InvalidInput("请填写计划发布时间".to_owned()))?;
+        let release = sqlx::query_as::<_, AppReleaseItem>(
+            r#"
+            SELECT
+                r.id,
+                r.app_id,
+                a.name AS app_name,
+                a.app_key,
+                r.version,
+                r.version_code,
+                r.package_name,
+                r.package_path,
+                r.extract_dir,
+                r.status,
+                r.source,
+                r.checksum_sha256,
+                r.size_bytes,
+                r.published_at,
+                r.received_at,
+                (
+                    SELECT q.scheduled_publish_at
+                    FROM app_release_queue q
+                    WHERE q.release_id = r.id
+                      AND q.status IN ('scheduled', 'queued', 'running')
+                    ORDER BY q.id DESC
+                    LIMIT 1
+                ) AS scheduled_publish_at,
+                r.metadata
+            FROM app_releases r
+            JOIN apps a ON a.id = r.app_id
+            WHERE r.id = ?1
+            "#,
+        )
+        .bind(release_id)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or_else(|| AppError::InvalidInput("发布版本不存在".to_owned()))?;
+
+        let app = self.fetch_app_detail(release.app_id).await?;
+        ensure_app_enabled(&app)?;
+        self.ensure_compose_app(&app)?;
+        if matches!(release.status.as_str(), "queued" | "deploying") {
+            return Err(AppError::Conflict("该发布版本已经在发布队列中".to_owned()));
+        }
+
+        let snapshot_id = self
+            .resolve_release_snapshot_id(release.app_id, &release.metadata)
+            .await?;
+        let metadata = release_metadata_with_snapshot(
+            &release.metadata,
+            snapshot_id,
+            Some(release.version_code),
+        )?;
+        let mut tx = self.db.begin().await?;
+        enqueue_app_release(
+            &mut tx,
+            release.app_id,
+            release.id,
+            snapshot_id,
+            "scheduler",
+            &format!("计划在 {scheduled_publish_at} 发布"),
+            "scheduled",
+            Some(&scheduled_publish_at),
+        )
+        .await
+        .map_err(AppError::from)?;
+        sqlx::query(
+            r#"
+            UPDATE app_releases
+            SET status = 'queued',
+                metadata = ?2,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+            "#,
+        )
+        .bind(release.id)
+        .bind(&metadata)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(scheduled_publish_at)
+    }
+
+    pub async fn cancel_scheduled_release(&self, release_id: i64) -> Result<(), AppError> {
+        let mut tx = self.db.begin().await?;
+        let result = sqlx::query(
+            r#"
+            UPDATE app_release_queue
+            SET status = 'canceled',
+                message = '已取消定时发布',
+                scheduled_publish_at = NULL,
+                finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE release_id = ?1
+              AND status = 'scheduled'
+              AND scheduled_publish_at IS NOT NULL
+              AND scheduled_publish_at != ''
+            "#,
+        )
+        .bind(release_id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::InvalidInput(
+                "当前发布版本没有待执行的定时发布".to_owned(),
+            ));
+        }
+        sqlx::query(
+            r#"
+            UPDATE app_releases
+            SET status = 'received',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+            "#,
+        )
+        .bind(release_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn cancel_release_queue_item(&self, queue_id: i64) -> Result<i64, AppError> {
+        let queue = sqlx::query_as::<_, (i64, i64, String)>(
+            r#"
+            SELECT app_id, release_id, status
+            FROM app_release_queue
+            WHERE id = ?1
+            "#,
+        )
+        .bind(queue_id)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or_else(|| AppError::InvalidInput("发布队列项不存在".to_owned()))?;
+        if !matches!(queue.2.as_str(), "queued" | "scheduled") {
+            return Err(AppError::InvalidInput(
+                "只能取消等待中或定时等待的发布队列项".to_owned(),
+            ));
+        }
+
+        let mut tx = self.db.begin().await?;
+        sqlx::query(
+            r#"
+            UPDATE app_release_queue
+            SET status = 'canceled',
+                message = '已取消待发布队列',
+                scheduled_publish_at = NULL,
+                finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+            "#,
+        )
+        .bind(queue_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE app_releases
+            SET status = 'received',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+            "#,
+        )
+        .bind(queue.1)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.enqueue_release_dispatch(queue.0).await?;
+        Ok(queue.0)
+    }
+
+    async fn resolve_release_snapshot_id(
+        &self,
+        app_id: i64,
+        metadata: &str,
+    ) -> Result<i64, AppError> {
+        if let Some(snapshot_id) = release_metadata_snapshot_id(metadata) {
+            return Ok(snapshot_id);
+        }
+        let snapshot = self
+            .latest_config_snapshot(app_id)
+            .await?
+            .ok_or_else(|| AppError::InvalidInput("当前应用还没有可用配置快照".to_owned()))?;
+        Ok(snapshot.id)
+    }
+
+    async fn enqueue_release_dispatch(&self, app_id: i64) -> Result<(), AppError> {
+        self.release_dispatch_queue.enqueue(app_id).await
     }
 
     pub async fn list_services(&self) -> Result<Vec<ServiceListItem>, AppError> {
@@ -6307,6 +7720,8 @@ impl AppService {
         let environment = normalize_app_environment(&input.environment)?;
         let deploy_mode = app_type.clone();
         let deploy_strategy = normalize_deploy_strategy(&input.deploy_strategy)?;
+        let release_source = normalize_release_source(&input.release_source)?;
+        let auto_queue_release = input.auto_queue_release;
         let work_dir = required_text(&input.work_dir, "请输入部署目录")?;
         let description = input.description.trim().to_owned();
         let runtime_name = name.clone();
@@ -6363,10 +7778,12 @@ impl AppService {
                 app_type,
                 deploy_mode,
                 deploy_strategy,
+                release_source,
+                auto_queue_release,
                 work_dir,
                 status
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready')
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'ready')
             RETURNING id
             "#,
         )
@@ -6377,6 +7794,8 @@ impl AppService {
         .bind(&app_type)
         .bind(&deploy_mode)
         .bind(&deploy_strategy)
+        .bind(&release_source)
+        .bind(if auto_queue_release { 1 } else { 0 })
         .bind(&work_dir)
         .fetch_one(&mut *tx)
         .await?;
@@ -6404,10 +7823,27 @@ impl AppService {
         sqlx::query(
             r#"
             INSERT INTO app_health_checks(app_id, check_kind)
-            VALUES (?1, 'none')
+            VALUES (?1, ?2)
             "#,
         )
         .bind(app_id)
+        .bind(input.health_check.kind.as_str())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE app_health_checks
+            SET endpoint = ?2,
+                timeout_secs = ?3,
+                expected_status = ?4,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE app_id = ?1
+            "#,
+        )
+        .bind(app_id)
+        .bind(&input.health_check.endpoint)
+        .bind(input.health_check.timeout_secs as i64)
+        .bind(input.health_check.expected_status as i64)
         .execute(&mut *tx)
         .await?;
 
@@ -6515,6 +7951,7 @@ impl AppService {
                     .collect(),
                 compose_content: compose_content.clone(),
                 env_content: env_content.clone(),
+                deploy_scripts: input.deploy_scripts.clone(),
                 binary: binary_config.as_ref().map(to_binary_runtime_metadata),
             })
             .await?;
@@ -6535,6 +7972,7 @@ impl AppService {
             "manual",
             runtime_result.root_dir.to_string_lossy(),
             None,
+            Some(&input.deploy_scripts),
             binary_config.as_ref(),
         );
         let initial_snapshot = insert_runtime_config_snapshot(
@@ -6620,11 +8058,12 @@ impl AppService {
             binary_config.as_ref(),
         );
         self.runtime_fs
-            .save_app_runtime_files(
+            .save_app_runtime_files_with_scripts(
                 &app.app_key,
                 &compose_content,
                 &env_content,
                 &metadata_content,
+                &input.deploy_scripts,
             )
             .await?;
         if let Some(config) = &binary_config {
@@ -6684,6 +8123,7 @@ impl AppService {
                     "manual",
                     runtime_root.to_string_lossy(),
                     None,
+                    Some(&input.deploy_scripts),
                     binary_config.as_ref(),
                 ),
             },
@@ -6712,6 +8152,8 @@ impl AppService {
         let environment = normalize_app_environment(&input.environment)?;
         let work_dir = required_text(&input.work_dir, "请输入部署目录")?;
         let deploy_strategy = normalize_deploy_strategy(&input.deploy_strategy)?;
+        let release_source = normalize_release_source(&input.release_source)?;
+        let auto_queue_release = input.auto_queue_release;
         if input.target_node_ids.is_empty() {
             return Err(AppError::InvalidInput(
                 "至少需要选择一个目标节点".to_owned(),
@@ -6734,6 +8176,8 @@ impl AppService {
         app.environment = environment.clone();
         app.work_dir = work_dir.clone();
         app.deploy_strategy = deploy_strategy.clone();
+        app.release_source = release_source.clone();
+        app.auto_queue_release = if auto_queue_release { 1 } else { 0 };
         let binary_config_for_metadata = if app.app_type == "binary" {
             if binary_config.working_dir.trim().is_empty()
                 || binary_config.working_dir == previous_work_dir
@@ -6786,6 +8230,8 @@ impl AppService {
                 environment = ?4,
                 work_dir = ?5,
                 deploy_strategy = ?6,
+                release_source = ?7,
+                auto_queue_release = ?8,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE id = ?1
             "#,
@@ -6796,6 +8242,8 @@ impl AppService {
         .bind(&app.environment)
         .bind(&app.work_dir)
         .bind(&app.deploy_strategy)
+        .bind(&app.release_source)
+        .bind(app.auto_queue_release)
         .execute(&mut *tx)
         .await?;
         sqlx::query("DELETE FROM app_targets WHERE app_id = ?1")
@@ -6849,19 +8297,197 @@ impl AppService {
     ) -> Result<UploadBinaryArtifactResult, AppError> {
         let app = self.fetch_app_detail(input.app_id).await?;
         ensure_app_enabled(&app)?;
-        self.ensure_no_active_deploy_task(app.id).await?;
         self.ensure_binary_app(&app)?;
-        self.register_binary_artifact(RegisterBinaryArtifactInput {
-            app,
-            artifact_version: input.artifact_version,
-            version_code: input.version_code,
-            published_at: input.published_at,
-            file_name: input.file_name,
-            bytes: input.bytes,
-            entry_file: input.entry_file,
-            source: input.source,
+        let result = self
+            .register_binary_artifact(RegisterBinaryArtifactInput {
+                app,
+                artifact_version: input.artifact_version,
+                version_code: input.version_code,
+                published_at: input.published_at,
+                file_name: input.file_name,
+                bytes: input.bytes,
+                entry_file: input.entry_file,
+                source: input.source,
+            })
+            .await?;
+        if result.queued {
+            self.enqueue_release_dispatch(result.app_id).await?;
+        }
+        Ok(result)
+    }
+
+    pub async fn upload_release_package(
+        &self,
+        input: UploadReleasePackageInput,
+    ) -> Result<UploadReleasePackageResult, AppError> {
+        let app = self.fetch_app_detail(input.app_id).await?;
+        ensure_app_enabled(&app)?;
+        self.ensure_compose_app(&app)?;
+        let release_version = normalize_release_id(&input.release_version)?;
+        let version_code = match input.version_code {
+            Some(version_code) if version_code > 0 => version_code,
+            Some(_) => {
+                return Err(AppError::InvalidInput(
+                    "versionCode 必须是大于 0 的整数".to_owned(),
+                ));
+            }
+            None => version_code_from_release(&release_version).ok_or_else(|| {
+                AppError::InvalidInput(
+                    "发布版本必须是 vX.Y.Z 格式，或显式传入 versionCode".to_owned(),
+                )
+            })?,
+        };
+        let published_at = match normalize_published_at(&input.published_at)? {
+            Some(value) => value,
+            None => sqlite_now(&self.db).await?,
+        };
+        let received_at = sqlite_now(&self.db).await?;
+        let file_name = required_text(&input.file_name, "请选择版本包文件")?;
+        if input.bytes.is_empty() {
+            return Err(AppError::InvalidInput("上传文件不能为空".to_owned()));
+        }
+        let package_kind = artifact_kind_from_file_name(&file_name);
+        let uploaded_path = self
+            .runtime_fs
+            .save_release_package_file(&app.app_key, &release_version, &file_name, &input.bytes)
+            .await?;
+        if package_kind == "tar_gz" {
+            extract_tar_gz(&uploaded_path, &release_version)?;
+        }
+        let entry_file = if input.entry_file.trim().is_empty() {
+            String::new()
+        } else {
+            normalize_entry_file(&input.entry_file, &file_name, "package")?
+        };
+        let checksum = sha256_hex(&input.bytes);
+        let size_bytes = input.bytes.len() as u64;
+        let runtime_root = self.runtime_fs.app_root(&app.app_key)?;
+        let runtime_files = self.runtime_fs.load_app_config(&app.app_key).await?;
+        let auto_queue_release = app.auto_queue_release == 1;
+        let release_status = release_status_after_upload(auto_queue_release);
+        let package_path = target_work_dir_path(
+            &app.work_dir,
+            &format!("releases/{release_version}/{file_name}"),
+        );
+        let extract_dir =
+            target_work_dir_path(&app.work_dir, &format!("releases/{release_version}"));
+
+        let mut tx = self.db.begin().await?;
+        let config_snapshot = insert_runtime_config_snapshot(
+            &mut tx,
+            RuntimeConfigSnapshotInput {
+                app_id: app.id,
+                snapshot_kind: "manual",
+                compose_content: &runtime_files.compose_content,
+                env_content: &runtime_files.env_content,
+                artifact_version: &release_version,
+                metadata: runtime_snapshot_metadata(
+                    "package_upload",
+                    runtime_root.to_string_lossy(),
+                    Some(&release_version),
+                    Some(&runtime_files.deploy_scripts),
+                    None,
+                ),
+            },
+        )
+        .await?;
+        self.runtime_fs
+            .save_release_runtime_metadata(ReleaseRuntimeMetadata {
+                app_key: app.app_key.clone(),
+                app_id: app.id,
+                app_name: app.name.clone(),
+                release_version: release_version.clone(),
+                version_code,
+                package_name: file_name.clone(),
+                package_path: package_path.clone(),
+                extract_dir: extract_dir.clone(),
+                checksum_sha256: checksum.clone(),
+                size_bytes,
+                published_at: published_at.clone(),
+                received_at: received_at.clone(),
+                source: artifact_channel_from_source(&input.source).to_owned(),
+                config_snapshot_id: Some(config_snapshot.id),
+                config_revision_no: Some(config_snapshot.revision_no),
+            })
+            .await?;
+        let release_metadata = render_artifact_metadata(ArtifactMetadataInput {
+            source: "package_upload",
+            source_detail: upload_source(&input.source),
+            unit_name: "",
+            uploaded_path: &uploaded_path.to_string_lossy(),
+            original_file_name: &file_name,
+            entry_file: &entry_file,
+            sha256: &checksum,
+            size_bytes,
+            config_snapshot_id: Some(config_snapshot.id),
+            config_revision_no: Some(config_snapshot.revision_no),
+        });
+        let release_id = upsert_app_release(
+            &mut tx,
+            app.id,
+            &release_version,
+            version_code,
+            &file_name,
+            &package_path,
+            &uploaded_path
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_string_lossy(),
+            artifact_channel_from_source(&input.source),
+            &checksum,
+            size_bytes,
+            &published_at,
+            release_status,
+            &release_metadata,
+        )
+        .await?;
+        let queue_id = if auto_queue_release {
+            Some(
+                enqueue_app_release(
+                    &mut tx,
+                    app.id,
+                    release_id,
+                    config_snapshot.id,
+                    upload_source(&input.source),
+                    &format!("版本 {} 已入队，等待串行发布", release_version),
+                    "queued",
+                    None,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        sqlx::query(
+            r#"
+            UPDATE apps
+            SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+            "#,
+        )
+        .bind(app.id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if queue_id.is_some() {
+            self.enqueue_release_dispatch(app.id).await?;
+        }
+        Ok(UploadReleasePackageResult {
+            app_id: app.id,
+            app_key: app.app_key,
+            release_id,
+            queue_id,
+            release_version,
+            version_code,
+            package_path,
+            package_kind: package_kind.to_owned(),
+            published_at,
+            config_snapshot_id: config_snapshot.id,
+            config_revision_no: config_snapshot.revision_no,
+            queued: auto_queue_release,
+            publish_status: release_publish_mode_label(auto_queue_release).to_owned(),
+            scheduled_publish_at: None,
         })
-        .await
     }
 
     pub async fn register_binary_artifact_from_task(
@@ -6871,17 +8497,22 @@ impl AppService {
         let app = self.fetch_app_detail(input.app_id).await?;
         ensure_app_enabled(&app)?;
         self.ensure_binary_app(&app)?;
-        self.register_binary_artifact(RegisterBinaryArtifactInput {
-            app,
-            artifact_version: input.artifact_version,
-            version_code: input.version_code,
-            published_at: input.published_at,
-            file_name: input.file_name,
-            bytes: input.bytes,
-            entry_file: input.entry_file,
-            source: input.source,
-        })
-        .await
+        let result = self
+            .register_binary_artifact(RegisterBinaryArtifactInput {
+                app,
+                artifact_version: input.artifact_version,
+                version_code: input.version_code,
+                published_at: input.published_at,
+                file_name: input.file_name,
+                bytes: input.bytes,
+                entry_file: input.entry_file,
+                source: input.source,
+            })
+            .await?;
+        if result.queued {
+            self.enqueue_release_dispatch(result.app_id).await?;
+        }
+        Ok(result)
     }
 
     async fn register_binary_artifact(
@@ -6911,7 +8542,7 @@ impl AppService {
         if input.bytes.is_empty() {
             return Err(AppError::InvalidInput("上传文件不能为空".to_owned()));
         }
-        let mut config = self.load_binary_config(&app).await?;
+        let current_config = self.load_binary_config(&app).await?;
         let artifact_kind = artifact_kind_from_file_name(&file_name);
         let uploaded_path = self
             .runtime_fs
@@ -6939,48 +8570,35 @@ impl AppService {
             &app.work_dir,
             &format!("releases/{artifact_version}/{entry_file}"),
         );
-
-        config.artifact_version = artifact_version.clone();
-        config.artifact_path = target_artifact_path;
-        if config.working_dir.trim().is_empty() {
-            config.working_dir = app.work_dir.clone();
-        }
-        if config.unit_name.trim().is_empty() {
-            config.unit_name = format!("easy-deploy-{}.service", app.app_key);
-        }
-        if config.service_user.trim().is_empty() {
-            config.service_user = "deploy".to_owned();
-        }
-
         let runtime_root = self.runtime_fs.app_root(&app.app_key)?;
-        let target_nodes = self.target_node_metadata_for_app(app.id).await?;
         let runtime_files = self.runtime_fs.load_app_config(&app.app_key).await?;
-        let metadata_content = render_runtime_metadata(
-            &app,
-            target_nodes
-                .iter()
-                .map(|node| TargetNodeMetadata {
-                    node_key: node.node_key.clone(),
-                    name: node.name.clone(),
-                })
-                .collect(),
-            &runtime_root.to_string_lossy(),
-            Some(&config),
-        );
-        self.runtime_fs
-            .save_app_runtime_files(&app.app_key, "", &config.env_content, &metadata_content)
-            .await?;
-        self.runtime_fs
-            .save_binary_runtime_files(to_binary_runtime_config(
-                app.id,
-                &app.app_key,
-                &app.name,
-                &config,
-            ))
-            .await?;
+        let mut release_config = current_config.clone();
+        release_config.artifact_version = artifact_version.clone();
+        release_config.artifact_path = target_artifact_path.clone();
+        if release_config.working_dir.trim().is_empty() {
+            release_config.working_dir = app.work_dir.clone();
+        }
+        if release_config.unit_name.trim().is_empty() {
+            release_config.unit_name = format!("easy-deploy-{}.service", app.app_key);
+        }
+        if release_config.service_user.trim().is_empty() {
+            release_config.service_user = "deploy".to_owned();
+        }
+        let upload_metadata = render_artifact_metadata(ArtifactMetadataInput {
+            source: "upload",
+            source_detail: upload_source(&input.source),
+            unit_name: &release_config.unit_name,
+            uploaded_path: &uploaded_path.to_string_lossy(),
+            original_file_name: &file_name,
+            entry_file: &entry_file,
+            sha256: &checksum,
+            size_bytes,
+            config_snapshot_id: None,
+            config_revision_no: None,
+        });
 
         let mut tx = self.db.begin().await?;
-        upsert_binary_config(&mut tx, app.id, &config).await?;
+        upsert_binary_config(&mut tx, app.id, &release_config).await?;
         sqlx::query(
             r#"
             INSERT INTO binary_artifacts(
@@ -7006,18 +8624,10 @@ impl AppService {
         .bind(app.id)
         .bind(&artifact_version)
         .bind(version_code)
-        .bind(&config.artifact_path)
+        .bind(&target_artifact_path)
         .bind(artifact_kind)
         .bind(&published_at)
-        .bind(render_artifact_metadata(ArtifactMetadataInput {
-            source: upload_source(&input.source),
-            unit_name: &config.unit_name,
-            uploaded_path: &uploaded_path.to_string_lossy(),
-            original_file_name: &file_name,
-            entry_file: &entry_file,
-            sha256: &checksum,
-            size_bytes,
-        }))
+        .bind(&upload_metadata)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -7047,17 +8657,68 @@ impl AppService {
                 app_id: app.id,
                 snapshot_kind: "manual",
                 compose_content: &runtime_files.compose_content,
-                env_content: &config.env_content,
+                env_content: &release_config.env_content,
                 artifact_version: &artifact_version,
                 metadata: runtime_snapshot_metadata(
                     "binary_upload",
                     runtime_root.to_string_lossy(),
                     Some(&artifact_version),
-                    Some(&config),
+                    Some(&runtime_files.deploy_scripts),
+                    Some(&release_config),
                 ),
             },
         )
         .await?;
+        let auto_queue_release = app.auto_queue_release == 1;
+        let release_status = release_status_after_upload(auto_queue_release);
+        let release_metadata = render_artifact_metadata(ArtifactMetadataInput {
+            source: "upload",
+            source_detail: upload_source(&input.source),
+            unit_name: &release_config.unit_name,
+            uploaded_path: &uploaded_path.to_string_lossy(),
+            original_file_name: &file_name,
+            entry_file: &entry_file,
+            sha256: &checksum,
+            size_bytes,
+            config_snapshot_id: Some(config_snapshot.id),
+            config_revision_no: Some(config_snapshot.revision_no),
+        });
+        let release_id = upsert_app_release(
+            &mut tx,
+            app.id,
+            &artifact_version,
+            version_code,
+            &file_name,
+            &target_artifact_path,
+            &uploaded_path
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_string_lossy(),
+            artifact_channel_from_source(&input.source),
+            &checksum,
+            size_bytes,
+            &published_at,
+            release_status,
+            &release_metadata,
+        )
+        .await?;
+        let queue_id = if auto_queue_release {
+            Some(
+                enqueue_app_release(
+                    &mut tx,
+                    app.id,
+                    release_id,
+                    config_snapshot.id,
+                    upload_source(&input.source),
+                    &format!("版本 {} 已入队，等待串行发布", artifact_version),
+                    "queued",
+                    None,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         sqlx::query(
             r#"
             UPDATE apps
@@ -7073,13 +8734,18 @@ impl AppService {
         Ok(UploadBinaryArtifactResult {
             app_id: app.id,
             app_key: app.app_key,
+            release_id,
+            queue_id,
             artifact_version,
             version_code,
-            artifact_path: config.artifact_path,
+            artifact_path: target_artifact_path,
             artifact_kind: artifact_kind.to_owned(),
             published_at,
             config_snapshot_id: config_snapshot.id,
             config_revision_no: config_snapshot.revision_no,
+            queued: auto_queue_release,
+            publish_status: release_publish_mode_label(auto_queue_release).to_owned(),
+            scheduled_publish_at: None,
         })
     }
 
@@ -7189,6 +8855,7 @@ impl AppService {
                     "binary_release_deploy",
                     runtime_root.to_string_lossy(),
                     Some(&artifact.version),
+                    Some(&runtime_files.deploy_scripts),
                     Some(&config),
                 ),
             },
@@ -7283,6 +8950,7 @@ impl AppService {
             .as_ref()
             .map(|config| config.env_content.clone())
             .unwrap_or_else(|| normalize_env_content(&snapshot.env_content));
+        let deploy_scripts = deploy_scripts_from_snapshot_metadata(&snapshot.metadata);
         let target_nodes = self.target_node_metadata_for_app(app.id).await?;
         let runtime_root = self.runtime_fs.app_root(&app.app_key)?;
         let metadata_content = render_runtime_metadata(
@@ -7298,11 +8966,12 @@ impl AppService {
             binary_config.as_ref(),
         );
         self.runtime_fs
-            .save_app_runtime_files(
+            .save_app_runtime_files_with_scripts(
                 &app.app_key,
                 &compose_content,
                 &env_content,
                 &metadata_content,
+                &deploy_scripts,
             )
             .await?;
         if app.app_type == "binary" {
@@ -7355,6 +9024,7 @@ impl AppService {
                         "snapshot-{}-{}",
                         snapshot.id, snapshot.snapshot_kind
                     )),
+                    Some(&deploy_scripts),
                     binary_config.as_ref(),
                 ),
             },
@@ -7514,6 +9184,7 @@ impl AppService {
                 task_kind: action.task_kind().to_owned(),
                 title: format!("{} {}", action.title_prefix(), app.name),
                 app_id: Some(app.id),
+                release_id: None,
                 node_id: None,
                 created_by: actor.to_owned(),
             })
@@ -7526,6 +9197,7 @@ impl AppService {
             return Err(AppError::InvalidInput("Compose 工作目录不存在".to_owned()));
         }
         let deploy_strategy = parse_deploy_strategy(&app.deploy_strategy);
+        let compose_strategy = load_app_compose_strategy(&self.db, app.id).await?;
         let config_snapshot =
             self.latest_config_snapshot(app.id)
                 .await?
@@ -7568,7 +9240,13 @@ impl AppService {
             .enqueue(ComposeTaskJob {
                 task_id,
                 app_id: app.id,
+                release_id: None,
+                queue_id: None,
                 app_key: app.app_key,
+                app_name: app.name,
+                environment: app.environment,
+                compose_strategy,
+                release_version: None,
                 config_snapshot_id: (config_snapshot.id > 0).then_some(config_snapshot.id),
                 config_revision_no: config_snapshot.revision_no,
                 deploy_strategy,
@@ -7634,6 +9312,7 @@ impl AppService {
                 task_kind: action.task_kind().to_owned(),
                 title: format!("{} {}", action.title_prefix(), app.name),
                 app_id: Some(app.id),
+                release_id: None,
                 node_id: None,
                 created_by: actor.to_owned(),
             })
@@ -7695,6 +9374,8 @@ impl AppService {
             .enqueue(BinaryTaskJob {
                 task_id,
                 app_id: app.id,
+                release_id: None,
+                queue_id: None,
                 app_key: app.app_key,
                 deploy_work_dir: app.work_dir,
                 unit_name: config.unit_name,
@@ -7749,6 +9430,7 @@ impl AppService {
                 task_kind: action.task_kind().to_owned(),
                 title: format!("{title_prefix} {}", app.name),
                 app_id: Some(app.id),
+                release_id: None,
                 node_id: None,
                 created_by: actor.to_owned(),
             })
@@ -7804,6 +9486,8 @@ impl AppService {
             .enqueue(BinaryTaskJob {
                 task_id,
                 app_id: app.id,
+                release_id: None,
+                queue_id: None,
                 app_key: app.app_key,
                 deploy_work_dir: app.work_dir,
                 unit_name: config.unit_name,
@@ -7926,6 +9610,9 @@ impl AppService {
                 a.app_type,
                 a.deploy_mode,
                 a.deploy_strategy,
+                a.release_source,
+                a.compose_strategy,
+                a.auto_queue_release,
                 a.work_dir,
                 a.status,
                 group_concat(n.name, '、') AS target_names,
@@ -8803,6 +10490,14 @@ fn render_runtime_metadata(
     push_yaml_string(&mut output, "app_type", &app.app_type);
     push_yaml_string(&mut output, "deploy_mode", &app.deploy_mode);
     push_yaml_string(&mut output, "deploy_strategy", &app.deploy_strategy);
+    push_yaml_string(&mut output, "release_source", &app.release_source);
+    output.push_str("auto_queue_release: ");
+    output.push_str(if app.auto_queue_release == 1 {
+        "true"
+    } else {
+        "false"
+    });
+    output.push('\n');
     push_yaml_string(&mut output, "deploy_work_dir", &app.work_dir);
     push_yaml_string(&mut output, "runtime_root", runtime_root);
     output.push_str("target_nodes:\n");
@@ -9019,25 +10714,35 @@ fn replace_endpoint_port(endpoint: &str, active_port: i64, target_port: i64) -> 
 
 struct ArtifactMetadataInput<'a> {
     source: &'a str,
+    source_detail: &'a str,
     unit_name: &'a str,
     uploaded_path: &'a str,
     original_file_name: &'a str,
     entry_file: &'a str,
     sha256: &'a str,
     size_bytes: u64,
+    config_snapshot_id: Option<i64>,
+    config_revision_no: Option<i64>,
 }
 
 fn render_artifact_metadata(input: ArtifactMetadataInput<'_>) -> String {
-    format!(
-        "{{\"source\":\"{}\",\"unit_name\":\"{}\",\"uploaded_path\":\"{}\",\"original_file_name\":\"{}\",\"entry_file\":\"{}\",\"sha256\":\"{}\",\"size_bytes\":{}}}",
-        json_escape(input.source),
-        json_escape(input.unit_name),
-        json_escape(input.uploaded_path),
-        json_escape(input.original_file_name),
-        json_escape(input.entry_file),
-        json_escape(input.sha256),
-        input.size_bytes
-    )
+    let mut metadata = json!({
+        "source": input.source,
+        "source_detail": input.source_detail,
+        "unit_name": input.unit_name,
+        "uploaded_path": input.uploaded_path,
+        "original_file_name": input.original_file_name,
+        "entry_file": input.entry_file,
+        "sha256": input.sha256,
+        "size_bytes": input.size_bytes,
+    });
+    if let Some(snapshot_id) = input.config_snapshot_id {
+        metadata["config_snapshot_id"] = json!(snapshot_id);
+    }
+    if let Some(revision_no) = input.config_revision_no {
+        metadata["config_revision_no"] = json!(revision_no);
+    }
+    metadata.to_string()
 }
 
 fn upload_source(source: &str) -> &str {
@@ -9045,7 +10750,14 @@ fn upload_source(source: &str) -> &str {
     if source.is_empty() { "upload" } else { source }
 }
 
-fn artifact_metadata_value(metadata: &str, key: &str) -> String {
+fn artifact_channel_from_source(source: &str) -> &'static str {
+    match upload_source(source) {
+        "upload" | "web" => "web",
+        _ => "openapi",
+    }
+}
+
+pub fn artifact_metadata_value(metadata: &str, key: &str) -> String {
     serde_json::from_str::<JsonValue>(metadata)
         .ok()
         .and_then(|value| value.get(key).cloned())
@@ -9056,6 +10768,33 @@ fn artifact_metadata_value(metadata: &str, key: &str) -> String {
             _ => None,
         })
         .unwrap_or_default()
+}
+
+fn release_metadata_snapshot_id(metadata: &str) -> Option<i64> {
+    serde_json::from_str::<JsonValue>(metadata)
+        .ok()
+        .and_then(|value| value.get("config_snapshot_id").and_then(JsonValue::as_i64))
+}
+
+fn release_metadata_with_snapshot(
+    metadata: &str,
+    snapshot_id: i64,
+    revision_no: Option<i64>,
+) -> Result<String, AppError> {
+    let mut value = if metadata.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str::<JsonValue>(metadata)
+            .map_err(|_| AppError::InvalidInput("发布版本元数据格式损坏".to_owned()))?
+    };
+    if !value.is_object() {
+        value = json!({});
+    }
+    value["config_snapshot_id"] = json!(snapshot_id);
+    if let Some(revision_no) = revision_no {
+        value["config_revision_no"] = json!(revision_no);
+    }
+    Ok(value.to_string())
 }
 
 fn normalize_release_id(value: &str) -> Result<String, AppError> {
@@ -9072,9 +10811,9 @@ fn normalize_release_id(value: &str) -> Result<String, AppError> {
     Ok(value.to_owned())
 }
 
-pub fn parse_binary_package_name(
+pub fn parse_release_package_name(
     file_name: &str,
-) -> Result<ParsedBinaryPackageName, BinaryPackageNameError> {
+) -> Result<ParsedReleasePackageName, BinaryPackageNameError> {
     let file_name = file_name
         .trim()
         .rsplit(['/', '\\'])
@@ -9091,19 +10830,19 @@ pub fn parse_binary_package_name(
         .ok_or(BinaryPackageNameError::InvalidPackageVersionName)?;
     let version_code = version_code_from_release(&release_version)
         .ok_or(BinaryPackageNameError::InvalidPackageVersionName)?;
-    Ok(ParsedBinaryPackageName {
+    Ok(ParsedReleasePackageName {
         service_key,
         release_version,
         version_code,
     })
 }
 
-pub fn parse_binary_package_name_for_service(
+pub fn parse_release_package_name_for_service(
     file_name: &str,
     expected_service_key: &str,
     explicit_release_version: Option<&str>,
-) -> Result<ParsedBinaryPackageName, BinaryPackageNameError> {
-    let parsed = parse_binary_package_name(file_name)?;
+) -> Result<ParsedReleasePackageName, BinaryPackageNameError> {
+    let parsed = parse_release_package_name(file_name)?;
     let expected_service_key = normalize_key(expected_service_key)
         .map_err(|_| BinaryPackageNameError::InvalidPackageVersionName)?;
     if parsed.service_key != expected_service_key {
@@ -9125,6 +10864,24 @@ pub fn parse_binary_package_name_for_service(
         }
     }
     Ok(parsed)
+}
+
+pub fn parse_binary_package_name(
+    file_name: &str,
+) -> Result<ParsedBinaryPackageName, BinaryPackageNameError> {
+    parse_release_package_name(file_name)
+}
+
+pub fn parse_binary_package_name_for_service(
+    file_name: &str,
+    expected_service_key: &str,
+    explicit_release_version: Option<&str>,
+) -> Result<ParsedBinaryPackageName, BinaryPackageNameError> {
+    parse_release_package_name_for_service(
+        file_name,
+        expected_service_key,
+        explicit_release_version,
+    )
 }
 
 fn strip_binary_package_extension(file_name: &str) -> &str {
@@ -9172,6 +10929,27 @@ fn normalize_published_at(value: &str) -> Result<Option<String>, AppError> {
     if value.is_empty() {
         return Ok(None);
     }
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+        return Ok(Some(
+            parsed
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+        ));
+    }
+    for pattern in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"] {
+        if let Ok(parsed) = NaiveDateTime::parse_from_str(value, pattern) {
+            let offset = FixedOffset::east_opt(8 * 60 * 60)
+                .ok_or_else(|| AppError::InvalidInput("东八区时区解析失败".to_owned()))?;
+            let local = parsed.and_local_timezone(offset).single().ok_or_else(|| {
+                AppError::InvalidInput("发布时间格式不正确，请检查日期和时间".to_owned())
+            })?;
+            return Ok(Some(
+                local
+                    .with_timezone(&Utc)
+                    .to_rfc3339_opts(SecondsFormat::Secs, true),
+            ));
+        }
+    }
     if value.len() < 10
         || value.len() > 64
         || !value
@@ -9179,10 +10957,188 @@ fn normalize_published_at(value: &str) -> Result<Option<String>, AppError> {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | ':' | '.' | 'T' | 'Z' | '+'))
     {
         return Err(AppError::InvalidInput(
-            "发布时间格式不正确，请使用 ISO-8601 时间，例如 2026-06-09T10:00:00Z".to_owned(),
+            "发布时间格式不正确，请使用 ISO-8601 时间，例如 2026-06-09T10:00:00Z，或页面中的本地时间".to_owned(),
         ));
     }
     Ok(Some(value.to_owned()))
+}
+
+async fn upsert_app_release(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    app_id: i64,
+    version: &str,
+    version_code: i64,
+    package_name: &str,
+    package_path: &str,
+    extract_dir: &str,
+    source: &str,
+    checksum_sha256: &str,
+    size_bytes: u64,
+    published_at: &str,
+    status: &str,
+    metadata: &str,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        INSERT INTO app_releases(
+            app_id,
+            version,
+            version_code,
+            package_name,
+            package_path,
+            extract_dir,
+            status,
+            source,
+            checksum_sha256,
+            size_bytes,
+            published_at,
+            metadata,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        ON CONFLICT(app_id, version) DO UPDATE SET
+            version_code = excluded.version_code,
+            package_name = excluded.package_name,
+            package_path = excluded.package_path,
+            extract_dir = excluded.extract_dir,
+            status = excluded.status,
+            source = excluded.source,
+            checksum_sha256 = excluded.checksum_sha256,
+            size_bytes = excluded.size_bytes,
+            published_at = excluded.published_at,
+            metadata = excluded.metadata,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        RETURNING id
+        "#,
+    )
+    .bind(app_id)
+    .bind(version)
+    .bind(version_code)
+    .bind(package_name)
+    .bind(package_path)
+    .bind(extract_dir)
+    .bind(status)
+    .bind(source)
+    .bind(checksum_sha256)
+    .bind(size_bytes as i64)
+    .bind(published_at)
+    .bind(metadata)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+async fn enqueue_app_release(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    app_id: i64,
+    release_id: i64,
+    config_snapshot_id: i64,
+    triggered_by: &str,
+    message: &str,
+    status: &str,
+    scheduled_publish_at: Option<&str>,
+) -> Result<i64, sqlx::Error> {
+    let queue_seq = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COALESCE(MAX(queue_seq), 0) + 1
+        FROM app_release_queue
+        WHERE app_id = ?1
+        "#,
+    )
+    .bind(app_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        INSERT INTO app_release_queue(
+            app_id,
+            release_id,
+            config_snapshot_id,
+            queue_seq,
+            status,
+            triggered_by,
+            message,
+            scheduled_publish_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        RETURNING id
+        "#,
+    )
+    .bind(app_id)
+    .bind(release_id)
+    .bind(config_snapshot_id)
+    .bind(queue_seq)
+    .bind(status)
+    .bind(triggered_by)
+    .bind(message)
+    .bind(scheduled_publish_at)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+async fn mark_release_queue_running(
+    db: &SqlitePool,
+    queue_id: i64,
+    task_id: i64,
+) -> Result<bool, AppError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE app_release_queue
+        SET status = 'running',
+            task_id = ?2,
+            started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ?1
+          AND status = 'queued'
+        "#,
+    )
+    .bind(queue_id)
+    .bind(task_id)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+async fn finish_release_queue_item(
+    db: &SqlitePool,
+    queue_id: i64,
+    release_id: i64,
+    status: &str,
+    message: &str,
+) -> Result<(), AppError> {
+    let release_status = match status {
+        "success" => "deployed",
+        "failed" => "failed",
+        "canceled" => "canceled",
+        _ => "failed",
+    };
+    sqlx::query(
+        r#"
+        UPDATE app_release_queue
+        SET status = ?2,
+            message = ?3,
+            finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ?1
+        "#,
+    )
+    .bind(queue_id)
+    .bind(status)
+    .bind(message)
+    .execute(db)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE app_releases
+        SET status = ?2,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ?1
+        "#,
+    )
+    .bind(release_id)
+    .bind(release_status)
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 async fn sqlite_now(db: &SqlitePool) -> Result<String, AppError> {
@@ -9248,7 +11204,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn extract_tar_gz(path: &Path, artifact_version: &str) -> Result<(), AppError> {
     let release_dir = path
         .parent()
-        .ok_or_else(|| AppError::Internal("无法定位二进制发布目录".to_owned()))?
+        .ok_or_else(|| AppError::Internal("无法定位发布版本目录".to_owned()))?
         .to_path_buf();
     let file = File::open(path).map_err(|err| {
         AppError::Internal(format!(
@@ -9381,7 +11337,9 @@ fn dedupe_strings(values: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::runtimefs::RELEASE_META_FILE_NAME;
     use sqlx::sqlite::SqliteConnectOptions;
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -9409,6 +11367,7 @@ mod tests {
                 task_kind: "compose.up".to_owned(),
                 title: "部署 Redis".to_owned(),
                 app_id: None,
+                release_id: None,
                 node_id: None,
                 created_by: "admin".to_owned(),
             })
@@ -9535,6 +11494,60 @@ services:
     }
 
     #[test]
+    fn remote_copy_files_preserve_release_and_script_layout() {
+        let root = tempdir().expect("create temp dir");
+        let app_dir = root.path();
+        let release_dir = app_dir.join(RELEASES_DIR_NAME).join("v1.2.3");
+        let scripts_dir = app_dir.join(META_DIR_NAME).join("scripts");
+        fs::create_dir_all(release_dir.join("bundle/bin")).expect("create release dirs");
+        fs::create_dir_all(&scripts_dir).expect("create scripts dir");
+        fs::write(
+            release_dir.join(RELEASE_META_FILE_NAME),
+            "release_version: v1.2.3\n",
+        )
+        .expect("write release metadata");
+        fs::write(release_dir.join("bundle/bin/server"), "binary").expect("write bundle file");
+        fs::write(scripts_dir.join("20-migrate.sh"), "#!/usr/bin/env sh\n").expect("write script");
+        fs::write(
+            app_dir.join(CURRENT_RELEASE_FILE_NAME),
+            "release_version: v1.2.3\n",
+        )
+        .expect("write current");
+
+        let mut files =
+            collect_remote_copy_files(&release_dir, "/opt/easy-deploy/apps/orders/releases/v1.2.3")
+                .expect("collect release files");
+        files.extend(
+            collect_remote_copy_files(
+                &scripts_dir,
+                "/opt/easy-deploy/apps/orders/.easy-deploy/scripts",
+            )
+            .expect("collect scripts"),
+        );
+        files.push(RemoteCopyFile {
+            local_path: app_dir.join(CURRENT_RELEASE_FILE_NAME),
+            remote_path: remote_join("/opt/easy-deploy/apps/orders", CURRENT_RELEASE_FILE_NAME),
+        });
+        let remote_paths = files
+            .iter()
+            .map(|file| file.remote_path.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            remote_paths.contains(&"/opt/easy-deploy/apps/orders/releases/v1.2.3/release.yaml")
+        );
+        assert!(
+            remote_paths
+                .contains(&"/opt/easy-deploy/apps/orders/releases/v1.2.3/bundle/bin/server")
+        );
+        assert!(
+            remote_paths
+                .contains(&"/opt/easy-deploy/apps/orders/.easy-deploy/scripts/20-migrate.sh")
+        );
+        assert!(remote_paths.contains(&"/opt/easy-deploy/apps/orders/current"));
+    }
+
+    #[test]
     fn select_uploaded_binary_release_prunes_keeps_recent_uploads_and_active_release() {
         let rows = [
             uploaded_binary_artifact(6, "v1.6.0"),
@@ -9628,8 +11641,13 @@ services:
     fn runtime_snapshot_metadata_records_binary_runtime_config() {
         let config = binary_config_item("v1.2.3", "/opt/app/releases/v1.2.3/app");
 
-        let metadata =
-            runtime_snapshot_metadata("manual", "/data/apps/app", Some("v1.2.3"), Some(&config));
+        let metadata = runtime_snapshot_metadata(
+            "manual",
+            "/data/apps/app",
+            Some("v1.2.3"),
+            Some(&DeployScriptSet::default()),
+            Some(&config),
+        );
         let value = serde_json::from_str::<JsonValue>(&metadata).expect("metadata json");
         let binary = value.get("binary").expect("binary metadata");
 
@@ -9658,6 +11676,7 @@ services:
                 "manual",
                 "/data/apps/app",
                 Some("v1.2.3"),
+                Some(&DeployScriptSet::default()),
                 Some(&snapshot_config),
             ),
             "RUST_LOG=debug",
@@ -9847,6 +11866,9 @@ services:
             app_type: "binary".to_owned(),
             deploy_mode: "binary".to_owned(),
             deploy_strategy: "rolling_stop_on_failure".to_owned(),
+            release_source: "package_upload".to_owned(),
+            compose_strategy: "recreate".to_owned(),
+            auto_queue_release: 1,
             work_dir: work_dir.to_owned(),
             status: "ready".to_owned(),
             target_names: None,
@@ -9878,6 +11900,8 @@ services:
         BinaryTaskJob {
             task_id: 1,
             app_id: 1,
+            release_id: None,
+            queue_id: None,
             app_key: "worker-bin".to_owned(),
             deploy_work_dir: "/opt/easy-deploy/apps/worker-bin".to_owned(),
             unit_name: "easy-deploy-worker-bin.service".to_owned(),

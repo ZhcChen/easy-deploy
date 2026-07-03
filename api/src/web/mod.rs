@@ -11,10 +11,10 @@ use axum::{
     extract::{FromRequestParts, Multipart, Path, Query, RawForm, State},
     http::{HeaderMap, StatusCode, header, request::Parts},
     response::{Html, IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{get, post},
 };
+use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
@@ -23,14 +23,14 @@ use tracing::warn;
 use crate::{
     Settings,
     apps::{
-        AppDeployDiffStatus, AppError, AppService, BINARY_PACKAGE_EXAMPLE, BINARY_PACKAGE_PATTERN,
-        BinaryPackageNameError, BinaryTaskAction, ComposeTaskAction, CreateAppInput,
-        ServiceTargetNodeItem, UpdateAppConfigInput, UpdateAppMetadataInput,
-        UploadBinaryArtifactInput, normalize_deploy_strategy,
-        parse_binary_package_name_for_service,
+        AppDeployDiffStatus, AppError, AppService, BinaryPackageNameError, ComposeTaskAction,
+        CreateAppInput, RELEASE_PACKAGE_EXAMPLE, RELEASE_PACKAGE_PATTERN, ServiceTargetNodeItem,
+        UpdateAppConfigInput, UpdateAppMetadataInput, UploadReleasePackageInput,
+        artifact_metadata_value, normalize_deploy_strategy, normalize_release_source,
+        parse_release_package_name_for_service, release_publish_mode_label,
     },
     auth::{
-        API_TOKENS_MANAGE, API_TOKENS_VIEW, APPS_STATUS, APPS_UPDATE, APPS_VIEW, ARTIFACTS_UPLOAD,
+        API_TOKENS_MANAGE, API_TOKENS_VIEW, APPS_STATUS, APPS_VIEW, ARTIFACTS_UPLOAD,
         ARTIFACTS_VIEW, AUDIT_VIEW, AuditLogFilter, AuthService, CurrentSession, DASHBOARD_VIEW,
         LoginInput, NODES_INSTALL, NODES_MANAGE, NODES_VIEW, PROFILE_VIEW, RBAC_ACCOUNTS_VIEW,
         RBAC_PERMISSIONS_VIEW, RBAC_ROLES_VIEW, RBAC_SESSIONS_VIEW, SERVICES_DEPLOY, SERVICES_LOGS,
@@ -40,12 +40,14 @@ use crate::{
     catalog::compose_templates,
     events::{EventLogError, EventLogFilter, EventLogService},
     health::{HealthCheckKind, normalize_health_config},
+    host_metrics::HostMetricsService,
     node_credentials::{
         CreateGeneratedCredentialInput, CreateUploadedCredentialInput, NodeCredentialError,
         NodeCredentialService,
     },
     nodes::{CreateNodeInput, NodeError, NodeInstallComponent, NodeService, UpdateNodeInput},
     platform::{PlatformConfigError, PlatformConfigService, UpdatePlatformConfigInput},
+    runtimefs::DeployScriptSet,
     tasks::{TaskError, TaskListFilter, TaskService},
 };
 use templates::{
@@ -53,24 +55,24 @@ use templates::{
     AppDeployDiffRow, AppDeployDiffView, AppDeploymentRunRow, AppDetailTemplate, AppNodeChoiceRow,
     AppPageRow, AppRow, AppRuntimeStateRow, AppTargetChoiceRow, AppsTemplate, ArtifactAppOptionRow,
     ArtifactPageRow, ArtifactsTemplate, AuditFilterOptionRow, AuditLogRow, AuditTemplate,
-    BinaryReleaseRow, ComposeResultView, DashboardTemplate, DeployConfirmTargetNodeRow,
-    DeployConfirmTemplate, DeployPlanFileRow, DeployPlanStepRow, DeployPreflightActionRow,
-    DeployPreflightCheckRow, DeployPreflightRow, EventLogRow, EventsTemplate, LoginTemplate,
-    NavItem, NavSection, NodeAppRuntimeRow, NodeCapabilityGuideRow, NodeCheckHistoryRow,
-    NodeCredentialOptionRow, NodeCredentialPageRow, NodeCredentialsTemplate, NodeDetailModalRow,
-    NodeDetailTemplate, NodePageRow, NodeRow, NodeTaskRow, NodesTemplate, PermissionGroup,
-    PermissionRow, PermissionsTemplate, ProfileTemplate, RbacFilterOptionRow, RoleRow,
+    ComposeResultView, DashboardTemplate, DeployConfirmTargetNodeRow, DeployConfirmTemplate,
+    DeployPlanFileRow, DeployPlanStepRow, DeployPreflightActionRow, DeployPreflightCheckRow,
+    DeployPreflightRow, EventLogRow, EventsTemplate, LoginTemplate, NavItem, NavSection,
+    NodeAppRuntimeRow, NodeCapabilityGuideRow, NodeCheckHistoryRow, NodeCredentialOptionRow,
+    NodeCredentialPageRow, NodeCredentialsTemplate, NodeDetailModalRow, NodeDetailTemplate,
+    NodePageRow, NodeRow, NodeTaskRow, NodesTemplate, PermissionGroup, PermissionRow,
+    PermissionsTemplate, ProfileTemplate, RbacFilterOptionRow, ReleaseQueueRow, RoleRow,
     RolesTemplate, ServiceLogTailOptionRow, ServiceLogsTemplate, ServiceNodeLinkRow,
     ServicePageRow, ServicesTemplate, SessionRow, SessionsTemplate, SettingsRow, SettingsTemplate,
     SummaryItem, TaskAppFilterRow, TaskDetailTemplate, TaskDetailView, TaskExecutionGuideView,
-    TaskFilterOptionRow, TaskLogRow, TaskNodeResultRow, TaskPageRow, TaskPhaseStepRow,
-    TaskReturnActionView, TaskRow, TaskStepRow, TasksTemplate, TemplateCardRow, TemplatesTemplate,
-    render_html,
+    TaskFilterOptionRow, TaskLogRow, TaskNodeResultRow, TaskPageRow, TaskPhaseGroupRow,
+    TaskPhaseStepRow, TaskReturnActionView, TaskRow, TaskStepRow, TasksTemplate, TemplateCardRow,
+    TemplatesTemplate, render_html,
 };
 
 const LOGO_SVG: &str = include_str!("../../assets/logo.svg");
 const APP_JS: &str = include_str!("../../assets/app.js");
-const ASSET_VERSION: &str = "20260610-modern-ui-refresh";
+const ASSET_VERSION: &str = "20260703-template-import";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -97,6 +99,7 @@ struct AppStateInner {
     tasks: TaskService,
     platform: PlatformConfigService,
     events: EventLogService,
+    host_metrics: HostMetricsService,
     api_token_flashes: Mutex<HashMap<String, crate::auth::CreatedApiToken>>,
 }
 
@@ -104,6 +107,7 @@ impl AppState {
     pub fn new(settings: Settings, db: SqlitePool, services: AppStateServices) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
+                host_metrics: HostMetricsService::new(&settings.data_dir),
                 settings,
                 db,
                 auth: services.auth,
@@ -153,11 +157,16 @@ impl AppState {
     pub fn events(&self) -> &EventLogService {
         &self.inner.events
     }
+
+    pub fn host_metrics(&self) -> &HostMetricsService {
+        &self.inner.host_metrics
+    }
 }
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(dashboard))
+        .route("/api/dashboard/host-metrics", get(dashboard_host_metrics))
         .route("/login", get(login_page).post(login_submit))
         .route("/auth/refresh", post(refresh_submit))
         .route("/logout", post(logout_submit))
@@ -186,23 +195,6 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/apps/{app_id}/compose/restart",
             post(app_compose_restart_submit),
-        )
-        .route(
-            "/apps/{app_id}/binary/{action}/confirm",
-            get(app_binary_confirm_page),
-        )
-        .route(
-            "/apps/{app_id}/binary/restart",
-            post(app_binary_restart_submit),
-        )
-        .route("/apps/{app_id}/binary/stop", post(app_binary_stop_submit))
-        .route(
-            "/apps/{app_id}/binary/releases/{artifact_id}/activate",
-            post(app_binary_release_deploy_submit),
-        )
-        .route(
-            "/apps/{app_id}/binary/releases/{artifact_id}/deploy",
-            post(app_binary_release_deploy_submit),
         )
         .route("/services", get(services_page))
         .route(
@@ -236,6 +228,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/templates", get(templates_page))
         .route("/artifacts", get(artifacts_page))
         .route("/artifacts/upload", post(artifact_upload_submit))
+        .route("/artifacts/publish", post(artifact_publish_now_submit))
+        .route("/artifacts/schedule", post(artifact_schedule_submit))
+        .route(
+            "/artifacts/schedule/cancel",
+            post(artifact_schedule_cancel_submit),
+        )
+        .route(
+            "/artifacts/queue/cancel",
+            post(artifact_queue_cancel_submit),
+        )
         .route("/admin/accounts", get(accounts_page))
         .route("/admin/accounts", post(create_account_submit))
         .route("/admin/accounts/status", post(account_status_submit))
@@ -259,42 +261,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/events", get(events_page))
         .route("/openapi.json", get(openapi_json))
         .route("/docs/openapi", get(openapi_docs))
-        .route("/api/v1/nodes", get(api_v1_nodes))
-        .route("/api/v1/apps", get(api_v1_apps).post(api_v1_create_app))
-        .route("/api/v1/apps/{app_id}", get(api_v1_app_detail))
-        .route(
-            "/api/v1/apps/{app_id}/config",
-            put(api_v1_update_app_config),
-        )
-        .route("/api/v1/apps/{app_id}/enable", post(api_v1_enable_app))
-        .route("/api/v1/apps/{app_id}/disable", post(api_v1_disable_app))
-        .route("/api/v1/apps/{app_id}/deploy", post(api_v1_deploy_app))
-        .route(
-            "/api/v1/services/{service_key}/app",
-            get(api_v1_service_app_detail),
-        )
-        .route(
-            "/api/v1/services/{service_key}/enable",
-            post(api_v1_enable_service),
-        )
-        .route(
-            "/api/v1/services/{service_key}/disable",
-            post(api_v1_disable_service),
-        )
-        .route(
-            "/api/v1/services/{service_key}/config",
-            put(api_v1_update_service_config),
-        )
-        .route(
-            "/api/v1/services/{service_key}/deploy",
-            post(api_v1_deploy_service),
-        )
         .route(
             "/api/v1/services/{service_key}/packages",
             post(api_v1_upload_service_package),
         )
-        .route("/api/v1/tasks", get(api_v1_tasks))
-        .route("/api/v1/tasks/{task_id}", get(api_v1_task_detail))
         .route("/healthz", get(healthz))
         .route("/assets/logo.svg", get(logo_svg))
         .route("/assets/app.js", get(app_js))
@@ -443,6 +413,17 @@ async fn dashboard(State(state): State<AppState>, session: CurrentSession) -> Re
     })
 }
 
+async fn dashboard_host_metrics(
+    State(state): State<AppState>,
+    session: CurrentSession,
+) -> Response {
+    if !session.can(DASHBOARD_VIEW) {
+        return forbidden();
+    }
+
+    Json(state.host_metrics().snapshot().await).into_response()
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 struct LoginQuery {
     notice: Option<String>,
@@ -479,38 +460,33 @@ struct CreateAppForm {
     description: String,
     #[serde(default)]
     environment: String,
-    app_type: String,
     #[serde(default)]
     deploy_strategy: String,
+    #[serde(default)]
+    release_source: String,
+    #[serde(default)]
+    auto_queue_release: bool,
     work_dir: String,
     compose_content: String,
     env_content: String,
     #[serde(default)]
-    binary_artifact_version: String,
+    deploy_script_pre_deploy: String,
     #[serde(default)]
-    binary_artifact_path: String,
+    deploy_script_deploy: String,
     #[serde(default)]
-    binary_exec_args: String,
+    deploy_script_post_deploy: String,
     #[serde(default)]
-    binary_service_user: String,
+    deploy_script_switch_traffic: String,
     #[serde(default)]
-    binary_unit_name: String,
+    deploy_script_cleanup: String,
     #[serde(default)]
-    binary_release_strategy: String,
+    health_check_kind: String,
     #[serde(default)]
-    binary_active_slot: String,
+    health_endpoint: String,
     #[serde(default)]
-    binary_base_port: i64,
+    health_timeout_secs: i64,
     #[serde(default)]
-    binary_standby_port: i64,
-    #[serde(default)]
-    binary_proxy_enabled: bool,
-    #[serde(default)]
-    binary_proxy_kind: String,
-    #[serde(default)]
-    binary_proxy_domain: String,
-    #[serde(default)]
-    binary_proxy_config_path: String,
+    health_expected_status: i64,
     target_node_ids: Vec<i64>,
 }
 
@@ -520,31 +496,15 @@ struct UpdateAppConfigForm {
     compose_content: String,
     env_content: String,
     #[serde(default)]
-    binary_artifact_version: String,
+    deploy_script_pre_deploy: String,
     #[serde(default)]
-    binary_artifact_path: String,
+    deploy_script_deploy: String,
     #[serde(default)]
-    binary_exec_args: String,
+    deploy_script_post_deploy: String,
     #[serde(default)]
-    binary_service_user: String,
+    deploy_script_switch_traffic: String,
     #[serde(default)]
-    binary_unit_name: String,
-    #[serde(default)]
-    binary_release_strategy: String,
-    #[serde(default)]
-    binary_active_slot: String,
-    #[serde(default)]
-    binary_base_port: i64,
-    #[serde(default)]
-    binary_standby_port: i64,
-    #[serde(default)]
-    binary_proxy_enabled: bool,
-    #[serde(default)]
-    binary_proxy_kind: String,
-    #[serde(default)]
-    binary_proxy_domain: String,
-    #[serde(default)]
-    binary_proxy_config_path: String,
+    deploy_script_cleanup: String,
     health_check_kind: String,
     health_endpoint: String,
     health_timeout_secs: i64,
@@ -561,6 +521,10 @@ struct UpdateAppMetadataForm {
     work_dir: String,
     #[serde(default)]
     deploy_strategy: String,
+    #[serde(default)]
+    release_source: String,
+    #[serde(default)]
+    auto_queue_release: bool,
     target_node_ids: Vec<i64>,
 }
 
@@ -675,6 +639,31 @@ struct SettingsForm {
     default_app_work_dir: String,
     default_node_work_dir: String,
     uploaded_binary_releases_to_keep: usize,
+}
+
+#[derive(Deserialize)]
+struct ReleasePublishNowForm {
+    csrf_token: String,
+    release_id: i64,
+}
+
+#[derive(Deserialize)]
+struct ReleaseScheduleForm {
+    csrf_token: String,
+    release_id: i64,
+    scheduled_publish_at: String,
+}
+
+#[derive(Deserialize)]
+struct ReleaseCancelScheduleForm {
+    csrf_token: String,
+    release_id: i64,
+}
+
+#[derive(Deserialize)]
+struct ReleaseQueueCancelForm {
+    csrf_token: String,
+    queue_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -818,7 +807,6 @@ struct ApiTokensQuery {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct AppsQuery {
-    r#type: Option<String>,
     environment: Option<String>,
     status: Option<String>,
     q: Option<String>,
@@ -835,112 +823,6 @@ struct NodesQuery {
     r#type: Option<String>,
     status: Option<String>,
     q: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct ApiV1TaskListQuery {
-    status: Option<String>,
-    phase: Option<String>,
-    app_id: Option<i64>,
-    task_kind: Option<String>,
-    q: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct ApiV1CreateAppRequest {
-    app_key: String,
-    name: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    environment: String,
-    #[serde(default = "default_app_type")]
-    app_type: String,
-    #[serde(default)]
-    deploy_strategy: String,
-    #[serde(default)]
-    work_dir: String,
-    #[serde(default)]
-    target_node_ids: Vec<i64>,
-    #[serde(default)]
-    target_node_keys: Vec<String>,
-    #[serde(default)]
-    compose_content: String,
-    #[serde(default)]
-    env_content: String,
-    #[serde(default)]
-    binary_artifact_version: String,
-    #[serde(default)]
-    binary_artifact_path: String,
-    #[serde(default)]
-    binary_exec_args: String,
-    #[serde(default)]
-    binary_service_user: String,
-    #[serde(default)]
-    binary_unit_name: String,
-    #[serde(default)]
-    binary_release_strategy: String,
-    #[serde(default)]
-    binary_active_slot: String,
-    #[serde(default)]
-    binary_base_port: i64,
-    #[serde(default)]
-    binary_standby_port: i64,
-    #[serde(default)]
-    binary_proxy_enabled: bool,
-    #[serde(default)]
-    binary_proxy_kind: String,
-    #[serde(default)]
-    binary_proxy_domain: String,
-    #[serde(default)]
-    binary_proxy_config_path: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct ApiV1DeployAppRequest {
-    action: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct ApiV1UpdateAppConfigRequest {
-    #[serde(default)]
-    compose_content: String,
-    #[serde(default)]
-    env_content: String,
-    #[serde(default)]
-    binary_artifact_version: String,
-    #[serde(default)]
-    binary_artifact_path: String,
-    #[serde(default)]
-    binary_exec_args: String,
-    #[serde(default)]
-    binary_service_user: String,
-    #[serde(default)]
-    binary_unit_name: String,
-    #[serde(default)]
-    binary_release_strategy: String,
-    #[serde(default)]
-    binary_active_slot: String,
-    #[serde(default)]
-    binary_base_port: i64,
-    #[serde(default)]
-    binary_standby_port: i64,
-    #[serde(default)]
-    binary_proxy_enabled: bool,
-    #[serde(default)]
-    binary_proxy_kind: String,
-    #[serde(default)]
-    binary_proxy_domain: String,
-    #[serde(default)]
-    binary_proxy_config_path: String,
-    #[serde(default = "default_health_check_kind")]
-    health_check_kind: String,
-    #[serde(default)]
-    health_endpoint: String,
-    #[serde(default = "default_health_timeout_secs")]
-    health_timeout_secs: i64,
-    #[serde(default = "default_health_expected_status")]
-    health_expected_status: i64,
 }
 
 #[derive(Serialize)]
@@ -964,23 +846,6 @@ struct ApiPackageUploadInput {
     bytes: Vec<u8>,
     entry_file: String,
     source: String,
-    auto_deploy: bool,
-}
-
-fn default_app_type() -> String {
-    "compose".to_owned()
-}
-
-fn default_health_check_kind() -> String {
-    "none".to_owned()
-}
-
-fn default_health_timeout_secs() -> i64 {
-    5
-}
-
-fn default_health_expected_status() -> i64 {
-    200
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -999,7 +864,6 @@ struct ServiceLogsQuery {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct ServicesQuery {
-    kind: Option<String>,
     status: Option<String>,
     q: Option<String>,
 }
@@ -1096,7 +960,7 @@ async fn apps_page(
         Ok(config) => config,
         Err(err) => return platform_error_response(err),
     };
-    let selected_type = normalize_app_type_filter(query.r#type.as_deref());
+    let selected_type = "compose";
     let selected_environment = normalize_app_environment_filter(query.environment.as_deref());
     let selected_status = normalize_app_runtime_status_filter(query.status.as_deref());
     let search_query = query.q.unwrap_or_default().trim().to_owned();
@@ -1129,7 +993,6 @@ async fn apps_page(
             } else {
                 &app.description
             },
-            app_type: app_type_label(&app.app_type),
             environment: app_environment_label(&app.environment),
             environment_tone: app_environment_tone(&app.environment),
             runtime_status: app_runtime_status_label(&app.runtime_status),
@@ -1160,7 +1023,6 @@ async fn apps_page(
         nav_sections: &nav_sections,
         apps: &rows,
         node_choices: &node_choices,
-        selected_type,
         selected_environment,
         selected_status,
         query: &search_query,
@@ -1174,14 +1036,14 @@ async fn apps_page(
         },
         page_end: page_end_index,
         prev_page_href: app_page_href(
-            selected_type,
+            "",
             selected_environment,
             selected_status,
             &search_query,
             page - 1,
         ),
         next_page_href: app_page_href(
-            selected_type,
+            "",
             selected_environment,
             selected_status,
             &search_query,
@@ -1212,6 +1074,9 @@ async fn create_app_submit(
     if let Err(err) = normalize_deploy_strategy(&form.deploy_strategy) {
         return (StatusCode::BAD_REQUEST, err.message().to_owned()).into_response();
     }
+    if let Err(err) = normalize_release_source(&form.release_source) {
+        return (StatusCode::BAD_REQUEST, err.message().to_owned()).into_response();
+    }
     if !valid_csrf(&session, &form.csrf_token) {
         return forbidden();
     }
@@ -1232,24 +1097,42 @@ async fn create_app_submit(
         name: form.name,
         description: form.description,
         environment: form.environment,
-        app_type: form.app_type,
+        app_type: "compose".to_owned(),
         deploy_strategy: form.deploy_strategy,
+        release_source: form.release_source,
+        auto_queue_release: form.auto_queue_release,
         work_dir,
         compose_content: form.compose_content,
         env_content: form.env_content,
-        binary_artifact_version: form.binary_artifact_version,
-        binary_artifact_path: form.binary_artifact_path,
-        binary_exec_args: form.binary_exec_args,
-        binary_service_user: form.binary_service_user,
-        binary_unit_name: form.binary_unit_name,
-        binary_release_strategy: form.binary_release_strategy,
-        binary_active_slot: form.binary_active_slot,
-        binary_base_port: form.binary_base_port,
-        binary_standby_port: form.binary_standby_port,
-        binary_proxy_enabled: form.binary_proxy_enabled,
-        binary_proxy_kind: form.binary_proxy_kind,
-        binary_proxy_domain: form.binary_proxy_domain,
-        binary_proxy_config_path: form.binary_proxy_config_path,
+        deploy_scripts: DeployScriptSet {
+            pre_deploy: form.deploy_script_pre_deploy,
+            deploy: form.deploy_script_deploy,
+            post_deploy: form.deploy_script_post_deploy,
+            switch_traffic: form.deploy_script_switch_traffic,
+            cleanup: form.deploy_script_cleanup,
+        },
+        health_check: match normalize_health_config(
+            default_if_blank(&form.health_check_kind, "none"),
+            &form.health_endpoint,
+            default_i64(form.health_timeout_secs, 5),
+            default_i64(form.health_expected_status, 200),
+        ) {
+            Ok(config) => config,
+            Err(err) => return (StatusCode::BAD_REQUEST, err.message().to_owned()).into_response(),
+        },
+        binary_artifact_version: String::new(),
+        binary_artifact_path: String::new(),
+        binary_exec_args: String::new(),
+        binary_service_user: String::new(),
+        binary_unit_name: String::new(),
+        binary_release_strategy: String::new(),
+        binary_active_slot: String::new(),
+        binary_base_port: 0,
+        binary_standby_port: 0,
+        binary_proxy_enabled: false,
+        binary_proxy_kind: String::new(),
+        binary_proxy_domain: String::new(),
+        binary_proxy_config_path: String::new(),
         target_node_ids: form.target_node_ids,
     };
     match state.apps().create_app(input).await {
@@ -1353,7 +1236,6 @@ fn render_app_detail(
         })
         .collect::<Vec<_>>();
     let can_manage = session.can("apps.update") && app_enabled && app_idle;
-    let can_deploy_release = session.can(SERVICES_DEPLOY) && app_enabled && app_idle;
     let config_snapshots = detail
         .config_snapshots
         .iter()
@@ -1363,7 +1245,6 @@ fn render_app_detail(
             kind: snapshot_kind_label(&snapshot.snapshot_kind),
             compose_summary: config_summary(&snapshot.compose_content),
             env_summary: config_summary(&snapshot.env_content),
-            binary_summary: snapshot_binary_summary(&snapshot.metadata),
             artifact_version: display_text(snapshot.artifact_version.clone(), "无发布版本"),
             config_hash: short_hash(&snapshot.config_hash),
             created_at: snapshot.created_at.clone(),
@@ -1444,64 +1325,6 @@ fn render_app_detail(
             checked: node.checked,
         })
         .collect::<Vec<_>>();
-    let binary_releases = detail
-        .binary_releases
-        .iter()
-        .map(|release| {
-            let status = artifact_status_label(&release.status);
-            BinaryReleaseRow {
-                id: release.id,
-                version: release.version.clone(),
-                version_code: release.version_code,
-                artifact_kind: artifact_kind_label(&release.artifact_kind).to_owned(),
-                status,
-                status_tone: artifact_status_tone(&release.status),
-                artifact_path: release.artifact_path.clone(),
-                sha256: short_hash(&release.metadata_value("sha256")),
-                size: format_size(&release.metadata_value("size_bytes")),
-                entry_file: display_text(release.metadata_value("entry_file"), "未记录"),
-                published_at: release.published_at.clone(),
-                created_at: release.created_at.clone(),
-                can_deploy: can_deploy_release && release.status != "disabled",
-            }
-        })
-        .collect::<Vec<_>>();
-    let binary_unit_path = detail
-        .binary_runtime
-        .unit_path
-        .to_string_lossy()
-        .to_string();
-    let binary_env_path = detail.binary_runtime.env_path.to_string_lossy().to_string();
-    let binary_blue_unit_path = detail
-        .binary_runtime
-        .blue_unit_path
-        .to_string_lossy()
-        .to_string();
-    let binary_blue_env_path = detail
-        .binary_runtime
-        .blue_env_path
-        .to_string_lossy()
-        .to_string();
-    let binary_green_unit_path = detail
-        .binary_runtime
-        .green_unit_path
-        .to_string_lossy()
-        .to_string();
-    let binary_green_env_path = detail
-        .binary_runtime
-        .green_env_path
-        .to_string_lossy()
-        .to_string();
-    let binary_release_path = detail
-        .binary_runtime
-        .release_path
-        .to_string_lossy()
-        .to_string();
-    let binary_current_path = detail
-        .binary_runtime
-        .current_path
-        .to_string_lossy()
-        .to_string();
     render_html(AppDetailTemplate {
         product_name: "Easy Deploy",
         css: include_str!("../../assets/app.css"),
@@ -1518,9 +1341,12 @@ fn render_app_detail(
         environment: &detail.app.environment,
         environment_label: app_environment_label(&detail.app.environment),
         environment_tone: app_environment_tone(&detail.app.environment),
-        is_binary_app: detail.app.app_type == "binary",
         deploy_strategy: detail.app.deploy_strategy.as_str(),
         deploy_strategy_label: deploy_strategy_label(&detail.app.deploy_strategy),
+        release_source: &detail.app.release_source,
+        release_source_label: release_source_label(&detail.app.release_source),
+        auto_queue_release: detail.app.auto_queue_release == 1,
+        release_publish_mode: release_publish_mode_label(detail.app.auto_queue_release == 1),
         work_dir: &detail.app.work_dir,
         runtime_root: &detail.runtime_root,
         status: app_enabled_status_label(&detail.app.status),
@@ -1531,41 +1357,12 @@ fn render_app_detail(
         updated_at: &detail.app.updated_at,
         compose_content: &detail.compose_content,
         env_content: &detail.env_content,
+        deploy_script_pre_deploy: &detail.deploy_scripts.pre_deploy,
+        deploy_script_deploy: &detail.deploy_scripts.deploy,
+        deploy_script_post_deploy: &detail.deploy_scripts.post_deploy,
+        deploy_script_switch_traffic: &detail.deploy_scripts.switch_traffic,
+        deploy_script_cleanup: &detail.deploy_scripts.cleanup,
         metadata_content: &detail.metadata_content,
-        binary_artifact_version: &detail.binary_config.artifact_version,
-        binary_artifact_path: &detail.binary_config.artifact_path,
-        binary_exec_args: &detail.binary_config.exec_args,
-        binary_service_user: &detail.binary_config.service_user,
-        binary_unit_name: &detail.binary_config.unit_name,
-        binary_release_strategy: &detail.binary_config.release_strategy,
-        binary_release_strategy_label: binary_release_strategy_label(
-            &detail.binary_config.release_strategy,
-        ),
-        binary_active_slot: &detail.binary_config.active_slot,
-        binary_standby_slot: binary_standby_slot(&detail.binary_config.active_slot),
-        binary_base_port: detail.binary_config.base_port,
-        binary_standby_port: detail.binary_config.standby_port,
-        binary_proxy_enabled: detail.binary_config.proxy_enabled == 1,
-        binary_proxy_kind: &detail.binary_config.proxy_kind,
-        binary_proxy_kind_label: binary_proxy_kind_label(&detail.binary_config.proxy_kind),
-        binary_proxy_domain: &detail.binary_config.proxy_domain,
-        binary_proxy_config_path: &detail.binary_config.proxy_config_path,
-        binary_unit_path: &binary_unit_path,
-        binary_env_path: &binary_env_path,
-        binary_blue_unit_path: &binary_blue_unit_path,
-        binary_blue_env_path: &binary_blue_env_path,
-        binary_green_unit_path: &binary_green_unit_path,
-        binary_green_env_path: &binary_green_env_path,
-        binary_release_path: &binary_release_path,
-        binary_current_path: &binary_current_path,
-        binary_unit_content: &detail.binary_runtime.unit_content,
-        binary_env_content: &detail.binary_runtime.env_content,
-        binary_blue_unit_content: &detail.binary_runtime.blue_unit_content,
-        binary_blue_env_content: &detail.binary_runtime.blue_env_content,
-        binary_green_unit_content: &detail.binary_runtime.green_unit_content,
-        binary_green_env_content: &detail.binary_runtime.green_env_content,
-        binary_release_content: &detail.binary_runtime.release_content,
-        binary_current_content: &detail.binary_runtime.current_content,
         health_check_kind: detail.health_check.kind.as_str(),
         health_check_label: detail.health_check.kind.label(),
         health_endpoint: &detail.health_check.endpoint,
@@ -1576,9 +1373,7 @@ fn render_app_detail(
         deploy_diff: &deploy_diff,
         runtime_states: &runtime_states,
         target_choices: &target_choices,
-        binary_releases: &binary_releases,
         can_manage,
-        can_view_artifacts: session.can(ARTIFACTS_VIEW),
         can_deploy: session.can(SERVICES_DEPLOY) && app_enabled && app_idle,
         can_logs: session.can(SERVICES_LOGS),
         compose_result,
@@ -1602,19 +1397,26 @@ async fn app_config_submit(
         app_id,
         compose_content: form.compose_content,
         env_content: form.env_content,
-        binary_artifact_version: form.binary_artifact_version,
-        binary_artifact_path: form.binary_artifact_path,
-        binary_exec_args: form.binary_exec_args,
-        binary_service_user: form.binary_service_user,
-        binary_unit_name: form.binary_unit_name,
-        binary_release_strategy: form.binary_release_strategy,
-        binary_active_slot: form.binary_active_slot,
-        binary_base_port: form.binary_base_port,
-        binary_standby_port: form.binary_standby_port,
-        binary_proxy_enabled: form.binary_proxy_enabled,
-        binary_proxy_kind: form.binary_proxy_kind,
-        binary_proxy_domain: form.binary_proxy_domain,
-        binary_proxy_config_path: form.binary_proxy_config_path,
+        deploy_scripts: DeployScriptSet {
+            pre_deploy: form.deploy_script_pre_deploy,
+            deploy: form.deploy_script_deploy,
+            post_deploy: form.deploy_script_post_deploy,
+            switch_traffic: form.deploy_script_switch_traffic,
+            cleanup: form.deploy_script_cleanup,
+        },
+        binary_artifact_version: String::new(),
+        binary_artifact_path: String::new(),
+        binary_exec_args: String::new(),
+        binary_service_user: String::new(),
+        binary_unit_name: String::new(),
+        binary_release_strategy: String::new(),
+        binary_active_slot: String::new(),
+        binary_base_port: 0,
+        binary_standby_port: 0,
+        binary_proxy_enabled: false,
+        binary_proxy_kind: String::new(),
+        binary_proxy_domain: String::new(),
+        binary_proxy_config_path: String::new(),
         health_check: match normalize_health_config(
             &form.health_check_kind,
             &form.health_endpoint,
@@ -1644,6 +1446,9 @@ async fn app_metadata_submit(
     if let Err(err) = normalize_deploy_strategy(&form.deploy_strategy) {
         return (StatusCode::BAD_REQUEST, err.message().to_owned()).into_response();
     }
+    if let Err(err) = normalize_release_source(&form.release_source) {
+        return (StatusCode::BAD_REQUEST, err.message().to_owned()).into_response();
+    }
     if !valid_csrf(&session, &form.csrf_token) {
         return forbidden();
     }
@@ -1657,6 +1462,8 @@ async fn app_metadata_submit(
         environment: form.environment,
         work_dir: form.work_dir,
         deploy_strategy: form.deploy_strategy,
+        release_source: form.release_source,
+        auto_queue_release: form.auto_queue_release,
         target_node_ids: form.target_node_ids,
     };
     match state.apps().update_app_metadata(input).await {
@@ -1772,23 +1579,6 @@ async fn app_compose_confirm_page(
     .await
 }
 
-async fn app_binary_confirm_page(
-    State(state): State<AppState>,
-    session: CurrentSession,
-    Path((app_id, action)): Path<(i64, String)>,
-) -> Response {
-    let Some(action) = parse_binary_confirm_action(&action) else {
-        return bad_request("不支持的二进制操作".to_owned());
-    };
-    render_deploy_confirm(
-        &state,
-        &session,
-        app_id,
-        DeployConfirmAction::Binary(action),
-    )
-    .await
-}
-
 async fn app_compose_up_submit(
     State(state): State<AppState>,
     session: CurrentSession,
@@ -1816,24 +1606,6 @@ async fn app_compose_restart_submit(
     app_compose_task_submit(state, session, app_id, form, ComposeTaskAction::Restart).await
 }
 
-async fn app_binary_restart_submit(
-    State(state): State<AppState>,
-    session: CurrentSession,
-    Path(app_id): Path<i64>,
-    Form(form): Form<ConfirmTaskForm>,
-) -> Response {
-    app_binary_task_submit(state, session, app_id, form, BinaryTaskAction::Restart).await
-}
-
-async fn app_binary_stop_submit(
-    State(state): State<AppState>,
-    session: CurrentSession,
-    Path(app_id): Path<i64>,
-    Form(form): Form<ConfirmTaskForm>,
-) -> Response {
-    app_binary_task_submit(state, session, app_id, form, BinaryTaskAction::Stop).await
-}
-
 async fn artifact_upload_submit(
     State(state): State<AppState>,
     session: CurrentSession,
@@ -1847,7 +1619,7 @@ async fn artifact_upload_submit(
         Err(response) => return response,
     };
     let app_id = input.app_id;
-    match state.apps().upload_binary_artifact(input).await {
+    match state.apps().upload_release_package(input).await {
         Ok(_) => {
             record_audit_event(
                 &state,
@@ -1855,20 +1627,19 @@ async fn artifact_upload_submit(
                 "artifacts.upload",
                 "app",
                 &app_id.to_string(),
-                "上传二进制版本包",
+                "上传发布版本包",
             )
             .await;
-            redirect("/artifacts?status=active&source=upload")
+            redirect("/artifacts?source=upload")
         }
         Err(err) => app_error_response(err),
     }
 }
 
-async fn app_binary_release_deploy_submit(
+async fn artifact_publish_now_submit(
     State(state): State<AppState>,
     session: CurrentSession,
-    Path((app_id, artifact_id)): Path<(i64, i64)>,
-    Form(form): Form<CsrfForm>,
+    Form(form): Form<ReleasePublishNowForm>,
 ) -> Response {
     if !valid_csrf(&session, &form.csrf_token) {
         return forbidden();
@@ -1878,20 +1649,113 @@ async fn app_binary_release_deploy_submit(
     }
     match state
         .apps()
-        .deploy_binary_artifact(app_id, artifact_id, &session.account.username)
+        .publish_release_now(form.release_id, &session.account.username)
         .await
     {
-        Ok(result) => {
+        Ok(queue_id) => {
             record_audit_event(
                 &state,
                 &session,
                 "services.deploy",
-                "task",
-                &result.task_id.to_string(),
-                &format!("部署应用 #{app_id} 的发布版本 {}", result.version),
+                "release",
+                &form.release_id.to_string(),
+                &format!(
+                    "手动发布版本，{}",
+                    queue_id
+                        .map(|id| format!("队列项 #{id}"))
+                        .unwrap_or_else(|| "已存在排队项".to_owned())
+                ),
             )
             .await;
-            redirect(&format!("/tasks/{}", result.task_id))
+            redirect("/artifacts")
+        }
+        Err(err) => app_error_response(err),
+    }
+}
+
+async fn artifact_schedule_submit(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Form(form): Form<ReleaseScheduleForm>,
+) -> Response {
+    if !valid_csrf(&session, &form.csrf_token) {
+        return forbidden();
+    }
+    if !session.can(SERVICES_DEPLOY) {
+        return forbidden();
+    }
+    match state
+        .apps()
+        .schedule_release_publish(form.release_id, &form.scheduled_publish_at)
+        .await
+    {
+        Ok(scheduled_at) => {
+            record_audit_event(
+                &state,
+                &session,
+                "services.deploy",
+                "release",
+                &form.release_id.to_string(),
+                &format!("设置计划发布时间 {scheduled_at}"),
+            )
+            .await;
+            redirect("/artifacts")
+        }
+        Err(err) => app_error_response(err),
+    }
+}
+
+async fn artifact_schedule_cancel_submit(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Form(form): Form<ReleaseCancelScheduleForm>,
+) -> Response {
+    if !valid_csrf(&session, &form.csrf_token) {
+        return forbidden();
+    }
+    if !session.can(SERVICES_DEPLOY) {
+        return forbidden();
+    }
+    match state.apps().cancel_scheduled_release(form.release_id).await {
+        Ok(()) => {
+            record_audit_event(
+                &state,
+                &session,
+                "services.deploy",
+                "release",
+                &form.release_id.to_string(),
+                "取消计划发布时间",
+            )
+            .await;
+            redirect("/artifacts")
+        }
+        Err(err) => app_error_response(err),
+    }
+}
+
+async fn artifact_queue_cancel_submit(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Form(form): Form<ReleaseQueueCancelForm>,
+) -> Response {
+    if !valid_csrf(&session, &form.csrf_token) {
+        return forbidden();
+    }
+    if !session.can(SERVICES_DEPLOY) {
+        return forbidden();
+    }
+    match state.apps().cancel_release_queue_item(form.queue_id).await {
+        Ok(_) => {
+            record_audit_event(
+                &state,
+                &session,
+                "services.deploy",
+                "release_queue",
+                &form.queue_id.to_string(),
+                "取消等待中的发布队列项",
+            )
+            .await;
+            redirect("/artifacts")
         }
         Err(err) => app_error_response(err),
     }
@@ -1908,7 +1772,6 @@ fn app_detail_is_deploying(detail: &crate::apps::AppConfigDetail) -> bool {
 #[derive(Clone, Copy)]
 enum DeployConfirmAction {
     Compose(ComposeTaskAction),
-    Binary(BinaryTaskAction),
 }
 
 async fn render_deploy_confirm(
@@ -1939,24 +1802,16 @@ async fn render_deploy_confirm(
             "应用没有可用目标节点，请先启用节点或调整目标节点".to_owned(),
         ));
     }
-    match action {
-        DeployConfirmAction::Compose(_) if detail.app.app_type != "compose" => {
-            return app_error_response(AppError::InvalidInput(
-                "当前应用不是 Compose 应用".to_owned(),
-            ));
-        }
-        DeployConfirmAction::Binary(_) if detail.app.app_type != "binary" => {
-            return app_error_response(AppError::InvalidInput("当前应用不是二进制应用".to_owned()));
-        }
-        _ => {}
+    if detail.app.app_type != "compose" {
+        return app_error_response(AppError::InvalidInput(
+            "当前应用不是 Compose 应用".to_owned(),
+        ));
     }
 
     let nav_sections = nav_sections("/apps", session);
     let deploy_diff = deploy_diff_view(&detail.deploy_diff);
-    let post_action = match action {
-        DeployConfirmAction::Compose(action) => compose_submit_path(app_id, action),
-        DeployConfirmAction::Binary(action) => binary_submit_path(app_id, action),
-    };
+    let DeployConfirmAction::Compose(compose_action) = action;
+    let post_action = compose_submit_path(app_id, compose_action);
     let action_label = deploy_confirm_action_label(action);
     let action_tone = deploy_confirm_action_tone(action);
     let action_description = deploy_confirm_action_description(action);
@@ -2083,7 +1938,7 @@ async fn app_compose_task_submit(
 async fn parse_artifact_upload_multipart(
     session: &CurrentSession,
     mut multipart: Multipart,
-) -> Result<UploadBinaryArtifactInput, Response> {
+) -> Result<UploadReleasePackageInput, Response> {
     let mut csrf_token = String::new();
     let mut app_id = None;
     let mut artifact_version = String::new();
@@ -2170,10 +2025,10 @@ async fn parse_artifact_upload_multipart(
     if !valid_csrf(session, &csrf_token) {
         return Err(forbidden());
     }
-    Ok(UploadBinaryArtifactInput {
+    Ok(UploadReleasePackageInput {
         app_id: app_id
             .ok_or_else(|| (StatusCode::BAD_REQUEST, "请选择关联应用").into_response())?,
-        artifact_version,
+        release_version: artifact_version,
         version_code,
         published_at,
         file_name,
@@ -2191,7 +2046,6 @@ async fn parse_api_package_upload_multipart(
     let mut published_at = String::new();
     let mut entry_file = String::new();
     let mut source = String::new();
-    let mut auto_deploy = false;
     let mut file_name = String::new();
     let mut bytes = Vec::new();
 
@@ -2242,15 +2096,6 @@ async fn parse_api_package_upload_multipart(
                     api_error(StatusCode::BAD_REQUEST, &format!("读取来源字段失败: {err}"))
                 })?;
             }
-            "auto_deploy" => {
-                let value = field.text().await.map_err(|err| {
-                    api_error(
-                        StatusCode::BAD_REQUEST,
-                        &format!("读取自动部署字段失败: {err}"),
-                    )
-                })?;
-                auto_deploy = parse_api_bool(&value);
-            }
             "package_file" | "file" | "artifact_file" => {
                 file_name = field
                     .file_name()
@@ -2281,50 +2126,7 @@ async fn parse_api_package_upload_multipart(
         bytes,
         entry_file,
         source,
-        auto_deploy,
     })
-}
-
-async fn app_binary_task_submit(
-    state: AppState,
-    session: CurrentSession,
-    app_id: i64,
-    form: ConfirmTaskForm,
-    action: BinaryTaskAction,
-) -> Response {
-    if !valid_csrf(&session, &form.csrf_token) {
-        return forbidden();
-    }
-    if !session.can(SERVICES_DEPLOY) {
-        return forbidden();
-    }
-    if !form.is_confirmed() {
-        return redirect(&binary_confirm_path(app_id, action));
-    }
-    match deploy_submit_blocker(&state, app_id, DeployConfirmAction::Binary(action)).await {
-        Ok(Some(message)) => return app_error_response(AppError::InvalidInput(message)),
-        Ok(None) => {}
-        Err(err) => return app_error_response(err),
-    }
-    match state
-        .apps()
-        .run_binary_task(app_id, action, &session.account.username)
-        .await
-    {
-        Ok(task_id) => {
-            record_audit_event(
-                &state,
-                &session,
-                binary_audit_action(action),
-                "task",
-                &task_id.to_string(),
-                &format!("应用 #{app_id} 创建二进制任务"),
-            )
-            .await;
-            redirect(&format!("/tasks/{task_id}"))
-        }
-        Err(err) => app_error_response(err),
-    }
 }
 
 async fn services_page(
@@ -2339,7 +2141,7 @@ async fn services_page(
         Ok(services) => services,
         Err(err) => return app_error_response(err),
     };
-    let selected_kind = normalize_service_kind_filter(query.kind.as_deref());
+    let selected_kind = "compose";
     let selected_status = normalize_service_status_filter(query.status.as_deref());
     let search_query = query.q.unwrap_or_default().trim().to_owned();
     let filtered_services = services
@@ -2352,7 +2154,6 @@ async fn services_page(
         .iter()
         .filter(|service| service.service_kind == "Docker Compose")
         .count();
-    let binary_count = services.len().saturating_sub(compose_count);
     let rows = filtered_services
         .iter()
         .map(|service| {
@@ -2410,8 +2211,6 @@ async fn services_page(
         services: &rows,
         service_count: rows.len(),
         compose_count,
-        binary_count,
-        selected_kind,
         selected_status,
         query: &search_query,
         can_logs: session.can(SERVICES_LOGS),
@@ -2433,24 +2232,18 @@ async fn service_logs_page(
         Ok(detail) => detail,
         Err(err) => return app_error_response(err),
     };
-    let log_output = if detail.app.app_type == "binary" {
-        match state
-            .apps()
-            .binary_service_logs(app_id, &service_name, query.node_id, tail_lines)
-            .await
-        {
-            Ok(output) => output,
-            Err(err) => return app_error_response(err),
-        }
-    } else {
-        match state
-            .apps()
-            .compose_service_logs(app_id, &service_name, query.node_id, tail_lines)
-            .await
-        {
-            Ok(output) => output,
-            Err(err) => return app_error_response(err),
-        }
+    if detail.app.app_type != "compose" {
+        return app_error_response(AppError::InvalidInput(
+            "业务应用级二进制日志入口已停用，请使用 Compose 应用日志".to_owned(),
+        ));
+    }
+    let log_output = match state
+        .apps()
+        .compose_service_logs(app_id, &service_name, query.node_id, tail_lines)
+        .await
+    {
+        Ok(output) => output,
+        Err(err) => return app_error_response(err),
     };
     let command = compose_result_view(log_output.command_output);
     let selected_log_href = service_log_href(app_id, &service_name, log_output.node.id, tail_lines);
@@ -2558,7 +2351,7 @@ async fn nodes_page(
     let can_install_nodes = session.can(NODES_INSTALL);
     let rows = filtered_nodes
         .iter()
-        .map(|node| node_page_row(node, can_manage_nodes))
+        .map(|node| node_page_row_clean(node, can_manage_nodes))
         .collect::<Vec<_>>();
     let mut node_details = Vec::with_capacity(filtered_nodes.len());
     for node in &filtered_nodes {
@@ -2571,14 +2364,18 @@ async fn nodes_page(
             checks: detail
                 .checks
                 .iter()
-                .map(node_check_history_row)
+                .map(node_check_history_row_clean)
                 .collect::<Vec<_>>(),
             apps: detail
                 .apps
                 .iter()
-                .map(node_app_runtime_row)
+                .map(node_app_runtime_row_clean)
                 .collect::<Vec<_>>(),
-            tasks: detail.tasks.iter().map(node_task_row).collect::<Vec<_>>(),
+            tasks: detail
+                .tasks
+                .iter()
+                .map(node_task_row_clean)
+                .collect::<Vec<_>>(),
             can_install: can_install_nodes,
         });
     }
@@ -2615,18 +2412,22 @@ async fn node_detail_page(
         Err(err) => return node_error_response(err),
     };
     let node = &detail.node;
-    let node_row = node_page_row(node, session.can(NODES_MANAGE));
+    let node_row = node_page_row_clean(node, session.can(NODES_MANAGE));
     let checks = detail
         .checks
         .iter()
-        .map(node_check_history_row)
+        .map(node_check_history_row_clean)
         .collect::<Vec<_>>();
     let apps = detail
         .apps
         .iter()
-        .map(node_app_runtime_row)
+        .map(node_app_runtime_row_clean)
         .collect::<Vec<_>>();
-    let tasks = detail.tasks.iter().map(node_task_row).collect::<Vec<_>>();
+    let tasks = detail
+        .tasks
+        .iter()
+        .map(node_task_row_clean)
+        .collect::<Vec<_>>();
     let capability_guides = node_capability_guides(node);
     let nav_sections = nav_sections("/nodes", &session);
     render_html(NodeDetailTemplate {
@@ -2751,8 +2552,8 @@ async fn node_status_submit(
                 &format!(
                     "{} 状态 {} -> {}",
                     change.node_name,
-                    node_status_label(&change.previous_status),
-                    node_status_label(&change.status)
+                    node_status_label_clean(&change.previous_status),
+                    node_status_label_clean(&change.status)
                 ),
             )
             .await;
@@ -2777,7 +2578,7 @@ async fn node_check_submit(
     let ajax_request = is_node_check_ajax_request(&headers);
     match state.nodes().check_node(form.node_id).await {
         Ok(result) if ajax_request => Json(NodeCheckAjaxResponse {
-            status: node_check_result_node_status_label(&result.status),
+            status: node_check_result_node_status_label_clean(&result.status),
             status_tone: node_check_result_node_status_tone(&result.status),
             docker_status: node_check_result_docker_status(&result),
             message: &result.message,
@@ -3123,6 +2924,10 @@ async fn task_detail_page(
         Ok(steps) => steps,
         Err(err) => return task_error_response(err),
     };
+    let task_phases = match state.tasks().task_phases(task_id).await {
+        Ok(phases) => phases,
+        Err(err) => return task_error_response(err),
+    };
     let node_results = match state.tasks().task_node_results(task_id).await {
         Ok(node_results) => node_results,
         Err(err) => return task_error_response(err),
@@ -3203,6 +3008,61 @@ async fn task_detail_page(
             }
         })
         .collect::<Vec<_>>();
+    let mut step_rows_by_phase = HashMap::<Option<i64>, Vec<TaskStepRow<'_>>>::new();
+    for (step, row) in steps.iter().zip(step_rows.iter()) {
+        step_rows_by_phase
+            .entry(step.phase_id)
+            .or_default()
+            .push(row.clone());
+    }
+    let mut phase_groups = Vec::new();
+    for phase in &task_phases {
+        let phase_steps = step_rows_by_phase
+            .remove(&Some(phase.id))
+            .unwrap_or_default();
+        let has_steps = !phase_steps.is_empty();
+        let step_is_open = phase_steps.iter().any(|step| step.is_open);
+        let title = if phase.title.trim().is_empty() {
+            task_phase_label(&phase.phase_key).to_owned()
+        } else {
+            phase.title.clone()
+        };
+        phase_groups.push(TaskPhaseGroupRow {
+            phase_no: phase.phase_no,
+            title,
+            phase_key: phase.phase_key.clone(),
+            status: task_step_status_label(&phase.status),
+            status_tone: task_step_status_tone(&phase.status),
+            summary: task_display_text(&phase.summary, "暂无阶段摘要").to_owned(),
+            started_at: phase.started_at.as_deref().unwrap_or("未开始").to_owned(),
+            finished_at: phase.finished_at.as_deref().unwrap_or("未结束").to_owned(),
+            steps: phase_steps,
+            has_steps,
+            is_open: matches!(phase.status.as_str(), "running" | "failed")
+                || phase.phase_key == task.phase
+                || step_is_open,
+        });
+    }
+    let mut ungrouped_steps = step_rows_by_phase.remove(&None).unwrap_or_default();
+    for (_, mut remaining_steps) in step_rows_by_phase {
+        ungrouped_steps.append(&mut remaining_steps);
+    }
+    if !ungrouped_steps.is_empty() {
+        let step_is_open = ungrouped_steps.iter().any(|step| step.is_open);
+        phase_groups.push(TaskPhaseGroupRow {
+            phase_no: 0,
+            title: "未归档步骤".to_owned(),
+            phase_key: "ungrouped".to_owned(),
+            status: "已记录",
+            status_tone: "neutral",
+            summary: "历史任务或未绑定阶段的步骤".to_owned(),
+            started_at: "-".to_owned(),
+            finished_at: "-".to_owned(),
+            steps: ungrouped_steps,
+            has_steps: true,
+            is_open: step_is_open || task.status == "failed",
+        });
+    }
     let node_result_rows = node_results
         .iter()
         .map(|result| {
@@ -3246,7 +3106,7 @@ async fn task_detail_page(
         execution_guide,
         return_action,
         phases: &phase_rows,
-        steps: &step_rows,
+        phase_groups: &phase_groups,
         node_results: &node_result_rows,
         logs: &ungrouped_log_rows,
         can_retry: session.can(TASKS_RETRY),
@@ -3309,12 +3169,6 @@ async fn task_retry_submit(
                 .retry_compose_task(task_id, &session.account.username)
                 .await
         }
-        Ok(task) if is_binary_task_kind(&task.task_kind) => {
-            state
-                .apps()
-                .retry_binary_task(task_id, &session.account.username)
-                .await
-        }
         Ok(_) => Err(AppError::InvalidInput("当前任务不支持重试".to_owned())),
         Err(err) => return task_error_response(err),
     };
@@ -3374,35 +3228,47 @@ async fn artifacts_page(
     if !session.can(ARTIFACTS_VIEW) {
         return forbidden();
     }
-    let artifacts = match state.apps().list_artifacts().await {
-        Ok(artifacts) => artifacts,
+    let releases = match state.apps().list_app_releases().await {
+        Ok(releases) => releases,
+        Err(err) => return app_error_response(err),
+    };
+    let release_queue = match state.apps().list_app_release_queue().await {
+        Ok(queue) => queue,
         Err(err) => return app_error_response(err),
     };
     let apps = match state.apps().list_apps().await {
         Ok(apps) => apps,
         Err(err) => return app_error_response(err),
     };
-    let binary_apps = apps
+    let package_apps = apps
         .iter()
-        .filter(|app| app.app_type == "binary" && app.status != "disabled")
+        .filter(|app| {
+            app.app_type == "compose"
+                && app.release_source == "package_upload"
+                && app.status != "disabled"
+        })
         .map(|app| ArtifactAppOptionRow {
             id: app.id,
             label: app.name.clone(),
-            detail: format!("{} · {}", app.app_key, app.work_dir),
+            detail: format!(
+                "{} · {} · {}",
+                app.app_key,
+                app.work_dir,
+                release_publish_mode_label(app.auto_queue_release == 1)
+            ),
         })
         .collect::<Vec<_>>();
-    let active_count = artifacts
+    let queued_count = releases
         .iter()
-        .filter(|artifact| artifact.status == "active")
+        .filter(|release| matches!(release.status.as_str(), "queued" | "deploying"))
         .count();
-    let uploaded_count = artifacts
+    let uploaded_count = releases
         .iter()
-        .filter(|artifact| artifact.metadata_value("source") == "upload")
+        .filter(|release| matches!(release.source.as_str(), "openapi" | "web"))
         .count();
-    let registered_count = artifacts.len().saturating_sub(uploaded_count);
-    let latest_time = artifacts
+    let latest_time = releases
         .first()
-        .map(|artifact| artifact.published_at.clone())
+        .map(|release| format_datetime_shanghai(&release.published_at))
         .unwrap_or_else(|| "暂无发布版本".to_owned());
     let selected_status = normalize_artifact_status_filter(query.status.as_deref());
     let selected_kind = normalize_artifact_kind_filter(query.kind.as_deref());
@@ -3412,56 +3278,187 @@ async fn artifacts_page(
         Ok(config) => config,
         Err(err) => return platform_error_response(err),
     };
-    let filtered_artifacts = artifacts
+    let filtered_releases = releases
         .iter()
-        .filter(|artifact| {
-            artifact_matches_filters(
-                artifact,
-                selected_status,
-                selected_kind,
-                selected_source,
-                &search_query,
+        .filter(|release| {
+            if !selected_status.is_empty() && release.status != selected_status {
+                return false;
+            }
+            if !selected_kind.is_empty() {
+                let kind = if release.package_name.ends_with(".tar.gz")
+                    || release.package_name.ends_with(".tgz")
+                {
+                    "tar_gz"
+                } else {
+                    "binary"
+                };
+                if kind != selected_kind {
+                    return false;
+                }
+            }
+            if !selected_source.is_empty() {
+                let source = match release.source.as_str() {
+                    "openapi" => "openapi",
+                    "web" => "web",
+                    "initial" => "initial",
+                    _ => "",
+                };
+                if selected_source == "upload" {
+                    if !matches!(source, "web" | "openapi") {
+                        return false;
+                    }
+                } else if source != selected_source {
+                    return false;
+                }
+            }
+            if search_query.is_empty() {
+                return true;
+            }
+            let haystack = format!(
+                "{} {} {} {} {} {}",
+                release.app_name,
+                release.app_key,
+                release.version,
+                release.package_name,
+                release.package_path,
+                release.checksum_sha256
             )
+            .to_lowercase();
+            haystack.contains(&search_query.to_lowercase())
         })
         .collect::<Vec<_>>();
-    let rows = filtered_artifacts
+    let rows = filtered_releases
         .iter()
-        .map(|artifact| ArtifactPageRow {
-            id: artifact.id,
-            app_id: artifact.app_id,
-            app_name: artifact.app_name.clone(),
-            app_key: artifact.app_key.clone(),
-            version: artifact.version.clone(),
-            version_code: artifact.version_code,
-            artifact_kind: artifact_kind_label(&artifact.artifact_kind).to_owned(),
-            status: artifact_status_label(&artifact.status),
-            status_tone: artifact_status_tone(&artifact.status),
-            artifact_path: artifact.artifact_path.clone(),
-            sha256: short_hash(&artifact.metadata_value("sha256")),
-            size: format_size(&artifact.metadata_value("size_bytes")),
-            entry_file: display_text(artifact.metadata_value("entry_file"), "未记录"),
-            source: artifact_source_label(&artifact.metadata_value("source")).to_owned(),
-            published_at: artifact.published_at.clone(),
-            created_at: artifact.created_at.clone(),
+        .map(|release| {
+            let kind = if release.package_name.ends_with(".tar.gz")
+                || release.package_name.ends_with(".tgz")
+            {
+                "tar_gz"
+            } else {
+                "binary"
+            };
+            let active_queue = release_queue.iter().find(|item| {
+                item.release_id == release.id
+                    && matches!(item.status.as_str(), "scheduled" | "queued" | "running")
+            });
+            let publish_mode = apps
+                .iter()
+                .find(|app| app.id == release.app_id)
+                .map(|app| release_publish_mode_label(app.auto_queue_release == 1))
+                .unwrap_or("手动发布");
+            ArtifactPageRow {
+                id: release.id,
+                app_id: release.app_id,
+                app_name: release.app_name.clone(),
+                app_key: release.app_key.clone(),
+                version: release.version.clone(),
+                version_code: release.version_code,
+                artifact_kind: artifact_kind_label(kind).to_owned(),
+                status: release_status_label(&release.status),
+                status_tone: release_status_tone(&release.status),
+                queue_status: active_queue
+                    .map(|item| queue_status_label(&item.status).to_owned())
+                    .unwrap_or_else(|| "未排队".to_owned()),
+                queue_status_tone: active_queue
+                    .map(|item| queue_status_tone(&item.status))
+                    .unwrap_or("neutral"),
+                publish_mode,
+                artifact_path: release.package_path.clone(),
+                sha256: short_hash(&release.checksum_sha256),
+                size: format_size(&release.size_bytes.to_string()),
+                entry_file: display_text(
+                    artifact_metadata_value(&release.metadata, "entry_file"),
+                    "未记录",
+                ),
+                source: artifact_source_label(&release.source).to_owned(),
+                published_at: format_datetime_shanghai(&release.published_at),
+                received_at: format_datetime_shanghai(&release.received_at),
+                scheduled_publish_at: display_text(
+                    active_queue
+                        .and_then(|item| item.scheduled_publish_at.as_deref())
+                        .map(format_datetime_shanghai)
+                        .unwrap_or_default(),
+                    "未设置",
+                ),
+                scheduled_publish_input: format_datetime_local_input(
+                    active_queue
+                        .and_then(|item| item.scheduled_publish_at.as_deref())
+                        .unwrap_or_default(),
+                ),
+                queue_id: active_queue.map(|item| item.id),
+                task_id: active_queue.and_then(|item| item.task_id),
+                can_publish_now: session.can(SERVICES_DEPLOY)
+                    && active_queue.is_none()
+                    && !matches!(release.status.as_str(), "deploying"),
+                can_schedule: session.can(SERVICES_DEPLOY)
+                    && active_queue.is_none()
+                    && !matches!(release.status.as_str(), "deploying"),
+                can_cancel_schedule: session.can(SERVICES_DEPLOY)
+                    && active_queue.is_some_and(|item| item.status == "scheduled"),
+                can_cancel_queue: session.can(SERVICES_DEPLOY)
+                    && active_queue.is_some_and(|item| item.status == "queued"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let queue_rows = release_queue
+        .iter()
+        .map(|item| ReleaseQueueRow {
+            id: item.id,
+            app_id: item.app_id,
+            app_name: item.app_name.clone(),
+            app_key: item.app_key.clone(),
+            release_id: item.release_id,
+            version: item.version.clone(),
+            version_code: item.version_code,
+            status: queue_status_label(&item.status),
+            status_tone: queue_status_tone(&item.status),
+            queue_seq: item.queue_seq,
+            triggered_by: item.triggered_by.clone(),
+            message: item.message.clone(),
+            task_id: item.task_id,
+            scheduled_publish_at: item
+                .scheduled_publish_at
+                .as_deref()
+                .map(format_datetime_shanghai)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "立即".to_owned()),
+            created_at: format_datetime_shanghai(&item.created_at),
+            started_at: item
+                .started_at
+                .as_deref()
+                .map(format_datetime_shanghai)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "未开始".to_owned()),
+            finished_at: item
+                .finished_at
+                .as_deref()
+                .map(format_datetime_shanghai)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "未结束".to_owned()),
+            can_cancel: session.can(SERVICES_DEPLOY) && item.status == "queued",
         })
         .collect::<Vec<_>>();
     let summary_items = vec![
         SummaryItem {
             label: "发布版本",
-            value: artifacts.len().to_string(),
-            detail: "最多 100 条二进制发布版本".to_owned(),
+            value: releases.len().to_string(),
+            detail: "统一版本中心，展示最近 100 条发布版本".to_owned(),
             tone: "neutral",
         },
         SummaryItem {
-            label: "当前版本",
-            value: active_count.to_string(),
-            detail: "每个二进制应用最多一个当前版本".to_owned(),
-            tone: "success",
+            label: "待发布",
+            value: queued_count.to_string(),
+            detail: "包含等待入队和正在发布中的版本".to_owned(),
+            tone: if queued_count > 0 {
+                "active"
+            } else {
+                "neutral"
+            },
         },
         SummaryItem {
             label: "上传版本包",
             value: uploaded_count.to_string(),
-            detail: format!("登记路径 {registered_count} 个"),
+            detail: "来自 OpenAPI 的版本包".to_owned(),
             tone: "active",
         },
         SummaryItem {
@@ -3482,7 +3479,8 @@ async fn artifacts_page(
         nav_sections: &nav_sections,
         summary_items: &summary_items,
         artifacts: &rows,
-        binary_apps: &binary_apps,
+        release_queue: &queue_rows,
+        package_apps: &package_apps,
         selected_status,
         selected_kind,
         selected_source,
@@ -3608,20 +3606,20 @@ async fn settings_page(State(state): State<AppState>, session: CurrentSession) -
         SettingsRow {
             label: "健康检查超时",
             value: "5 秒".to_owned(),
-            detail: "应用未配置时使用 none；HTTP/TCP/systemd 检查默认 5 秒",
+            detail: "应用未配置时使用 none；HTTP/TCP/容器运行状态检查默认 5 秒",
         },
         SettingsRow {
             label: "命令执行超时",
             value: format!("{} 秒", settings.command_timeout_secs.max(1)),
-            detail: "来自 EASY_DEPLOY_COMMAND_TIMEOUT_SECS / --command-timeout-secs，作用于 Docker、systemd、SSH 与 scp 命令",
+            detail: "来自 EASY_DEPLOY_COMMAND_TIMEOUT_SECS / --command-timeout-secs，作用于 Docker、SSH 与 scp 命令",
         },
         SettingsRow {
-            label: "上传版本包保留",
+            label: "发布版本保留",
             value: format!(
                 "最多 {} 个版本",
                 platform_config.uploaded_binary_releases_to_keep
             ),
-            detail: "上传二进制版本包后的保留数量，当前版本永远不会被清理",
+            detail: "页面或 OpenAPI 投递版本包后的保留数量，当前生效版本永远不会被清理",
         },
         SettingsRow {
             label: "任务队列",
@@ -3681,7 +3679,7 @@ async fn settings_submit(
                 "settings",
                 "platform",
                 &format!(
-                    "更新平台设置：应用目录模板 {}，节点目录 {}，上传版本包保留 {} 个版本",
+                    "更新平台设置：应用目录模板 {}，节点目录 {}，发布版本保留 {} 个版本",
                     config.default_app_work_dir,
                     config.default_node_work_dir,
                     config.uploaded_binary_releases_to_keep
@@ -4495,537 +4493,6 @@ async fn api_token_delete_submit(
     }
 }
 
-async fn api_v1_nodes(State(state): State<AppState>, api: ApiSession) -> Response {
-    if !api.can(NODES_VIEW) {
-        return api_error(StatusCode::FORBIDDEN, "permission denied");
-    }
-    let nodes = match state.nodes().list_nodes().await {
-        Ok(nodes) => nodes,
-        Err(err) => return api_error(node_error_status(&err), err.message()),
-    };
-    Json(serde_json::json!({
-        "data": nodes.into_iter().map(|node| serde_json::json!({
-            "id": node.id,
-            "node_key": node.node_key,
-            "name": node.name,
-            "node_type": node.node_type,
-            "address": node.address,
-            "ssh_port": node.ssh_port,
-            "ssh_user": node.ssh_user,
-            "work_dir": node.work_dir,
-            "region": node.region,
-            "labels": node.labels,
-            "status": node.status,
-            "docker_status": node.docker_status,
-            "capabilities": {
-                "docker": node.docker_available == 1,
-                "compose": node.compose_available == 1,
-                "systemd": node.systemd_available == 1,
-                "caddy": node.caddy_available == 1,
-                "nginx": node.nginx_available == 1
-            },
-            "last_check_at": node.last_check_at,
-            "last_message": node.last_message
-        })).collect::<Vec<_>>()
-    }))
-    .into_response()
-}
-
-async fn api_v1_apps(State(state): State<AppState>, api: ApiSession) -> Response {
-    if !api.can(APPS_VIEW) {
-        return api_error(StatusCode::FORBIDDEN, "permission denied");
-    }
-    let apps = match state.apps().list_apps().await {
-        Ok(apps) => apps,
-        Err(err) => return api_error(app_error_status(&err), err.message()),
-    };
-    Json(serde_json::json!({
-        "data": apps.into_iter().map(|app| serde_json::json!({
-            "id": app.id,
-            "app_key": app.app_key,
-            "name": app.name,
-            "description": app.description,
-            "environment": app.environment,
-            "app_type": app.app_type,
-            "deploy_mode": app.deploy_mode,
-            "deploy_strategy": app.deploy_strategy,
-            "work_dir": app.work_dir,
-            "status": app.status,
-            "target_names": app.target_names,
-            "target_count": app.target_count,
-            "created_at": app.created_at,
-            "updated_at": app.updated_at
-        })).collect::<Vec<_>>()
-    }))
-    .into_response()
-}
-
-async fn api_v1_create_app(
-    State(state): State<AppState>,
-    api: ApiSession,
-    Json(payload): Json<ApiV1CreateAppRequest>,
-) -> Response {
-    if !api.can("apps.create") {
-        return api_error(StatusCode::FORBIDDEN, "permission denied");
-    }
-    if let Err(err) = normalize_deploy_strategy(&payload.deploy_strategy) {
-        return api_error(StatusCode::BAD_REQUEST, err.message());
-    }
-    let platform_config = match state.platform().config().await {
-        Ok(config) => config,
-        Err(err) => return api_error(platform_error_status(&err), err.message()),
-    };
-    let work_dir = if payload.work_dir.trim().is_empty() {
-        platform_config.default_app_work_dir_for(&payload.app_key)
-    } else {
-        payload.work_dir
-    };
-    let target_node_ids = if !payload.target_node_ids.is_empty() {
-        payload.target_node_ids
-    } else {
-        let node_keys = if payload.target_node_keys.is_empty() {
-            vec!["local".to_owned()]
-        } else {
-            payload.target_node_keys
-        };
-        match state.apps().node_ids_by_keys(&node_keys).await {
-            Ok(node_ids) => node_ids,
-            Err(err) => return api_error(app_error_status(&err), err.message()),
-        }
-    };
-    let input = CreateAppInput {
-        app_key: payload.app_key,
-        name: payload.name,
-        description: payload.description,
-        environment: payload.environment,
-        app_type: payload.app_type,
-        deploy_strategy: payload.deploy_strategy,
-        work_dir,
-        compose_content: payload.compose_content,
-        env_content: payload.env_content,
-        binary_artifact_version: payload.binary_artifact_version,
-        binary_artifact_path: payload.binary_artifact_path,
-        binary_exec_args: payload.binary_exec_args,
-        binary_service_user: payload.binary_service_user,
-        binary_unit_name: payload.binary_unit_name,
-        binary_release_strategy: payload.binary_release_strategy,
-        binary_active_slot: payload.binary_active_slot,
-        binary_base_port: payload.binary_base_port,
-        binary_standby_port: payload.binary_standby_port,
-        binary_proxy_enabled: payload.binary_proxy_enabled,
-        binary_proxy_kind: payload.binary_proxy_kind,
-        binary_proxy_domain: payload.binary_proxy_domain,
-        binary_proxy_config_path: payload.binary_proxy_config_path,
-        target_node_ids,
-    };
-    match state.apps().create_app(input).await {
-        Ok(app_id) => {
-            let detail = match state.apps().app_detail(app_id).await {
-                Ok(detail) => detail,
-                Err(err) => return api_error(app_error_status(&err), err.message()),
-            };
-            Json(serde_json::json!({
-                "data": {
-                    "id": app_id,
-                    "app_key": detail.app.app_key,
-                    "environment": detail.app.environment
-                }
-            }))
-            .into_response()
-        }
-        Err(err) => api_error(app_error_status(&err), err.message()),
-    }
-}
-
-async fn api_v1_app_detail(
-    State(state): State<AppState>,
-    api: ApiSession,
-    Path(app_id): Path<i64>,
-) -> Response {
-    if !api.can(APPS_VIEW) {
-        return api_error(StatusCode::FORBIDDEN, "permission denied");
-    }
-    let detail = match state.apps().app_detail(app_id).await {
-        Ok(detail) => detail,
-        Err(err) => return api_error(app_error_status(&err), err.message()),
-    };
-    Json(api_app_detail_payload(detail)).into_response()
-}
-
-async fn api_v1_service_app_detail(
-    State(state): State<AppState>,
-    api: ApiSession,
-    Path(service_key): Path<String>,
-) -> Response {
-    if !api.can(APPS_VIEW) {
-        return api_error(StatusCode::FORBIDDEN, "permission denied");
-    }
-    let app_id = match state.apps().app_id_by_key(&service_key).await {
-        Ok(app_id) => app_id,
-        Err(AppError::InvalidInput(_)) => {
-            return api_error(StatusCode::NOT_FOUND, "服务标识不存在");
-        }
-        Err(err) => return api_error(app_error_status(&err), err.message()),
-    };
-    let detail = match state.apps().app_detail(app_id).await {
-        Ok(detail) => detail,
-        Err(err) => return api_error(app_error_status(&err), err.message()),
-    };
-    Json(api_app_detail_payload(detail)).into_response()
-}
-
-fn api_app_detail_payload(detail: crate::apps::AppConfigDetail) -> serde_json::Value {
-    let service_key = detail.app.app_key.clone();
-    let app_id = detail.app.id;
-    let enabled = detail.app.status != "disabled";
-    let management_status = if enabled { "enabled" } else { "disabled" };
-    let runtime_overview = api_runtime_overview(&detail.runtime_states, enabled);
-    let latest_config_revision = detail
-        .config_snapshots
-        .first()
-        .map(|snapshot| format!("config#{}", snapshot.revision_no));
-    let current_release_version = (!detail.binary_config.artifact_version.is_empty())
-        .then(|| detail.binary_config.artifact_version.clone());
-    serde_json::json!({
-        "data": {
-            "service_key": service_key.clone(),
-            "package_upload_url": format!("/api/v1/services/{service_key}/packages"),
-            "deploy_url": format!("/api/v1/apps/{app_id}/deploy"),
-            "latest_config_revision": latest_config_revision,
-            "current_release_version": current_release_version,
-            "app": {
-                "id": detail.app.id,
-                "app_key": detail.app.app_key,
-                "name": detail.app.name,
-                "description": detail.app.description,
-                "environment": detail.app.environment,
-                "app_type": detail.app.app_type,
-                "deploy_mode": detail.app.deploy_mode,
-                "deploy_strategy": detail.app.deploy_strategy,
-                "work_dir": detail.app.work_dir,
-                "status": detail.app.status,
-                "enabled": enabled,
-                "management_status": management_status,
-                "runtime_status": runtime_overview.status,
-                "runtime_summary": runtime_overview.summary,
-                "target_names": detail.app.target_names,
-                "target_count": detail.app.target_count,
-                "created_at": detail.app.created_at,
-                "updated_at": detail.app.updated_at
-            },
-            "runtime_root": detail.runtime_root,
-            "compose_content": detail.compose_content,
-            "env_content": detail.env_content,
-            "service_names": detail.service_names,
-            "target_nodes": detail.target_nodes.into_iter().map(|node| serde_json::json!({
-                "id": node.id,
-                "name": node.name,
-                "node_key": node.node_key,
-                "node_type": node.node_type,
-                "status": node.status,
-                "docker_status": node.docker_status
-            })).collect::<Vec<_>>(),
-            "runtime_states": detail.runtime_states.into_iter().map(|state| serde_json::json!({
-                "node_id": state.node_id,
-                "node_name": state.node_name,
-                "node_key": state.node_key,
-                "runtime_status": state.runtime_status,
-                "active_version": state.active_version,
-                "service_count": state.service_count,
-                "message": state.message,
-                "last_task_id": state.last_task_id,
-                "last_task_status": state.last_task_status,
-                "last_task_kind": state.last_task_kind,
-                "last_deploy_at": state.last_deploy_at,
-                "updated_at": state.updated_at
-            })).collect::<Vec<_>>(),
-            "config_snapshots": detail.config_snapshots.iter().map(|snapshot| serde_json::json!({
-                "id": snapshot.id,
-                "revision_no": snapshot.revision_no,
-                "snapshot_kind": snapshot.snapshot_kind,
-                "artifact_version": snapshot.artifact_version,
-                "config_hash": snapshot.config_hash,
-                "compose_summary": config_summary(&snapshot.compose_content),
-                "env_summary": config_summary(&snapshot.env_content),
-                "binary_summary": snapshot_binary_summary(&snapshot.metadata),
-                "created_at": snapshot.created_at
-            })).collect::<Vec<_>>(),
-            "deployment_runs": detail.deployment_runs.iter().map(|run| serde_json::json!({
-                "id": run.id,
-                "task_id": run.task_id,
-                "task_title": run.task_title,
-                "deploy_action": run.deploy_action,
-                "status": run.status,
-                "message": run.message,
-                "config_snapshot_id": run.config_snapshot_id,
-                "config_revision_no": run.config_revision_no,
-                "artifact_version": run.artifact_version,
-                "started_at": run.started_at,
-                "finished_at": run.finished_at
-            })).collect::<Vec<_>>(),
-            "binary_config": {
-                "artifact_version": detail.binary_config.artifact_version,
-                "artifact_path": detail.binary_config.artifact_path,
-                "exec_args": detail.binary_config.exec_args,
-                "service_user": detail.binary_config.service_user,
-                "unit_name": detail.binary_config.unit_name,
-                "release_strategy": detail.binary_config.release_strategy,
-                "active_slot": detail.binary_config.active_slot,
-                "base_port": detail.binary_config.base_port,
-                "standby_port": detail.binary_config.standby_port,
-                "proxy_enabled": detail.binary_config.proxy_enabled == 1,
-                "proxy_kind": detail.binary_config.proxy_kind,
-                "proxy_domain": detail.binary_config.proxy_domain,
-                "proxy_config_path": detail.binary_config.proxy_config_path
-            }
-        }
-    })
-}
-
-async fn api_v1_update_app_config(
-    State(state): State<AppState>,
-    api: ApiSession,
-    Path(app_id): Path<i64>,
-    Json(payload): Json<ApiV1UpdateAppConfigRequest>,
-) -> Response {
-    api_v1_update_config_by_app_id(state, api, app_id, payload).await
-}
-
-async fn api_v1_update_service_config(
-    State(state): State<AppState>,
-    api: ApiSession,
-    Path(service_key): Path<String>,
-    Json(payload): Json<ApiV1UpdateAppConfigRequest>,
-) -> Response {
-    let app_id = match state.apps().app_id_by_key(&service_key).await {
-        Ok(app_id) => app_id,
-        Err(AppError::InvalidInput(_)) => {
-            return api_error(StatusCode::NOT_FOUND, "服务标识不存在");
-        }
-        Err(err) => return api_error(app_error_status(&err), err.message()),
-    };
-    api_v1_update_config_by_app_id(state, api, app_id, payload).await
-}
-
-async fn api_v1_update_config_by_app_id(
-    state: AppState,
-    api: ApiSession,
-    app_id: i64,
-    payload: ApiV1UpdateAppConfigRequest,
-) -> Response {
-    if !api.can(APPS_UPDATE) {
-        return api_error(StatusCode::FORBIDDEN, "permission denied");
-    }
-    let health_check = match normalize_health_config(
-        &payload.health_check_kind,
-        &payload.health_endpoint,
-        payload.health_timeout_secs,
-        payload.health_expected_status,
-    ) {
-        Ok(config) => config,
-        Err(err) => return api_error(StatusCode::BAD_REQUEST, err.message()),
-    };
-    let input = UpdateAppConfigInput {
-        app_id,
-        compose_content: payload.compose_content,
-        env_content: payload.env_content,
-        binary_artifact_version: payload.binary_artifact_version,
-        binary_artifact_path: payload.binary_artifact_path,
-        binary_exec_args: payload.binary_exec_args,
-        binary_service_user: payload.binary_service_user,
-        binary_unit_name: payload.binary_unit_name,
-        binary_release_strategy: payload.binary_release_strategy,
-        binary_active_slot: payload.binary_active_slot,
-        binary_base_port: payload.binary_base_port,
-        binary_standby_port: payload.binary_standby_port,
-        binary_proxy_enabled: payload.binary_proxy_enabled,
-        binary_proxy_kind: payload.binary_proxy_kind,
-        binary_proxy_domain: payload.binary_proxy_domain,
-        binary_proxy_config_path: payload.binary_proxy_config_path,
-        health_check,
-    };
-    if let Err(err) = state.apps().update_app_config(input).await {
-        return api_error(app_error_status(&err), err.message());
-    }
-    let detail = match state.apps().app_detail(app_id).await {
-        Ok(detail) => detail,
-        Err(err) => return api_error(app_error_status(&err), err.message()),
-    };
-    let latest_snapshot = detail.config_snapshots.first();
-    Json(serde_json::json!({
-        "data": {
-            "app_id": detail.app.id,
-            "service_key": detail.app.app_key,
-            "config_snapshot_id": latest_snapshot.map(|snapshot| snapshot.id),
-            "config_revision_no": latest_snapshot.map(|snapshot| snapshot.revision_no),
-            "config_revision": latest_snapshot.map(|snapshot| format!("config#{}", snapshot.revision_no)),
-            "current_release_version": if detail.binary_config.artifact_version.is_empty() {
-                serde_json::Value::Null
-            } else {
-                serde_json::Value::String(detail.binary_config.artifact_version)
-            },
-            "package_upload_url": format!("/api/v1/services/{}/packages", detail.app.app_key),
-            "deploy_url": format!("/api/v1/apps/{}/deploy", detail.app.id)
-        }
-    }))
-    .into_response()
-}
-
-async fn api_v1_enable_app(
-    State(state): State<AppState>,
-    api: ApiSession,
-    Path(app_id): Path<i64>,
-) -> Response {
-    api_v1_set_app_enabled_by_id(state, api, app_id, true).await
-}
-
-async fn api_v1_disable_app(
-    State(state): State<AppState>,
-    api: ApiSession,
-    Path(app_id): Path<i64>,
-) -> Response {
-    api_v1_set_app_enabled_by_id(state, api, app_id, false).await
-}
-
-async fn api_v1_enable_service(
-    State(state): State<AppState>,
-    api: ApiSession,
-    Path(service_key): Path<String>,
-) -> Response {
-    api_v1_set_service_enabled(state, api, service_key, true).await
-}
-
-async fn api_v1_disable_service(
-    State(state): State<AppState>,
-    api: ApiSession,
-    Path(service_key): Path<String>,
-) -> Response {
-    api_v1_set_service_enabled(state, api, service_key, false).await
-}
-
-async fn api_v1_set_service_enabled(
-    state: AppState,
-    api: ApiSession,
-    service_key: String,
-    enabled: bool,
-) -> Response {
-    let app_id = match state.apps().app_id_by_key(&service_key).await {
-        Ok(app_id) => app_id,
-        Err(AppError::InvalidInput(_)) => {
-            return api_error(StatusCode::NOT_FOUND, "服务标识不存在");
-        }
-        Err(err) => return api_error(app_error_status(&err), err.message()),
-    };
-    api_v1_set_app_enabled_by_id(state, api, app_id, enabled).await
-}
-
-async fn api_v1_set_app_enabled_by_id(
-    state: AppState,
-    api: ApiSession,
-    app_id: i64,
-    enabled: bool,
-) -> Response {
-    if !api.can(APPS_STATUS) {
-        return api_error(StatusCode::FORBIDDEN, "permission denied");
-    }
-    let change = match state.apps().set_app_enabled(app_id, enabled).await {
-        Ok(change) => change,
-        Err(err) => return api_error(app_error_status(&err), err.message()),
-    };
-    Json(serde_json::json!({
-        "data": {
-            "app_id": change.app_id,
-            "app_name": change.app_name,
-            "enabled": change.status != "disabled",
-            "previous_enabled": change.previous_status != "disabled",
-            "management_status": if change.status == "disabled" { "disabled" } else { "enabled" }
-        }
-    }))
-    .into_response()
-}
-
-async fn api_v1_deploy_app(
-    State(state): State<AppState>,
-    api: ApiSession,
-    Path(app_id): Path<i64>,
-    Json(payload): Json<ApiV1DeployAppRequest>,
-) -> Response {
-    api_v1_deploy_app_by_id(state, api, app_id, payload).await
-}
-
-async fn api_v1_deploy_service(
-    State(state): State<AppState>,
-    api: ApiSession,
-    Path(service_key): Path<String>,
-    Json(payload): Json<ApiV1DeployAppRequest>,
-) -> Response {
-    let app_id = match state.apps().app_id_by_key(&service_key).await {
-        Ok(app_id) => app_id,
-        Err(AppError::InvalidInput(_)) => {
-            return api_error(StatusCode::NOT_FOUND, "服务标识不存在");
-        }
-        Err(err) => return api_error(app_error_status(&err), err.message()),
-    };
-    api_v1_deploy_app_by_id(state, api, app_id, payload).await
-}
-
-async fn api_v1_deploy_app_by_id(
-    state: AppState,
-    api: ApiSession,
-    app_id: i64,
-    payload: ApiV1DeployAppRequest,
-) -> Response {
-    if !api.can(SERVICES_DEPLOY) {
-        return api_error(StatusCode::FORBIDDEN, "permission denied");
-    }
-    let actor = api.actor();
-    let result = match payload.action.as_str() {
-        "up" | "compose_up" => {
-            state
-                .apps()
-                .run_compose_task(app_id, ComposeTaskAction::Up, &actor)
-                .await
-        }
-        "down" | "compose_down" => {
-            state
-                .apps()
-                .run_compose_task(app_id, ComposeTaskAction::Down, &actor)
-                .await
-        }
-        "restart" | "compose_restart" => {
-            state
-                .apps()
-                .run_compose_task(app_id, ComposeTaskAction::Restart, &actor)
-                .await
-        }
-        "binary_restart" => {
-            state
-                .apps()
-                .run_binary_task(app_id, BinaryTaskAction::Restart, &actor)
-                .await
-        }
-        "binary_stop" => {
-            state
-                .apps()
-                .run_binary_task(app_id, BinaryTaskAction::Stop, &actor)
-                .await
-        }
-        _ => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "unsupported deploy action, use up/down/restart/binary_restart/binary_stop",
-            );
-        }
-    };
-    match result {
-        Ok(task_id) => {
-            Json(serde_json::json!({ "data": { "app_id": app_id, "task_id": task_id } }))
-                .into_response()
-        }
-        Err(err) => api_error(app_error_status(&err), err.message()),
-    }
-}
-
 async fn api_v1_upload_service_package(
     State(state): State<AppState>,
     api: ApiSession,
@@ -5039,10 +4506,7 @@ async fn api_v1_upload_service_package(
         Ok(upload) => upload,
         Err(response) => return response,
     };
-    if upload.auto_deploy && !api.can(SERVICES_DEPLOY) {
-        return api_error(StatusCode::FORBIDDEN, "permission denied");
-    }
-    let parsed = match parse_binary_package_name_for_service(
+    let parsed = match parse_release_package_name_for_service(
         &upload.file_name,
         &service_key,
         Some(&upload.artifact_version),
@@ -5056,9 +4520,9 @@ async fn api_v1_upload_service_package(
     };
     let result = match state
         .apps()
-        .upload_binary_artifact(UploadBinaryArtifactInput {
+        .upload_release_package(UploadReleasePackageInput {
             app_id,
-            artifact_version: parsed.release_version,
+            release_version: parsed.release_version,
             version_code: upload.version_code.or(Some(parsed.version_code)),
             published_at: upload.published_at,
             file_name: upload.file_name,
@@ -5071,161 +4535,24 @@ async fn api_v1_upload_service_package(
         Ok(result) => result,
         Err(err) => return api_error(app_error_status(&err), err.message()),
     };
-    let task_id = if upload.auto_deploy {
-        let actor = api.actor();
-        match state
-            .apps()
-            .run_binary_task(result.app_id, BinaryTaskAction::Restart, &actor)
-            .await
-        {
-            Ok(task_id) => Some(task_id),
-            Err(err) => return api_error(app_error_status(&err), err.message()),
-        }
-    } else {
-        None
-    };
     Json(serde_json::json!({
         "data": {
             "app_id": result.app_id,
             "service_key": result.app_key,
-            "release_version": result.artifact_version,
+            "release_id": result.release_id,
+            "queue_id": result.queue_id,
+            "release_version": result.release_version,
             "version_code": result.version_code,
             "versionCode": result.version_code,
             "published_at": result.published_at,
             "publishedAt": result.published_at,
-            "package_path": result.artifact_path,
-            "package_kind": result.artifact_kind,
+            "package_path": result.package_path,
+            "package_kind": result.package_kind,
             "config_snapshot_id": result.config_snapshot_id,
             "config_revision_no": result.config_revision_no,
             "config_revision": format!("config#{}", result.config_revision_no),
-            "auto_deploy": upload.auto_deploy,
-            "task_id": task_id
-        }
-    }))
-    .into_response()
-}
-
-async fn api_v1_tasks(
-    State(state): State<AppState>,
-    api: ApiSession,
-    Query(query): Query<ApiV1TaskListQuery>,
-) -> Response {
-    if !api.can(TASKS_VIEW) {
-        return api_error(StatusCode::FORBIDDEN, "permission denied");
-    }
-    let tasks = match state
-        .tasks()
-        .list_tasks_filtered(TaskListFilter {
-            status: query.status,
-            phase: query.phase,
-            app_id: query.app_id,
-            task_kind: query.task_kind,
-            query: query.q,
-        })
-        .await
-    {
-        Ok(tasks) => tasks,
-        Err(err) => return api_error(task_error_status(&err), err.message()),
-    };
-    Json(serde_json::json!({
-        "data": tasks.into_iter().map(|task| serde_json::json!({
-            "id": task.id,
-            "task_kind": task.task_kind,
-            "title": task.title,
-            "app_name": task.app_name,
-            "status": task.status,
-            "phase": task.phase,
-            "command": task.command,
-            "summary": task.summary,
-            "exit_code": task.exit_code,
-            "created_by": task.created_by,
-            "created_at": task.created_at,
-            "updated_at": task.updated_at
-        })).collect::<Vec<_>>()
-    }))
-    .into_response()
-}
-
-async fn api_v1_task_detail(
-    State(state): State<AppState>,
-    api: ApiSession,
-    Path(task_id): Path<i64>,
-) -> Response {
-    if !api.can(TASKS_VIEW) {
-        return api_error(StatusCode::FORBIDDEN, "permission denied");
-    }
-    let task = match state.tasks().task_detail(task_id).await {
-        Ok(task) => task,
-        Err(err) => return api_error(task_error_status(&err), err.message()),
-    };
-    let logs = match state.tasks().task_logs(task_id).await {
-        Ok(logs) => logs,
-        Err(err) => return api_error(task_error_status(&err), err.message()),
-    };
-    let steps = match state.tasks().task_steps(task_id).await {
-        Ok(steps) => steps,
-        Err(err) => return api_error(task_error_status(&err), err.message()),
-    };
-    let node_results = match state.tasks().task_node_results(task_id).await {
-        Ok(results) => results,
-        Err(err) => return api_error(task_error_status(&err), err.message()),
-    };
-    Json(serde_json::json!({
-        "data": {
-            "task": {
-                "id": task.id,
-                "app_id": task.app_id,
-                "node_id": task.node_id,
-                "task_kind": task.task_kind,
-                "title": task.title,
-                "app_name": task.app_name,
-                "node_name": task.node_name,
-                "status": task.status,
-                "phase": task.phase,
-                "command": task.command,
-                "summary": task.summary,
-                "exit_code": task.exit_code,
-                "created_by": task.created_by,
-                "started_at": task.started_at,
-                "finished_at": task.finished_at,
-                "created_at": task.created_at,
-                "updated_at": task.updated_at
-            },
-            "steps": steps.into_iter().map(|step| serde_json::json!({
-                "id": step.id,
-                "task_id": step.task_id,
-                "node_id": step.node_id,
-                "node_name": step.node_name,
-                "step_no": step.step_no,
-                "step_key": step.step_key,
-                "title": step.title,
-                "command": step.command,
-                "status": step.status,
-                "exit_code": step.exit_code,
-                "started_at": step.started_at,
-                "finished_at": step.finished_at,
-                "created_at": step.created_at,
-                "updated_at": step.updated_at
-            })).collect::<Vec<_>>(),
-            "logs": logs.into_iter().map(|log| serde_json::json!({
-                "id": log.id,
-                "step_id": log.step_id,
-                "stream": log.stream,
-                "content": log.content,
-                "created_at": log.created_at
-            })).collect::<Vec<_>>(),
-            "node_results": node_results.into_iter().map(|result| serde_json::json!({
-                "id": result.id,
-                "node_id": result.node_id,
-                "node_name": result.node_name,
-                "node_key": result.node_key,
-                "node_type": result.node_type,
-                "status": result.status,
-                "message": result.message,
-                "command_count": result.command_count,
-                "started_at": result.started_at,
-                "finished_at": result.finished_at
-            })).collect::<Vec<_>>()
+            "queued": result.queued,
+            "task_id": serde_json::Value::Null
         }
     }))
     .into_response()
@@ -5499,6 +4826,255 @@ fn node_check_result_node_status_tone(status: &str) -> &'static str {
     }
 }
 
+fn node_check_result_node_status_label_clean(status: &str) -> &'static str {
+    if status == "passed" {
+        node_status_label_clean("online")
+    } else {
+        node_status_label_clean("offline")
+    }
+}
+
+fn node_status_label_clean(status: &str) -> &'static str {
+    match status {
+        "online" => "在线",
+        "offline" => "离线",
+        "disabled" => "已禁用",
+        _ => "未探测",
+    }
+}
+
+fn node_page_row_clean<'a>(
+    node: &'a crate::nodes::NodeListItem,
+    can_manage: bool,
+) -> NodePageRow<'a> {
+    NodePageRow {
+        id: node.id,
+        name: &node.name,
+        node_key: &node.node_key,
+        node_type: node_type_label_clean(&node.node_type),
+        address: &node.address,
+        ssh: if node.node_type == "ssh" {
+            format!("{}:{}", node.ssh_user, node.ssh_port)
+        } else {
+            "本地执行".to_owned()
+        },
+        ssh_port: node.ssh_port,
+        ssh_user: &node.ssh_user,
+        credential_id: node.credential_id.unwrap_or_default(),
+        credential_name: node_credential_display_name_clean(node),
+        credential_fingerprint: node_credential_fingerprint(node),
+        work_dir: &node.work_dir,
+        region: if node.region.is_empty() {
+            "未分区"
+        } else {
+            &node.region
+        },
+        region_value: &node.region,
+        labels: if node.labels.is_empty() {
+            "未设置"
+        } else {
+            &node.labels
+        },
+        labels_value: &node.labels,
+        status: node_status_label_clean(&node.status),
+        status_tone: node_status_tone(&node.status),
+        docker_status: &node.docker_status,
+        capability: node_capability_text_clean(node),
+        os_info: node_probe_detail_text_clean(node.last_os_info.as_deref(), "OS 未探测"),
+        disk_info: node_disk_detail_text_clean(node.last_disk_info.as_deref(), "磁盘未探测"),
+        systemd_version: node_probe_detail_text_clean(
+            node.last_systemd_version.as_deref(),
+            "systemd 未探测",
+        ),
+        proxy_version: node_proxy_version_text_clean(node),
+        last_check_at: node.last_check_at.as_deref().unwrap_or("尚未探测"),
+        last_message: node.last_message.as_deref().unwrap_or("等待节点探测"),
+        can_manage,
+        is_ssh: node.node_type == "ssh",
+        can_check: node.status != "disabled",
+        toggle_status: node_status_toggle_value(&node.status),
+        toggle_label: node_status_toggle_label_clean(&node.status),
+    }
+}
+
+fn node_check_history_row_clean(check: &crate::nodes::NodeCheckHistoryItem) -> NodeCheckHistoryRow {
+    NodeCheckHistoryRow {
+        id: check.id,
+        status: node_check_status_label_clean(&check.check_status),
+        status_tone: node_check_status_tone(&check.check_status),
+        message: display_text_clean(check.message.clone(), "未记录"),
+        docker_version: display_text_clean(check.docker_version.clone(), "未记录"),
+        compose_version: display_text_clean(check.compose_version.clone(), "未记录"),
+        os_info: node_probe_detail_text_clean(Some(&check.os_info), "OS 未探测"),
+        disk_info: node_disk_detail_text_clean(Some(&check.disk_info), "磁盘未探测"),
+        systemd_version: node_probe_detail_text_clean(
+            Some(&check.systemd_version),
+            "systemd 未探测",
+        ),
+        checked_at: check.checked_at.clone(),
+    }
+}
+
+fn node_app_runtime_row_clean(app: &crate::nodes::NodeAppRuntimeItem) -> NodeAppRuntimeRow {
+    NodeAppRuntimeRow {
+        app_id: app.app_id,
+        app_name: app.app_name.clone(),
+        app_key: app.app_key.clone(),
+        app_type: app_type_label(&app.app_type),
+        app_status: app_enabled_status_label(&app.app_status),
+        app_status_tone: app_enabled_status_tone(&app.app_status),
+        runtime_status: runtime_status_label(&app.runtime_status),
+        runtime_status_tone: runtime_status_tone(&app.runtime_status),
+        active_version: display_text_clean(app.active_version.clone(), "未部署"),
+        service_count: app.service_count,
+        message: display_text_clean(app.message.clone(), "暂无运行信息"),
+        last_deploy_at: app
+            .last_deploy_at
+            .clone()
+            .unwrap_or_else(|| "未部署".to_owned()),
+        updated_at: app.updated_at.clone(),
+    }
+}
+
+fn node_task_row_clean(task: &crate::nodes::NodeTaskItem) -> NodeTaskRow {
+    NodeTaskRow {
+        id: task.id,
+        title: crate::text::fix_mojibake(&task.title),
+        task_kind: task_kind_label(&task.task_kind),
+        app_name: display_text_clean(task.app_name.clone(), "未关联应用"),
+        status: task_status_label(&task.status),
+        status_tone: task_status_tone(&task.status),
+        phase: task_phase_label(&task.phase),
+        summary: display_text_clean(task.summary.clone(), "暂无摘要"),
+        created_by: task.created_by.clone(),
+        created_at: task.created_at.clone(),
+        updated_at: task.updated_at.clone(),
+    }
+}
+
+fn node_type_label_clean(node_type: &str) -> &'static str {
+    match node_type {
+        "local" => "本机",
+        "ssh" => "SSH",
+        _ => "未知类型",
+    }
+}
+
+fn node_status_toggle_label_clean(status: &str) -> &'static str {
+    if status == "disabled" {
+        "启用"
+    } else {
+        "禁用"
+    }
+}
+
+fn node_credential_display_name_clean(node: &crate::nodes::NodeListItem) -> String {
+    if node.node_type != "ssh" {
+        return "本地执行".to_owned();
+    }
+    node.credential_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(crate::text::fix_mojibake)
+        .unwrap_or_else(|| "系统 SSH 配置".to_owned())
+}
+
+fn node_capability_text_clean(node: &crate::nodes::NodeListItem) -> String {
+    let executor = if node.node_type == "local" {
+        "本地执行"
+    } else {
+        "SSH 执行"
+    };
+    let docker = node
+        .last_docker_version
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(crate::text::fix_mojibake)
+        .unwrap_or_else(|| crate::text::fix_mojibake(node.docker_status.as_str()));
+    let compose = node
+        .last_compose_version
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(crate::text::fix_mojibake)
+        .unwrap_or_else(|| "Compose 未探测".to_owned());
+    let proxy = node_proxy_capability_text_clean(node);
+    format!("{executor} / {docker} / {compose} / {proxy}")
+}
+
+fn node_proxy_capability_text_clean(node: &crate::nodes::NodeListItem) -> String {
+    match (node.caddy_available == 1, node.nginx_available == 1) {
+        (true, true) => "Caddy/Nginx 可用".to_owned(),
+        (true, false) => "Caddy 可用".to_owned(),
+        (false, true) => "Nginx 可用".to_owned(),
+        (false, false) => "代理未探测".to_owned(),
+    }
+}
+
+fn node_proxy_version_text_clean(node: &crate::nodes::NodeListItem) -> String {
+    let mut versions = Vec::new();
+    if let Some(caddy) = node
+        .last_caddy_version
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        versions.push(crate::text::fix_mojibake(&format!(
+            "Caddy {}",
+            first_line(caddy)
+        )));
+    }
+    if let Some(nginx) = node
+        .last_nginx_version
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        versions.push(crate::text::fix_mojibake(first_line(nginx)));
+    }
+    if versions.is_empty() {
+        "代理未探测".to_owned()
+    } else {
+        versions.join(" / ")
+    }
+}
+
+fn node_probe_detail_text_clean(value: Option<&str>, fallback: &'static str) -> String {
+    let value = value.unwrap_or("").trim();
+    if value.is_empty() {
+        fallback.to_owned()
+    } else {
+        crate::text::fix_mojibake(value.lines().next().unwrap_or(value).trim())
+    }
+}
+
+fn node_disk_detail_text_clean(value: Option<&str>, fallback: &'static str) -> String {
+    let value = value.unwrap_or("").trim();
+    if value.is_empty() {
+        return fallback.to_owned();
+    }
+    crate::text::fix_mojibake(
+        value
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with("Filesystem"))
+            .unwrap_or(value),
+    )
+}
+
+fn node_check_status_label_clean(status: &str) -> &'static str {
+    match status {
+        "passed" => "通过",
+        "failed" => "失败",
+        _ => "未知",
+    }
+}
+
+fn display_text_clean(value: String, fallback: &'static str) -> String {
+    if value.trim().is_empty() {
+        fallback.to_owned()
+    } else {
+        crate::text::fix_mojibake(&value)
+    }
+}
+
 fn node_check_result_docker_status(result: &crate::nodes::NodeCheckResult) -> &'static str {
     if result.status == "passed" {
         "available"
@@ -5568,24 +5144,6 @@ fn deploy_plan_steps(
             tone: "neutral",
         });
     }
-    if matches!(
-        action,
-        DeployConfirmAction::Binary(BinaryTaskAction::Restart)
-    ) && detail.binary_config.release_strategy == "blue_green"
-    {
-        rows.push(DeployPlanStepRow {
-            label: "Blue/Green 预案",
-            detail: deploy_plan_blue_green_detail(detail),
-            tone: "warning",
-        });
-        if detail.binary_config.proxy_enabled == 1 {
-            rows.push(DeployPlanStepRow {
-                label: "反向代理切流",
-                detail: deploy_plan_proxy_switch_detail(detail),
-                tone: "active",
-            });
-        }
-    }
     rows.push(DeployPlanStepRow {
         label: deploy_plan_execute_label(action),
         detail: deploy_plan_execute_detail(detail, action),
@@ -5614,82 +5172,24 @@ fn deploy_plan_files(
     detail: &crate::apps::AppConfigDetail,
     action: DeployConfirmAction,
 ) -> Vec<DeployPlanFileRow> {
-    match action {
-        DeployConfirmAction::Compose(_) => vec![
-            DeployPlanFileRow {
-                label: "Compose",
-                path: target_work_dir_path(&detail.app.work_dir, "compose.yaml"),
-                detail: "服务编排文件",
-            },
-            DeployPlanFileRow {
-                label: "环境变量",
-                path: target_work_dir_path(&detail.app.work_dir, ".env"),
-                detail: "可为空",
-            },
-            DeployPlanFileRow {
-                label: "应用元数据",
-                path: target_work_dir_path(&detail.app.work_dir, ".easy-deploy/app.yaml"),
-                detail: "记录应用、节点和策略",
-            },
-        ],
-        DeployConfirmAction::Binary(_) => {
-            let unit_name = if detail.binary_config.unit_name.trim().is_empty() {
-                format!("easy-deploy-{}.service", detail.app.app_key)
-            } else {
-                detail.binary_config.unit_name.clone()
-            };
-            let env_file = binary_unit_env_file_name(&unit_name);
-            let release = if detail.binary_config.artifact_version.trim().is_empty() {
-                "未配置版本".to_owned()
-            } else {
-                detail.binary_config.artifact_version.clone()
-            };
-            let mut files = vec![
-                DeployPlanFileRow {
-                    label: "systemd unit",
-                    path: target_work_dir_path(
-                        &detail.app.work_dir,
-                        &format!(".easy-deploy/systemd/{unit_name}"),
-                    ),
-                    detail: "服务定义",
-                },
-                DeployPlanFileRow {
-                    label: "环境变量",
-                    path: target_work_dir_path(
-                        &detail.app.work_dir,
-                        &format!(".easy-deploy/systemd/{env_file}"),
-                    ),
-                    detail: "EnvironmentFile",
-                },
-                DeployPlanFileRow {
-                    label: "发布版本",
-                    path: target_work_dir_path(
-                        &detail.app.work_dir,
-                        &format!("releases/{release}/release.yaml"),
-                    ),
-                    detail: "release 元数据",
-                },
-                DeployPlanFileRow {
-                    label: "当前指针",
-                    path: target_work_dir_path(&detail.app.work_dir, "current"),
-                    detail: "当前 release",
-                },
-                DeployPlanFileRow {
-                    label: "切流预案",
-                    path: target_work_dir_path(&detail.app.work_dir, ".easy-deploy/app.yaml"),
-                    detail: "记录 Blue/Green 槽位和端口",
-                },
-            ];
-            if detail.binary_config.proxy_enabled == 1 {
-                files.push(DeployPlanFileRow {
-                    label: "反向代理",
-                    path: detail.binary_config.proxy_config_path.clone(),
-                    detail: "Caddy/Nginx 切流配置",
-                });
-            }
-            files
-        }
-    }
+    let DeployConfirmAction::Compose(_) = action;
+    vec![
+        DeployPlanFileRow {
+            label: "Compose",
+            path: target_work_dir_path(&detail.app.work_dir, "compose.yaml"),
+            detail: "服务编排文件",
+        },
+        DeployPlanFileRow {
+            label: "环境变量",
+            path: target_work_dir_path(&detail.app.work_dir, ".env"),
+            detail: "可为空",
+        },
+        DeployPlanFileRow {
+            label: "应用元数据",
+            path: target_work_dir_path(&detail.app.work_dir, ".easy-deploy/app.yaml"),
+            detail: "记录应用、节点和策略",
+        },
+    ]
 }
 
 fn deploy_preflight_rows(
@@ -5778,7 +5278,7 @@ fn deploy_preflight_submit_blocker(rows: &[DeployPreflightRow]) -> Option<String
 }
 
 fn deploy_preflight_checks(
-    detail: &crate::apps::AppConfigDetail,
+    _detail: &crate::apps::AppConfigDetail,
     node: &crate::apps::AppTargetSummaryItem,
     action: DeployConfirmAction,
 ) -> Vec<DeployPreflightCheckRow> {
@@ -5805,62 +5305,27 @@ fn deploy_preflight_checks(
         },
     ));
 
-    match action {
-        DeployConfirmAction::Compose(_) => {
-            checks.push(capability_preflight_check(
-                "Docker",
-                node.docker_available == 1,
-                &node.capability_message,
-                "Docker CLI 与 daemon 已通过探测",
-                "Docker 未通过探测，Compose 部署大概率会失败",
-            ));
-            checks.push(capability_preflight_check(
-                "Compose",
-                node.compose_available == 1,
-                &node.capability_message,
-                "Docker Compose 插件已通过探测",
-                "Docker Compose 未通过探测，无法执行 compose 命令",
-            ));
-        }
-        DeployConfirmAction::Binary(_) => {
-            checks.push(capability_preflight_check(
-                "systemd",
-                node.systemd_available == 1,
-                &node.capability_message,
-                "systemd 已通过探测",
-                "systemd 未通过探测，二进制服务无法 restart/stop",
-            ));
-            if matches!(
-                action,
-                DeployConfirmAction::Binary(BinaryTaskAction::Restart)
-            ) && detail.binary_config.proxy_enabled == 1
-            {
-                match detail.binary_config.proxy_kind.as_str() {
-                    "caddy" => checks.push(capability_preflight_check(
-                        "Caddy",
-                        node.caddy_available == 1,
-                        &node.capability_message,
-                        "Caddy 已通过探测，支持反向代理切流",
-                        "已启用 Caddy 切流，但目标节点未通过 Caddy 探测",
-                    )),
-                    "nginx" => checks.push(capability_preflight_check(
-                        "Nginx",
-                        node.nginx_available == 1,
-                        &node.capability_message,
-                        "Nginx 已通过探测，支持反向代理切流",
-                        "已启用 Nginx 切流，但目标节点未通过 Nginx 探测",
-                    )),
-                    _ => {}
-                }
-            }
-        }
-    }
+    let DeployConfirmAction::Compose(_) = action;
+    checks.push(capability_preflight_check(
+        "Docker",
+        node.docker_available == 1,
+        &node.capability_message,
+        "Docker CLI 与 daemon 已通过探测",
+        "Docker 未通过探测，Compose 部署大概率会失败",
+    ));
+    checks.push(capability_preflight_check(
+        "Compose",
+        node.compose_available == 1,
+        &node.capability_message,
+        "Docker Compose 插件已通过探测",
+        "Docker Compose 未通过探测，无法执行 compose 命令",
+    ));
 
     checks
 }
 
 fn deploy_preflight_actions(
-    detail: &crate::apps::AppConfigDetail,
+    _detail: &crate::apps::AppConfigDetail,
     node: &crate::apps::AppTargetSummaryItem,
     action: DeployConfirmAction,
 ) -> Vec<DeployPreflightActionRow> {
@@ -5872,44 +5337,12 @@ fn deploy_preflight_actions(
             component: "",
         });
     }
-    match action {
-        DeployConfirmAction::Compose(_) => {
-            if node.docker_available == 0 {
-                actions.push(deploy_install_action("安装 Docker", "docker"));
-            }
-            if node.compose_available == 0 {
-                actions.push(deploy_install_action("安装 Compose", "compose"));
-            }
-        }
-        DeployConfirmAction::Binary(BinaryTaskAction::Restart) => {
-            if node.systemd_available == 0 {
-                actions.push(DeployPreflightActionRow {
-                    label: "查看 systemd 建议",
-                    action_kind: "detail",
-                    component: "",
-                });
-            }
-            if detail.binary_config.proxy_enabled == 1 {
-                match detail.binary_config.proxy_kind.as_str() {
-                    "caddy" if node.caddy_available == 0 => {
-                        actions.push(deploy_install_action("安装 Caddy", "caddy"));
-                    }
-                    "nginx" if node.nginx_available == 0 => {
-                        actions.push(deploy_install_action("安装 Nginx", "nginx"));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        DeployConfirmAction::Binary(BinaryTaskAction::Stop) => {
-            if node.systemd_available == 0 {
-                actions.push(DeployPreflightActionRow {
-                    label: "查看 systemd 建议",
-                    action_kind: "detail",
-                    component: "",
-                });
-            }
-        }
+    let DeployConfirmAction::Compose(_) = action;
+    if node.docker_available == 0 {
+        actions.push(deploy_install_action("安装 Docker", "docker"));
+    }
+    if node.compose_available == 0 {
+        actions.push(deploy_install_action("安装 Compose", "compose"));
     }
     if actions.is_empty() && node.status == "offline" {
         actions.push(DeployPreflightActionRow {
@@ -5984,66 +5417,18 @@ fn deploy_preflight_summary(rows: &[DeployPreflightRow]) -> (String, &'static st
 }
 
 fn deploy_plan_preflight_detail(action: DeployConfirmAction) -> String {
-    match action {
-        DeployConfirmAction::Compose(_) => {
-            "校验节点在线状态、Docker daemon、docker compose config、部署目录和磁盘空间".to_owned()
-        }
-        DeployConfirmAction::Binary(_) => {
-            "校验节点在线状态、systemd 可用性、部署目录和发布文件".to_owned()
-        }
-    }
+    let DeployConfirmAction::Compose(_) = action;
+    "校验节点在线状态、Docker daemon、docker compose config、部署目录和磁盘空间".to_owned()
 }
 
 fn deploy_plan_sync_detail(
     detail: &crate::apps::AppConfigDetail,
     action: DeployConfirmAction,
 ) -> String {
-    match action {
-        DeployConfirmAction::Compose(_) => {
-            format!(
-                "compose.yaml、.env 与 app.yaml 同步到 {}",
-                detail.app.work_dir
-            )
-        }
-        DeployConfirmAction::Binary(_) => {
-            format!(
-                "releases、current、systemd unit/env 与 app.yaml 同步到 {}",
-                detail.app.work_dir
-            )
-        }
-    }
-}
-
-fn deploy_plan_blue_green_detail(detail: &crate::apps::AppConfigDetail) -> String {
-    let proxy = if detail.binary_config.proxy_enabled == 1 {
-        format!(
-            "健康检查通过后会切换 {} 到备用槽位",
-            binary_proxy_kind_label(&detail.binary_config.proxy_kind)
-        )
-    } else {
-        "未启用反向代理切流".to_owned()
-    };
+    let DeployConfirmAction::Compose(_) = action;
     format!(
-        "当前槽位 {}，备用槽 {}；主槽端口 {}，备用槽端口 {}。本次会启动并检查备用槽 systemd unit，{}",
-        detail.binary_config.active_slot,
-        binary_standby_slot(&detail.binary_config.active_slot),
-        port_plan_text(detail.binary_config.base_port),
-        port_plan_text(detail.binary_config.standby_port),
-        proxy,
-    )
-}
-
-fn deploy_plan_proxy_switch_detail(detail: &crate::apps::AppConfigDetail) -> String {
-    format!(
-        "生成 {} 配置 {} -> 127.0.0.1:{}，validate 成功后 reload；失败则不记录新槽位",
-        binary_proxy_kind_label(&detail.binary_config.proxy_kind),
-        display_text(detail.binary_config.proxy_domain.clone(), "未配置域名"),
-        port_plan_text(
-            match binary_standby_slot(&detail.binary_config.active_slot) {
-                "green" => detail.binary_config.standby_port,
-                _ => detail.binary_config.base_port,
-            }
-        )
+        "compose.yaml、.env 与 app.yaml 同步到 {}",
+        detail.app.work_dir
     )
 }
 
@@ -6051,14 +5436,12 @@ fn deploy_plan_execute_label(action: DeployConfirmAction) -> &'static str {
     match action {
         DeployConfirmAction::Compose(ComposeTaskAction::Up) => "执行部署",
         DeployConfirmAction::Compose(ComposeTaskAction::Down) => "执行停止",
-        DeployConfirmAction::Compose(ComposeTaskAction::Restart)
-        | DeployConfirmAction::Binary(BinaryTaskAction::Restart) => "执行重启",
-        DeployConfirmAction::Binary(BinaryTaskAction::Stop) => "执行停止",
+        DeployConfirmAction::Compose(ComposeTaskAction::Restart) => "执行重启",
     }
 }
 
 fn deploy_plan_execute_detail(
-    detail: &crate::apps::AppConfigDetail,
+    _detail: &crate::apps::AppConfigDetail,
     action: DeployConfirmAction,
 ) -> String {
     match action {
@@ -6071,57 +5454,12 @@ fn deploy_plan_execute_detail(
         DeployConfirmAction::Compose(ComposeTaskAction::Restart) => {
             "运行 docker compose restart".to_owned()
         }
-        DeployConfirmAction::Binary(BinaryTaskAction::Restart) => {
-            let unit_name = if detail.binary_config.release_strategy == "blue_green" {
-                binary_blue_green_unit_name(
-                    &detail.binary_config.unit_name,
-                    binary_standby_slot(&detail.binary_config.active_slot),
-                )
-            } else {
-                detail.binary_config.unit_name.clone()
-            };
-            format!(
-                "{}执行 systemctl link、daemon-reload，然后 restart {}",
-                binary_restart_plan_prefix(&detail.binary_config.release_strategy),
-                display_text(unit_name, "未配置 unit")
-            )
-        }
-        DeployConfirmAction::Binary(BinaryTaskAction::Stop) => format!(
-            "执行 systemctl stop {}",
-            display_text(detail.binary_config.unit_name.clone(), "未配置 unit")
-        ),
-    }
-}
-
-fn binary_restart_plan_prefix(strategy: &str) -> &'static str {
-    if strategy == "blue_green" {
-        "Blue/Green 会使用备用槽 unit"
-    } else {
-        ""
-    }
-}
-
-fn binary_blue_green_unit_name(unit_name: &str, slot: &str) -> String {
-    let stem = unit_name.strip_suffix(".service").unwrap_or(unit_name);
-    format!("{stem}-{slot}.service")
-}
-
-fn port_plan_text(port: i64) -> String {
-    if port > 0 {
-        port.to_string()
-    } else {
-        "未配置".to_owned()
     }
 }
 
 fn deploy_confirm_syncs_files(action: DeployConfirmAction) -> bool {
-    match action {
-        DeployConfirmAction::Compose(ComposeTaskAction::Up)
-        | DeployConfirmAction::Compose(ComposeTaskAction::Restart)
-        | DeployConfirmAction::Compose(ComposeTaskAction::Down) => true,
-        DeployConfirmAction::Binary(BinaryTaskAction::Restart) => true,
-        DeployConfirmAction::Binary(BinaryTaskAction::Stop) => false,
-    }
+    let DeployConfirmAction::Compose(_) = action;
+    true
 }
 
 fn deploy_confirm_runs_health_check(action: DeployConfirmAction) -> bool {
@@ -6129,7 +5467,6 @@ fn deploy_confirm_runs_health_check(action: DeployConfirmAction) -> bool {
         action,
         DeployConfirmAction::Compose(ComposeTaskAction::Up)
             | DeployConfirmAction::Compose(ComposeTaskAction::Restart)
-            | DeployConfirmAction::Binary(BinaryTaskAction::Restart)
     )
 }
 
@@ -6294,66 +5631,17 @@ fn node_capability_guides(node: &crate::nodes::NodeListItem) -> Vec<NodeCapabili
         });
     }
 
-    if node.systemd_available == 0 {
-        guides.push(NodeCapabilityGuideRow {
-            title: "确认 systemd 可用",
-            tone: "neutral",
-            reason: capability_reason(
-                node.last_systemd_version.as_deref(),
-                "二进制直接部署需要 systemd 管理服务；容器、极简系统或权限不足时可能不可用",
-            ),
-            command: format!("{install_prefix}systemctl --version && systemctl status"),
-            verify: "重新探测后 systemd 应显示版本号，而不是探测失败信息",
-            install_component: "",
-            can_install: false,
-        });
-    }
-
-    if node.caddy_available == 0 {
-        guides.push(NodeCapabilityGuideRow {
-            title: "安装 Caddy",
-            tone: "neutral",
-            reason: capability_reason(
-                node.last_caddy_version.as_deref(),
-                "启用 Caddy 反向代理切流时，目标节点需要 caddy 命令与 caddy.service",
-            ),
-            command: format!(
-                "{install_prefix}sudo apt-get update && sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https && curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg && curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt | sudo tee /etc/apt/sources.list.d/caddy-stable.list && sudo apt-get update && sudo apt-get install -y caddy"
-            ),
-            verify: "重新探测后应看到 Caddy 版本，部署确认页不再阻断 Caddy 切流",
-            install_component: "caddy",
-            can_install: true,
-        });
-    }
-
-    if node.nginx_available == 0 {
-        guides.push(NodeCapabilityGuideRow {
-            title: "安装 Nginx",
-            tone: "neutral",
-            reason: capability_reason(
-                node.last_nginx_version.as_deref(),
-                "启用 Nginx 反向代理切流时，目标节点需要 nginx 命令与 nginx.service",
-            ),
-            command: format!(
-                "{install_prefix}sudo apt-get update && sudo apt-get install -y nginx && sudo systemctl enable --now nginx"
-            ),
-            verify: "重新探测后应看到 nginx version，部署确认页不再阻断 Nginx 切流",
-            install_component: "nginx",
-            can_install: true,
-        });
-    }
-
     if guides.is_empty() {
         guides.push(NodeCapabilityGuideRow {
             title: "节点能力已就绪",
             tone: "success",
-            reason: "Docker、Compose、systemd、Caddy 与 Nginx 最近一次探测均可用".to_owned(),
+            reason: "Docker 与 Compose 最近一次探测均可用".to_owned(),
             command: if node.node_type == "ssh" {
                 format!("{install_prefix}docker compose version")
             } else {
                 "docker compose version".to_owned()
             },
-            verify: "可以继续作为 Compose 或二进制部署目标使用",
+            verify: "可以继续作为 Compose 部署目标使用",
             install_component: "",
             can_install: false,
         });
@@ -6447,7 +5735,7 @@ fn credential_status_toggle_label(status: &str) -> &'static str {
 
 fn app_type_label(app_type: &str) -> &'static str {
     match app_type {
-        "binary" => "二进制",
+        "binary" => "历史兼容",
         _ => "Docker Compose",
     }
 }
@@ -6473,25 +5761,10 @@ fn deploy_strategy_label(strategy: &str) -> &'static str {
     }
 }
 
-fn binary_release_strategy_label(strategy: &str) -> &'static str {
-    match strategy {
-        "blue_green" => "Blue/Green",
-        _ => "systemd restart",
-    }
-}
-
-fn binary_proxy_kind_label(kind: &str) -> &'static str {
-    match kind {
-        "caddy" => "Caddy",
-        "nginx" => "Nginx",
-        _ => "未启用",
-    }
-}
-
-fn binary_standby_slot(active_slot: &str) -> &'static str {
-    match active_slot {
-        "green" => "blue",
-        _ => "green",
+fn release_source_label(source: &str) -> &'static str {
+    match source {
+        "manual" => "手动配置发布",
+        _ => "版本包上传",
     }
 }
 
@@ -7135,8 +6408,6 @@ fn deploy_action_label(action: &str) -> &'static str {
         "compose_up" => "部署",
         "compose_down" => "停止",
         "compose_restart" => "重启",
-        "binary_restart" => "重启二进制",
-        "binary_stop" => "停止二进制",
         _ => "操作",
     }
 }
@@ -7150,14 +6421,6 @@ fn parse_compose_confirm_action(action: &str) -> Option<ComposeTaskAction> {
     }
 }
 
-fn parse_binary_confirm_action(action: &str) -> Option<BinaryTaskAction> {
-    match action {
-        "restart" => Some(BinaryTaskAction::Restart),
-        "stop" => Some(BinaryTaskAction::Stop),
-        _ => None,
-    }
-}
-
 fn compose_action_segment(action: ComposeTaskAction) -> &'static str {
     match action {
         ComposeTaskAction::Up => "up",
@@ -7166,27 +6429,12 @@ fn compose_action_segment(action: ComposeTaskAction) -> &'static str {
     }
 }
 
-fn binary_action_segment(action: BinaryTaskAction) -> &'static str {
-    match action {
-        BinaryTaskAction::Restart => "restart",
-        BinaryTaskAction::Stop => "stop",
-    }
-}
-
 fn compose_submit_path(app_id: i64, action: ComposeTaskAction) -> String {
     format!("/apps/{app_id}/compose/{}", compose_action_segment(action))
 }
 
-fn binary_submit_path(app_id: i64, action: BinaryTaskAction) -> String {
-    format!("/apps/{app_id}/binary/{}", binary_action_segment(action))
-}
-
 fn compose_confirm_path(app_id: i64, action: ComposeTaskAction) -> String {
     format!("{}/confirm", compose_submit_path(app_id, action))
-}
-
-fn binary_confirm_path(app_id: i64, action: BinaryTaskAction) -> String {
-    format!("{}/confirm", binary_submit_path(app_id, action))
 }
 
 fn deploy_confirm_action_label(action: DeployConfirmAction) -> &'static str {
@@ -7194,18 +6442,14 @@ fn deploy_confirm_action_label(action: DeployConfirmAction) -> &'static str {
         DeployConfirmAction::Compose(ComposeTaskAction::Up) => "部署",
         DeployConfirmAction::Compose(ComposeTaskAction::Down) => "停止",
         DeployConfirmAction::Compose(ComposeTaskAction::Restart) => "重启",
-        DeployConfirmAction::Binary(BinaryTaskAction::Restart) => "重启二进制",
-        DeployConfirmAction::Binary(BinaryTaskAction::Stop) => "停止二进制",
     }
 }
 
 fn deploy_confirm_action_tone(action: DeployConfirmAction) -> &'static str {
     match action {
         DeployConfirmAction::Compose(ComposeTaskAction::Up)
-        | DeployConfirmAction::Compose(ComposeTaskAction::Restart)
-        | DeployConfirmAction::Binary(BinaryTaskAction::Restart) => "active",
-        DeployConfirmAction::Compose(ComposeTaskAction::Down)
-        | DeployConfirmAction::Binary(BinaryTaskAction::Stop) => "warning",
+        | DeployConfirmAction::Compose(ComposeTaskAction::Restart) => "active",
+        DeployConfirmAction::Compose(ComposeTaskAction::Down) => "warning",
     }
 }
 
@@ -7219,12 +6463,6 @@ fn deploy_confirm_action_description(action: DeployConfirmAction) -> &'static st
         }
         DeployConfirmAction::Compose(ComposeTaskAction::Restart) => {
             "确认目标节点、配置差异和健康检查后，提交 Docker Compose 重启任务"
-        }
-        DeployConfirmAction::Binary(BinaryTaskAction::Restart) => {
-            "确认目标节点、发布版本配置和健康检查后，提交二进制 systemd 重启任务"
-        }
-        DeployConfirmAction::Binary(BinaryTaskAction::Stop) => {
-            "确认目标节点后，提交二进制 systemd 停止任务"
         }
     }
 }
@@ -7346,47 +6584,6 @@ fn config_summary(content: &str) -> String {
         .collect()
 }
 
-fn snapshot_binary_summary(metadata: &str) -> String {
-    let Some(binary) = serde_json::from_str::<JsonValue>(metadata)
-        .ok()
-        .and_then(|value| value.get("binary").cloned())
-        .filter(|value| value.is_object())
-    else {
-        return "无二进制运行配置".to_owned();
-    };
-    let artifact =
-        json_text(&binary, "artifact_version").unwrap_or_else(|| "无发布版本".to_owned());
-    let unit = json_text(&binary, "unit_name").unwrap_or_else(|| "未配置 unit".to_owned());
-    let strategy = json_text(&binary, "release_strategy").unwrap_or_else(|| "restart".to_owned());
-    let active_slot = json_text(&binary, "active_slot").unwrap_or_else(|| "blue".to_owned());
-    let exec_args = json_text(&binary, "exec_args")
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "无启动参数".to_owned());
-    let base_port = json_i64(&binary, "base_port").unwrap_or_default();
-    let standby_port = json_i64(&binary, "standby_port").unwrap_or_default();
-    let proxy = if json_i64(&binary, "proxy_enabled").unwrap_or_default() == 1 {
-        json_text(&binary, "proxy_kind").unwrap_or_else(|| "proxy".to_owned())
-    } else {
-        "无代理切流".to_owned()
-    };
-    format!(
-        "{artifact} · {unit} · {strategy}/{active_slot} · {base_port}->{standby_port} · {proxy} · {exec_args}"
-    )
-}
-
-fn json_text(value: &JsonValue, key: &str) -> Option<String> {
-    value
-        .get(key)
-        .and_then(JsonValue::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn json_i64(value: &JsonValue, key: &str) -> Option<i64> {
-    value.get(key).and_then(JsonValue::as_i64)
-}
-
 fn runtime_status_label(status: &str) -> &'static str {
     match status {
         "healthy" => "健康",
@@ -7500,7 +6697,7 @@ fn service_node_link_row(
 fn service_node_can_retry_task(node: &ServiceTargetNodeItem) -> bool {
     let task_status = node.last_task_status.as_deref().unwrap_or_default();
     let task_kind = node.last_task_kind.as_deref().unwrap_or_default();
-    task_status == "failed" && (is_compose_task_kind(task_kind) || is_binary_task_kind(task_kind))
+    task_status == "failed" && is_compose_task_kind(task_kind)
 }
 
 fn service_task_action_label(node: &ServiceTargetNodeItem) -> &'static str {
@@ -7586,27 +6783,10 @@ fn service_node_message(node: &ServiceTargetNodeItem) -> String {
     }
 }
 
-fn artifact_status_label(status: &str) -> &'static str {
-    match status {
-        "active" => "当前",
-        "registered" => "可用",
-        "disabled" => "已清理",
-        _ => "未知",
-    }
-}
-
-fn artifact_status_tone(status: &str) -> &'static str {
-    match status {
-        "active" => "success",
-        "disabled" => "warning",
-        _ => "neutral",
-    }
-}
-
 fn artifact_kind_label(kind: &str) -> &'static str {
     match kind {
         "tar_gz" => "tar.gz",
-        "binary" => "binary",
+        "binary" => "单文件",
         _ => "unknown",
     }
 }
@@ -7614,16 +6794,66 @@ fn artifact_kind_label(kind: &str) -> &'static str {
 fn artifact_source_label(source: &str) -> &'static str {
     match source {
         "upload" => "上传",
-        "initial" => "登记",
-        _ => "登记",
+        "web" => "页面上传",
+        "initial" => "初始登记",
+        "openapi" => "OpenAPI",
+        _ => "未知",
+    }
+}
+
+fn release_status_label(status: &str) -> &'static str {
+    match status {
+        "received" => "待处理",
+        "queued" => "等待入队",
+        "deploying" => "发布中",
+        "deployed" => "已发布",
+        "failed" => "失败",
+        "rolled_back" => "已回退",
+        "canceled" => "已取消",
+        _ => "未知",
+    }
+}
+
+fn release_status_tone(status: &str) -> &'static str {
+    match status {
+        "deployed" => "success",
+        "queued" | "deploying" => "active",
+        "failed" => "danger",
+        "canceled" | "rolled_back" => "warning",
+        _ => "neutral",
+    }
+}
+
+fn queue_status_label(status: &str) -> &'static str {
+    match status {
+        "scheduled" => "定时等待",
+        "queued" => "等待中",
+        "running" => "执行中",
+        "success" => "已完成",
+        "failed" => "失败",
+        "canceled" => "已取消",
+        _ => "未知",
+    }
+}
+
+fn queue_status_tone(status: &str) -> &'static str {
+    match status {
+        "success" => "success",
+        "scheduled" | "queued" | "running" => "active",
+        "failed" => "danger",
+        "canceled" => "warning",
+        _ => "neutral",
     }
 }
 
 fn normalize_artifact_status_filter(value: Option<&str>) -> &'static str {
     match value.unwrap_or_default() {
-        "active" => "active",
-        "registered" => "registered",
-        "disabled" => "disabled",
+        "received" => "received",
+        "queued" => "queued",
+        "deploying" => "deploying",
+        "deployed" => "deployed",
+        "failed" => "failed",
+        "canceled" => "canceled",
         _ => "",
     }
 }
@@ -7639,48 +6869,41 @@ fn normalize_artifact_kind_filter(value: Option<&str>) -> &'static str {
 fn normalize_artifact_source_filter(value: Option<&str>) -> &'static str {
     match value.unwrap_or_default() {
         "upload" => "upload",
+        "web" => "web",
+        "openapi" => "openapi",
         "initial" => "initial",
         _ => "",
     }
 }
 
-fn artifact_matches_filters(
-    artifact: &crate::apps::ArtifactListItem,
-    selected_status: &str,
-    selected_kind: &str,
-    selected_source: &str,
-    query: &str,
-) -> bool {
-    if !selected_status.is_empty() && artifact.status != selected_status {
-        return false;
+fn format_datetime_shanghai(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
     }
-    if !selected_kind.is_empty() && artifact.artifact_kind != selected_kind {
-        return false;
-    }
-    let artifact_source = artifact.metadata_value("source");
-    if !selected_source.is_empty() && artifact_source != selected_source {
-        return false;
-    }
-    if query.trim().is_empty() {
-        return true;
-    }
-    artifact_search_text(artifact).contains(&query.to_ascii_lowercase())
+    let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) else {
+        return trimmed.to_owned();
+    };
+    let offset = FixedOffset::east_opt(8 * 60 * 60).expect("valid shanghai offset");
+    parsed
+        .with_timezone(&offset)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
 }
 
-fn artifact_search_text(artifact: &crate::apps::ArtifactListItem) -> String {
-    format!(
-        "{} {} {} {} {} {} {} {} {}",
-        artifact.app_name,
-        artifact.app_key,
-        artifact.version,
-        artifact.artifact_path,
-        artifact.artifact_kind,
-        artifact.status,
-        artifact.metadata,
-        artifact.metadata_value("entry_file"),
-        artifact.metadata_value("sha256")
-    )
-    .to_ascii_lowercase()
+fn format_datetime_local_input(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) else {
+        return String::new();
+    };
+    let offset = FixedOffset::east_opt(8 * 60 * 60).expect("valid shanghai offset");
+    parsed
+        .with_timezone(&offset)
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string()
 }
 
 fn short_hash(value: &str) -> String {
@@ -7720,11 +6943,6 @@ fn target_work_dir_path(work_dir: &str, relative_path: &str) -> String {
     } else {
         format!("{work_dir}/{relative_path}")
     }
-}
-
-fn binary_unit_env_file_name(unit_name: &str) -> String {
-    let stem = unit_name.strip_suffix(".service").unwrap_or(unit_name);
-    format!("{stem}.env")
 }
 
 fn count_apps_by_runtime(apps: &[crate::apps::AppListItem], status: &str) -> usize {
@@ -7876,6 +7094,14 @@ fn task_phase_label(phase: &str) -> &'static str {
         "preparing_files" => "准备运行文件",
         "executing" => "执行命令",
         "healthchecking" => "健康检查",
+        "prepare" => "准备发布",
+        "render" => "渲染配置",
+        "pre_deploy" => "发布前脚本",
+        "deploy" => "部署脚本",
+        "post_deploy" => "发布后脚本",
+        "switch_traffic" => "切换流量",
+        "cleanup" => "清理现场",
+        "finalize" => "收尾确认",
         "completed" => "已完成",
         "failed" => "失败收尾",
         "canceled" => "已取消",
@@ -7886,7 +7112,10 @@ fn task_phase_label(phase: &str) -> &'static str {
 fn task_phase_tone(phase: &str) -> &'static str {
     match phase {
         "completed" => "success",
-        "preflight" | "preparing_files" | "executing" | "healthchecking" => "active",
+        "preflight" | "preparing_files" | "executing" | "healthchecking" | "prepare" | "render"
+        | "pre_deploy" | "deploy" | "post_deploy" | "switch_traffic" | "cleanup" | "finalize" => {
+            "active"
+        }
         "failed" | "canceled" => "warning",
         _ => "neutral",
     }
@@ -7899,6 +7128,14 @@ fn task_phase_detail(phase: &str) -> &'static str {
         "preparing_files" => "正在准备 compose、环境变量、systemd unit、版本包或代理配置等运行文件",
         "executing" => "正在目标节点执行部署、停止、重启、安装或切流命令",
         "healthchecking" => "命令已执行完成，正在验证服务是否按预期运行",
+        "prepare" => "正在准备发布上下文、版本包和配置快照",
+        "render" => "正在渲染 Compose、环境变量和部署脚本",
+        "pre_deploy" => "正在执行用户配置的发布前脚本",
+        "deploy" => "正在执行部署脚本或 Docker Compose 命令",
+        "post_deploy" => "正在执行发布后脚本",
+        "switch_traffic" => "正在执行切流脚本",
+        "cleanup" => "正在执行清理脚本",
+        "finalize" => "正在完成发布收尾和状态写回",
         "completed" => "任务已经完成，节点结果和部署记录已写回",
         "failed" => "任务失败并完成收尾，请查看日志和节点结果定位原因",
         "canceled" => "任务在开始执行前已取消，不会再进入后台执行",
@@ -8180,14 +7417,6 @@ fn message_mentions_component_issue(message: &str, components: &[&str]) -> bool 
         .any(|marker| message.contains(marker))
 }
 
-fn normalize_app_type_filter(value: Option<&str>) -> &'static str {
-    match value.unwrap_or_default() {
-        "compose" => "compose",
-        "binary" => "binary",
-        _ => "",
-    }
-}
-
 fn normalize_app_environment_filter(value: Option<&str>) -> &'static str {
     match value.unwrap_or_default() {
         "production" => "production",
@@ -8205,67 +7434,6 @@ fn normalize_app_runtime_status_filter(value: Option<&str>) -> &'static str {
         "unknown" | "ready" | "draft" => "unknown",
         "disabled" => "disabled",
         _ => "",
-    }
-}
-
-struct ApiRuntimeOverview {
-    status: &'static str,
-    summary: String,
-}
-
-fn api_runtime_overview(
-    states: &[crate::apps::AppRuntimeStateItem],
-    app_enabled: bool,
-) -> ApiRuntimeOverview {
-    if !app_enabled {
-        return ApiRuntimeOverview {
-            status: "disabled",
-            summary: "应用已停用".to_owned(),
-        };
-    }
-    if states.is_empty() {
-        return ApiRuntimeOverview {
-            status: "unknown",
-            summary: "暂无节点运行记录".to_owned(),
-        };
-    }
-
-    let healthy = states
-        .iter()
-        .filter(|state| state.runtime_status == "healthy")
-        .count();
-    let unhealthy = states
-        .iter()
-        .filter(|state| state.runtime_status == "unhealthy")
-        .count();
-    let deploying = states
-        .iter()
-        .filter(|state| state.runtime_status == "deploying")
-        .count();
-    let stopped = states
-        .iter()
-        .filter(|state| state.runtime_status == "stopped")
-        .count();
-    let unknown = states
-        .len()
-        .saturating_sub(healthy + unhealthy + deploying + stopped);
-    let status = if deploying > 0 {
-        "deploying"
-    } else if unhealthy > 0 {
-        "unhealthy"
-    } else if healthy > 0 && healthy == states.len() {
-        "healthy"
-    } else if stopped > 0 && stopped == states.len() {
-        "stopped"
-    } else {
-        "unknown"
-    };
-
-    ApiRuntimeOverview {
-        status,
-        summary: format!(
-            "{healthy} 健康，{unhealthy} 异常，{deploying} 部署中，{stopped} 已停止，{unknown} 未知"
-        ),
     }
 }
 
@@ -8368,14 +7536,6 @@ fn node_search_text(node: &crate::nodes::NodeListItem) -> String {
     .to_ascii_lowercase()
 }
 
-fn normalize_service_kind_filter(value: Option<&str>) -> &'static str {
-    match value.unwrap_or_default() {
-        "compose" => "compose",
-        "binary" => "binary",
-        _ => "",
-    }
-}
-
 fn normalize_service_status_filter(value: Option<&str>) -> &'static str {
     match value.unwrap_or_default() {
         "healthy" => "healthy",
@@ -8472,7 +7632,12 @@ fn task_phase_filter_rows(selected_phase: &str) -> Vec<TaskFilterOptionRow> {
         "preflight",
         "preparing_files",
         "executing",
+        "pre_deploy",
+        "deploy",
+        "post_deploy",
         "healthchecking",
+        "switch_traffic",
+        "cleanup",
         "completed",
         "failed",
         "canceled",
@@ -8492,8 +7657,6 @@ fn task_kind_label(task_kind: &str) -> &'static str {
         "compose.up" => "Compose 部署",
         "compose.down" => "Compose 停止",
         "compose.restart" => "Compose 重启",
-        "binary.restart" => "二进制重启",
-        "binary.stop" => "二进制停止",
         "node.install.docker" => "安装 Docker",
         "node.install.compose" => "安装 Compose",
         "node.install.caddy" => "安装 Caddy",
@@ -8508,7 +7671,12 @@ fn task_phase_step_rows(current_phase: &str) -> Vec<TaskPhaseStepRow> {
         ("preflight", "部署前预检"),
         ("preparing_files", "准备运行文件"),
         ("executing", "执行命令"),
+        ("pre_deploy", "发布前脚本"),
+        ("deploy", "部署脚本"),
+        ("post_deploy", "发布后脚本"),
         ("healthchecking", "健康检查"),
+        ("switch_traffic", "切换流量"),
+        ("cleanup", "清理现场"),
         ("completed", "已完成"),
         ("failed", "失败收尾"),
         ("canceled", "已取消"),
@@ -8557,8 +7725,6 @@ fn task_kind_filter_rows(selected_task_kind: &str) -> Vec<TaskFilterOptionRow> {
         ("compose.up", "Compose 部署"),
         ("compose.down", "Compose 停止"),
         ("compose.restart", "Compose 重启"),
-        ("binary.restart", "二进制重启"),
-        ("binary.stop", "二进制停止"),
         ("node.install.docker", "安装 Docker"),
         ("node.install.compose", "安装 Compose"),
         ("node.install.caddy", "安装 Caddy"),
@@ -8575,18 +7741,11 @@ fn task_kind_filter_rows(selected_task_kind: &str) -> Vec<TaskFilterOptionRow> {
 }
 
 fn is_retryable_task_kind(task_kind: &str) -> bool {
-    matches!(
-        task_kind,
-        "compose.up" | "compose.down" | "compose.restart" | "binary.restart" | "binary.stop"
-    )
+    is_compose_task_kind(task_kind)
 }
 
 fn is_compose_task_kind(task_kind: &str) -> bool {
     matches!(task_kind, "compose.up" | "compose.down" | "compose.restart")
-}
-
-fn is_binary_task_kind(task_kind: &str) -> bool {
-    matches!(task_kind, "binary.restart" | "binary.stop")
 }
 
 fn is_node_install_task_kind(task_kind: &str) -> bool {
@@ -8628,257 +7787,27 @@ fn openapi_spec() -> serde_json::Value {
     serde_json::json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "Easy Deploy OpenAPI",
+            "title": "Easy Deploy Package Upload API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "OpenAPI for developers, CI scripts and AI agents. Recommended AI flow: get service by service_key, create when 404, update config, upload package or deploy compose, then poll task detail and inspect failed steps."
+            "description": "Easy Deploy 对外只暴露版本包投递能力。应用创建、部署配置、目标节点、发布策略、立即/定时发布都在后台页面维护，外部业务项目或 AI 只负责把规范命名的版本包上传到对应服务。"
         },
         "servers": [
             { "url": "http://127.0.0.1:9066", "description": "local default endpoint" }
         ],
         "security": [{ "BearerAuth": [] }],
         "paths": {
-            "/api/v1/nodes": {
-                "get": {
-                    "operationId": "listNodes",
-                    "description": "读取可用于 target_node_keys 的节点列表。AI 创建应用前可先读取节点 key。",
-                    "responses": { "200": { "description": "nodes" } }
-                }
-            },
-            "/api/v1/apps": {
-                "get": {
-                    "operationId": "listApps",
-                    "description": "列出应用。AI 更推荐用 /api/v1/services/{service_key}/app 精确读取。",
-                    "responses": { "200": { "description": "apps" } }
-                },
-                "post": {
-                    "operationId": "createApp",
-                    "description": "创建应用和初始部署配置。service_key 对应请求体 app_key；二进制应用可先不上传版本包。",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": { "$ref": "#/components/schemas/CreateAppRequest" }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "created",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/CreateAppResponse" }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/api/v1/apps/{app_id}": {
-                "get": {
-                    "operationId": "getApp",
-                    "parameters": [
-                        { "name": "app_id", "in": "path", "required": true, "schema": { "type": "integer" } }
-                    ],
-                    "responses": { "200": { "description": "app detail" } }
-                }
-            },
-            "/api/v1/apps/{app_id}/config": {
-                "put": {
-                    "operationId": "updateAppConfig",
-                    "parameters": [
-                        { "name": "app_id", "in": "path", "required": true, "schema": { "type": "integer" } }
-                    ],
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": { "$ref": "#/components/schemas/UpdateAppConfigRequest" }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "updated",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/UpdateAppConfigResponse" }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/api/v1/apps/{app_id}/enable": {
-                "post": {
-                    "operationId": "enableApp",
-                    "responses": {
-                        "200": {
-                            "description": "enabled",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/AppEnableResponse" }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/api/v1/apps/{app_id}/disable": {
-                "post": {
-                    "operationId": "disableApp",
-                    "responses": {
-                        "200": {
-                            "description": "disabled",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/AppEnableResponse" }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/api/v1/apps/{app_id}/deploy": {
-                "post": {
-                    "operationId": "deployApp",
-                    "description": "按应用 ID 创建部署任务。AI 更推荐使用 /api/v1/services/{service_key}/deploy。",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": { "$ref": "#/components/schemas/DeployAppRequest" }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "task created",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/DeployTaskResponse" }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/api/v1/services/{service_key}/app": {
-                "get": {
-                    "operationId": "getServiceApp",
-                    "description": "按服务标识读取应用详情。AI 应先调用此接口；404 时再创建应用。",
-                    "parameters": [
-                        { "name": "service_key", "in": "path", "required": true, "schema": { "type": "string" } }
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "service app",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/ServiceAppResponse" }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/api/v1/services/{service_key}/config": {
-                "put": {
-                    "operationId": "updateServiceConfig",
-                    "description": "按 service_key 更新部署配置，包括 compose、env、二进制启动参数、健康检查、Blue/Green 配置。",
-                    "parameters": [
-                        { "name": "service_key", "in": "path", "required": true, "schema": { "type": "string" } }
-                    ],
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": { "$ref": "#/components/schemas/UpdateAppConfigRequest" }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "updated",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/UpdateAppConfigResponse" }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/api/v1/services/{service_key}/enable": {
-                "post": {
-                    "operationId": "enableService",
-                    "description": "启用服务管理状态。不会自动部署。",
-                    "parameters": [
-                        { "name": "service_key", "in": "path", "required": true, "schema": { "type": "string" } }
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "enabled",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/AppEnableResponse" }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/api/v1/services/{service_key}/disable": {
-                "post": {
-                    "operationId": "disableService",
-                    "description": "禁用服务管理状态。不会自动卸载远端服务。",
-                    "parameters": [
-                        { "name": "service_key", "in": "path", "required": true, "schema": { "type": "string" } }
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "disabled",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/AppEnableResponse" }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/api/v1/services/{service_key}/deploy": {
-                "post": {
-                    "operationId": "deployService",
-                    "description": "按 service_key 创建部署任务。Compose 使用 up/down/restart；二进制使用 binary_restart/binary_stop。",
-                    "parameters": [
-                        { "name": "service_key", "in": "path", "required": true, "schema": { "type": "string" } }
-                    ],
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": { "$ref": "#/components/schemas/DeployAppRequest" }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "task created",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/DeployTaskResponse" }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
             "/api/v1/services/{service_key}/packages": {
                 "post": {
                     "operationId": "uploadServicePackage",
-                    "description": "上传二进制版本包。包名必须符合 {service_key}_version_{x_y_z}.tar.gz；auto_deploy=true 会上传后立即创建 binary_restart 任务。",
+                    "description": "向已在后台配置好的服务投递版本包。包名必须符合 {service_key}_version_{x_y_z}.tar.gz 或等价版本格式；平台接收后记录 release，并按应用的发布设置决定立即入队、定时发布或等待手动发布。",
                     "parameters": [
-                        { "name": "service_key", "in": "path", "required": true, "schema": { "type": "string" } }
+                        {
+                            "name": "service_key",
+                            "in": "path",
+                            "required": true,
+                            "description": "后台应用的服务标识，必须和版本包文件名前缀一致。",
+                            "schema": { "type": "string" }
+                        }
                     ],
                     "requestBody": {
                         "required": true,
@@ -8898,39 +7827,16 @@ fn openapi_spec() -> serde_json::Value {
                             }
                         },
                         "400": {
-                            "description": "package error",
+                            "description": "package validation error",
                             "content": {
                                 "application/json": {
                                     "schema": { "$ref": "#/components/schemas/PackageError" }
                                 }
                             }
-                        }
-                    }
-                }
-            },
-            "/api/v1/tasks": {
-                "get": {
-                    "operationId": "listTasks",
-                    "description": "列出任务。支持 status、phase、app_id、task_kind、q 查询参数。",
-                    "responses": { "200": { "description": "tasks" } }
-                }
-            },
-            "/api/v1/tasks/{task_id}": {
-                "get": {
-                    "operationId": "getTask",
-                    "description": "读取任务详情。部署任务会返回 steps，logs 中的 step_id 可用于把终端输出归属到具体部署步骤。",
-                    "parameters": [
-                        { "name": "task_id", "in": "path", "required": true, "schema": { "type": "integer" } }
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "task detail",
-                            "content": {
-                                "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/TaskDetailResponse" }
-                                }
-                            }
-                        }
+                        },
+                        "401": { "description": "missing or invalid token" },
+                        "403": { "description": "token has no artifact upload permission" },
+                        "404": { "description": "service_key does not match an existing app" }
                     }
                 }
             }
@@ -8943,174 +7849,16 @@ fn openapi_spec() -> serde_json::Value {
                 }
             },
             "schemas": {
-                "CreateAppRequest": {
-                    "type": "object",
-                    "required": ["app_key", "name"],
-                    "description": "创建应用。app_key 就是 service_key，后续推荐使用 /api/v1/services/{service_key}/... 操作。",
-                    "properties": {
-                        "app_key": { "type": "string", "description": "服务唯一标识，例如 orders-api-test。创建后不要随意变更。" },
-                        "name": { "type": "string", "description": "后台展示名称。" },
-                        "description": { "type": "string" },
-                        "environment": {
-                            "type": "string",
-                            "enum": ["production", "test"],
-                            "default": "test",
-                            "description": "应用环境。production=正式环境，test=测试环境。"
-                        },
-                        "app_type": { "type": "string", "enum": ["compose", "binary"], "default": "compose", "description": "compose 服务不需要版本包；binary 服务通过版本包 + systemd 部署。" },
-                        "deploy_strategy": {
-                            "type": "string",
-                            "enum": ["rolling_stop_on_failure", "rolling_continue"],
-                            "default": "rolling_stop_on_failure"
-                        },
-                        "work_dir": { "type": "string", "description": "部署目录。为空时使用平台默认目录模板。" },
-                        "target_node_keys": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "目标节点标识，例：local、prod-1。推荐 AI 和脚本优先使用"
-                        },
-                        "target_node_ids": {
-                            "type": "array",
-                            "items": { "type": "integer" },
-                            "description": "兼容字段。AI 优先使用 target_node_keys。"
-                        },
-                        "compose_content": { "type": "string", "description": "Docker Compose YAML 内容。compose 应用可直接部署。" },
-                        "env_content": { "type": "string", "description": ".env 内容，平台保存环境变量。" },
-                        "binary_artifact_version": { "type": "string", "description": "当前二进制版本。首次创建通常留空，上传版本包后由平台更新。" },
-                        "binary_artifact_path": { "type": "string", "description": "当前二进制入口文件路径。首次创建通常留空。" },
-                        "binary_exec_args": { "type": "string", "description": "二进制启动参数。" },
-                        "binary_service_user": { "type": "string", "description": "systemd User。" },
-                        "binary_unit_name": { "type": "string", "description": "systemd unit 名称，例如 orders-api-test.service。" },
-                        "binary_release_strategy": { "type": "string", "enum": ["standard", "blue_green"], "default": "standard" },
-                        "binary_active_slot": { "type": "string", "enum": ["blue", "green"] },
-                        "binary_base_port": { "type": "integer" },
-                        "binary_standby_port": { "type": "integer" },
-                        "binary_proxy_enabled": { "type": "boolean" },
-                        "binary_proxy_kind": { "type": "string", "enum": ["caddy", "nginx"] },
-                        "binary_proxy_domain": { "type": "string" },
-                        "binary_proxy_config_path": { "type": "string" }
-                    }
-                },
-                "CreateAppResponse": {
-                    "type": "object",
-                    "properties": {
-                        "data": {
-                            "type": "object",
-                                "properties": {
-                                "id": { "type": "integer" },
-                                "app_key": { "type": "string" },
-                                "environment": {
-                                    "type": "string",
-                                    "enum": ["production", "test"]
-                                }
-                            }
-                        }
-                    }
-                },
-                "AppEnableResponse": {
-                    "type": "object",
-                    "properties": {
-                        "data": {
-                            "type": "object",
-                            "properties": {
-                                "app_id": { "type": "integer" },
-                                "enabled": { "type": "boolean" },
-                                "management_status": {
-                                    "type": "string",
-                                    "enum": ["enabled", "disabled"]
-                                }
-                            }
-                        }
-                    }
-                },
-                "ServiceAppResponse": {
-                    "type": "object",
-                    "properties": {
-                        "data": {
-                            "type": "object",
-                            "properties": {
-                                "service_key": { "type": "string" },
-                                "package_upload_url": { "type": "string" },
-                                "deploy_url": { "type": "string" },
-                                "latest_config_revision": { "type": ["string", "null"] },
-                                "current_release_version": { "type": ["string", "null"] },
-                                "app": {
-                                    "type": "object",
-                                    "properties": {
-                                        "environment": {
-                                            "type": "string",
-                                            "enum": ["production", "test"]
-                                        },
-                                        "management_status": {
-                                            "type": "string",
-                                            "enum": ["enabled", "disabled"]
-                                        },
-                                        "runtime_status": {
-                                            "type": "string",
-                                            "enum": ["unknown", "healthy", "unhealthy", "deploying", "stopped", "disabled"]
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-                "UpdateAppConfigRequest": {
-                    "type": "object",
-                    "description": "更新部署配置。只传需要更新的配置；空字符串会按后端配置规则保存。",
-                    "properties": {
-                        "compose_content": { "type": "string", "description": "Docker Compose YAML。" },
-                        "env_content": { "type": "string", "description": ".env 内容。" },
-                        "binary_artifact_version": { "type": "string", "description": "当前二进制版本，通常由版本包上传接口维护。" },
-                        "binary_artifact_path": { "type": "string", "description": "当前二进制入口文件路径，通常由版本包上传接口维护。" },
-                        "binary_exec_args": { "type": "string", "description": "二进制启动参数。" },
-                        "binary_service_user": { "type": "string" },
-                        "binary_unit_name": { "type": "string" },
-                        "binary_release_strategy": { "type": "string", "enum": ["standard", "blue_green"] },
-                        "binary_active_slot": { "type": "string", "enum": ["blue", "green"] },
-                        "binary_base_port": { "type": "integer" },
-                        "binary_standby_port": { "type": "integer" },
-                        "binary_proxy_enabled": { "type": "boolean" },
-                        "binary_proxy_kind": { "type": "string", "enum": ["caddy", "nginx"] },
-                        "binary_proxy_domain": { "type": "string" },
-                        "binary_proxy_config_path": { "type": "string" },
-                        "health_check_kind": {
-                            "type": "string",
-                            "enum": ["none", "compose_running", "systemd_active", "http", "tcp"],
-                            "default": "none"
-                        },
-                        "health_endpoint": { "type": "string" },
-                        "health_timeout_secs": { "type": "integer", "default": 5 },
-                        "health_expected_status": { "type": "integer", "default": 200 }
-                    }
-                },
-                "UpdateAppConfigResponse": {
-                    "type": "object",
-                    "properties": {
-                        "data": {
-                            "type": "object",
-                            "properties": {
-                                "app_id": { "type": "integer" },
-                                "service_key": { "type": "string" },
-                                "config_revision": { "type": ["string", "null"] },
-                                "package_upload_url": { "type": "string" },
-                                "deploy_url": { "type": "string" }
-                            }
-                        }
-                    }
-                },
                 "UploadServicePackageRequest": {
                     "type": "object",
                     "required": ["package_file"],
-                    "description": "multipart/form-data。包名必须符合 {service_key}_version_{x_y_z}.tar.gz。",
                     "properties": {
                         "package_file": { "type": "string", "format": "binary", "description": "版本包文件。兼容字段名 file、artifact_file。" },
-                        "entry_file": { "type": "string", "description": "包内二进制入口文件名，例如 orders-api。" },
-                        "release_version": { "type": "string", "description": "可选。兼容 artifact_version；如果传入，必须和文件名解析版本一致。" },
-                        "versionCode": { "type": "integer", "description": "可选。兼容 version_code；越大越新。" },
-                        "publishedAt": { "type": "string", "description": "可选。兼容 published_at；ISO 8601 发布时间。" },
-                        "source": { "type": "string", "description": "来源标记，例如 local-build、ci、ai-agent。" },
-                        "auto_deploy": { "type": "boolean", "default": false, "description": "true 时上传后立即创建 binary_restart 任务。" }
+                        "release_version": { "type": "string", "description": "可选。显式版本号；如果填写，必须与包名解析出的版本一致。兼容字段名 artifact_version。" },
+                        "version_code": { "type": "integer", "description": "可选。版本排序号；不填时平台从包名版本解析。兼容字段名 versionCode。" },
+                        "published_at": { "type": "string", "description": "可选。业务项目构建或发布时间，ISO-8601 格式。兼容字段名 publishedAt。" },
+                        "entry_file": { "type": "string", "description": "可选。保留给旧版本包结构的入口文件提示。Compose 发布主线通常不需要。" },
+                        "source": { "type": "string", "description": "可选。来源标记，例如 ci、local-script、ai-agent。" }
                     }
                 },
                 "UploadServicePackageResponse": {
@@ -9121,13 +7869,20 @@ fn openapi_spec() -> serde_json::Value {
                             "properties": {
                                 "app_id": { "type": "integer" },
                                 "service_key": { "type": "string" },
+                                "release_id": { "type": "integer" },
+                                "queue_id": { "type": ["integer", "null"], "description": "自动入队时返回队列 ID；未入队时为空。" },
                                 "release_version": { "type": "string" },
+                                "version_code": { "type": "integer" },
                                 "versionCode": { "type": "integer" },
+                                "published_at": { "type": "string" },
                                 "publishedAt": { "type": "string" },
                                 "package_path": { "type": "string" },
-                                "package_kind": { "type": "string", "enum": ["binary", "tar_gz", "archive"] },
-                                "auto_deploy": { "type": "boolean" },
-                                "task_id": { "type": ["integer", "null"] }
+                                "package_kind": { "type": "string" },
+                                "config_snapshot_id": { "type": "integer" },
+                                "config_revision_no": { "type": "integer" },
+                                "config_revision": { "type": "string" },
+                                "queued": { "type": "boolean" },
+                                "task_id": { "type": ["integer", "null"], "description": "上传接口只负责投递版本包，不直接执行部署任务。" }
                             }
                         }
                     }
@@ -9135,1809 +7890,174 @@ fn openapi_spec() -> serde_json::Value {
                 "PackageError": {
                     "type": "object",
                     "properties": {
-                        "code": {
-                            "type": "string",
-                            "enum": [
-                                "INVALID_PACKAGE_VERSION_NAME",
-                                "PACKAGE_SERVICE_KEY_MISMATCH",
-                                "PACKAGE_VERSION_CONFLICT"
-                            ]
-                        },
+                        "code": { "type": "string" },
                         "error": { "type": "string" },
                         "expected_pattern": { "type": "string" },
                         "example": { "type": "string" }
-                    }
-                },
-                "DeployAppRequest": {
-                    "type": "object",
-                    "required": ["action"],
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["up", "down", "restart", "binary_restart", "binary_stop"]
-                        }
-                    }
-                },
-                "DeployTaskResponse": {
-                    "type": "object",
-                    "properties": {
-                        "data": {
-                            "type": "object",
-                            "properties": {
-                                "app_id": { "type": "integer" },
-                                "task_id": { "type": "integer" }
-                            }
-                        }
-                    }
-                },
-                "TaskDetailResponse": {
-                    "type": "object",
-                    "properties": {
-                        "data": {
-                            "type": "object",
-                            "properties": {
-                                "task": { "type": "object" },
-                                "steps": {
-                                    "type": "array",
-                                    "description": "结构化部署步骤。按 step_no 顺序展示，每个步骤保留命令、状态、退出码和时间。",
-                                    "items": { "$ref": "#/components/schemas/TaskStep" }
-                                },
-                                "logs": {
-                                    "type": "array",
-                                    "description": "任务日志。step_id 为空代表全局日志，不为空代表归属到对应步骤。",
-                                    "items": { "$ref": "#/components/schemas/TaskLog" }
-                                },
-                                "node_results": {
-                                    "type": "array",
-                                    "items": { "type": "object" }
-                                }
-                            }
-                        }
-                    }
-                },
-                "TaskStep": {
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "integer" },
-                        "task_id": { "type": "integer" },
-                        "node_id": { "type": ["integer", "null"] },
-                        "node_name": { "type": ["string", "null"] },
-                        "step_no": { "type": "integer" },
-                        "step_key": { "type": "string" },
-                        "title": { "type": "string" },
-                        "command": { "type": "string" },
-                        "status": {
-                            "type": "string",
-                            "enum": ["pending", "running", "success", "failed", "skipped"]
-                        },
-                        "exit_code": { "type": ["integer", "null"] },
-                        "started_at": { "type": ["string", "null"] },
-                        "finished_at": { "type": ["string", "null"] },
-                        "created_at": { "type": "string" },
-                        "updated_at": { "type": "string" }
-                    }
-                },
-                "TaskLog": {
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "integer" },
-                        "step_id": { "type": ["integer", "null"] },
-                        "stream": { "type": "string", "enum": ["system", "stdout", "stderr", "combined"] },
-                        "content": { "type": "string" },
-                        "created_at": { "type": "string" }
                     }
                 }
             }
         }
     })
 }
-
-#[allow(dead_code)]
-fn openapi_docs_html() -> String {
+fn openapi_docs_public_html() -> String {
     r###"<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Easy Deploy OpenAPI 接入文档</title>
-  <style>
-    :root {
-      --ed-bg: #f5f7fb;
-      --ed-panel: #ffffff;
-      --ed-border: #eef0f3;
-      --ed-text: #172033;
-      --ed-muted: #64748b;
-      --ed-strong: #334155;
-      --ed-accent: #3154d4;
-      --ed-accent-soft: #eef4ff;
-      --ed-danger: #d92d20;
-      --ed-danger-soft: #fff6f4;
-      --ed-code: #111827;
-      --ed-radius: 8px;
-      --ed-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
-    }
-
-    * { box-sizing: border-box; }
-    html { scroll-behavior: smooth; }
-    body {
-      margin: 0;
-      background: var(--ed-bg);
-      color: var(--ed-text);
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      line-height: 1.68;
-    }
-
-    a { color: var(--ed-accent); text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    h1, h2, h3 { margin: 0; line-height: 1.25; color: #0f172a; }
-    h1 { font-size: 20px; letter-spacing: 0; }
-    h2 { font-size: 20px; }
-    h3 { font-size: 15px; }
-    p, ul, ol { margin-top: 0; }
-    li { margin: 5px 0; }
-    code, pre {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-      font-size: 13px;
-    }
-    code {
-      padding: 2px 6px;
-      border-radius: 5px;
-      background: #eef2f7;
-      color: #1e293b;
-    }
-    pre {
-      margin: 12px 0 0;
-      padding: 14px 16px;
-      overflow: auto;
-      border-radius: var(--ed-radius);
-      background: var(--ed-code);
-      color: #e5e7eb;
-      line-height: 1.6;
-    }
-    pre code {
-      padding: 0;
-      border-radius: 0;
-      background: transparent;
-      color: inherit;
-      font-size: inherit;
-    }
-
-    .openapi-docs-page {
-      width: 100%;
-      min-height: 100vh;
-      padding: 24px;
-    }
-    .openapi-docs-embed {
-      width: min(1440px, 100%);
-      margin: 0 auto;
-    }
-    .panel-card {
-      margin-bottom: 0;
-      border-radius: 10px;
-      border: 1px solid #eef0f3;
-      background: #ffffff;
-      box-shadow: var(--ed-shadow);
-    }
-    .panel-card__head {
-      min-height: 56px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 14px 20px;
-      border-bottom: 1px solid #eef0f3;
-    }
-    .panel-card__body {
-      padding: 16px 24px 20px;
-    }
-    .openapi-docs-embed__shell {
-      overflow: hidden;
-    }
-    .openapi-docs-embed__heading {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-    .openapi-docs-embed__tag {
-      display: inline-flex;
-      align-items: center;
-      min-height: 24px;
-      padding: 2px 8px;
-      border: 1px solid #dbeafe;
-      border-radius: 5px;
-      background: #eff6ff;
-      color: #1d4ed8;
-      font-size: 12px;
-      font-weight: 700;
-    }
-    .openapi-docs-embed__summary {
-      max-width: 920px;
-      margin: 0;
-      color: var(--ed-muted);
-      font-size: 14px;
-    }
-    .openapi-docs-embed__actions {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: flex-end;
-      gap: 8px;
-      flex: none;
-    }
-    .openapi-docs-embed__button {
-      min-height: 34px;
-      display: inline-flex;
-      align-items: center;
-      padding: 6px 12px;
-      border: 1px solid #dbe2ea;
-      border-radius: 6px;
-      background: #ffffff;
-      color: #334155;
-      font-size: 13px;
-      font-weight: 650;
-      text-decoration: none;
-    }
-    .openapi-docs-embed__button:hover {
-      border-color: #b8c2d2;
-      background: #f8fafc;
-      text-decoration: none;
-    }
-    .openapi-docs-embed__button--primary {
-      border-color: var(--ed-accent);
-      background: var(--ed-accent);
-      color: #ffffff;
-    }
-    .openapi-docs-embed__button--primary:hover {
-      background: #2444bd;
-      color: #ffffff;
-    }
-    .openapi-docs-embed__layout {
-      display: grid;
-      grid-template-columns: 300px minmax(0, 1fr);
-      gap: 16px;
-      min-height: min(760px, calc(100vh - 210px));
-    }
-    .openapi-docs-embed__nav,
-    .openapi-docs-embed__content {
-      min-height: 0;
-      border: 1px solid var(--ed-border);
-      border-radius: var(--ed-radius);
-      background: #ffffff;
-    }
-    .openapi-docs-embed__nav {
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-    }
-    .openapi-docs-embed__navHead {
-      flex: none;
-      padding: 12px 14px;
-      border-bottom: 1px solid var(--ed-border);
-      color: var(--ed-strong);
-      font-weight: 700;
-    }
-    .openapi-docs-embed__tree {
-      flex: 1 1 auto;
-      min-height: 0;
-      margin: 0;
-      padding: 10px 8px 12px;
-      overflow: auto;
-      list-style: none;
-    }
-    .openapi-docs-embed__tree ul {
-      margin: 4px 0 8px 0;
-      padding-left: 12px;
-      list-style: none;
-    }
-    .openapi-docs-embed__tree li { margin: 0; }
-    .openapi-docs-embed__treeSection {
-      display: block;
-      padding: 8px 8px 5px;
-      color: var(--ed-strong);
-      cursor: default;
-      font-size: 13px;
-      font-weight: 800;
-    }
-    .openapi-docs-embed__tree a {
-      display: block;
-      padding: 7px 8px;
-      border-radius: 6px;
-      color: #475569;
-      font-size: 13px;
-      text-decoration: none;
-    }
-    .openapi-docs-embed__tree a:hover {
-      background: #f1f5f9;
-      color: #0f172a;
-    }
-    .openapi-docs-embed__content {
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-    }
-    .openapi-docs-embed__description {
-      flex: none;
-      margin: 0;
-      padding: 12px 16px;
-      border-bottom: 1px solid var(--ed-border);
-      color: #475569;
-      font-size: 14px;
-    }
-    .openapi-docs-embed__article {
-      flex: 1 1 auto;
-      min-height: 0;
-      padding: 18px;
-      overflow: auto;
-      background: #ffffff;
-    }
-    .openapi-docs-embed__section {
-      padding: 18px 0;
-      border-top: 1px solid var(--ed-border);
-      scroll-margin-top: 18px;
-    }
-    .openapi-docs-embed__section:first-child {
-      padding-top: 0;
-      border-top: 0;
-    }
-    .openapi-docs-embed__section > p:last-child,
-    .openapi-docs-embed__section > ul:last-child,
-    .openapi-docs-embed__section > ol:last-child {
-      margin-bottom: 0;
-    }
-    .openapi-docs-embed__callout {
-      margin-top: 12px;
-      padding: 14px 16px;
-      border: 1px solid #dbeafe;
-      border-left: 4px solid var(--ed-accent);
-      border-radius: var(--ed-radius);
-      background: var(--ed-accent-soft);
-    }
-    .openapi-docs-embed__callout--danger {
-      border-color: #fee4df;
-      border-left-color: var(--ed-danger);
-      background: var(--ed-danger-soft);
-    }
-    .openapi-docs-embed__grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 12px;
-      margin-top: 12px;
-    }
-    .openapi-docs-embed__metric {
-      min-height: 86px;
-      padding: 14px;
-      border: 1px solid var(--ed-border);
-      border-radius: var(--ed-radius);
-      background: #ffffff;
-    }
-    .openapi-docs-embed__metric strong {
-      display: block;
-      margin-bottom: 4px;
-      color: #0f172a;
-    }
-    .openapi-docs-embed__metric span {
-      color: var(--ed-muted);
-      font-size: 13px;
-    }
-    .endpoint {
-      display: grid;
-      grid-template-columns: 96px minmax(0, 1fr);
-      gap: 10px 12px;
-      align-items: start;
-      padding: 13px 0;
-      border-top: 1px solid var(--ed-border);
-    }
-    .endpoint:first-of-type { border-top: 0; }
-    .method {
-      width: max-content;
-      min-width: 70px;
-      display: inline-flex;
-      justify-content: center;
-      padding: 3px 8px;
-      border: 1px solid #c7d2fe;
-      border-radius: 5px;
-      background: #eef2ff;
-      color: var(--ed-accent);
-      font-size: 12px;
-      font-weight: 800;
-    }
-    .endpoint p {
-      grid-column: 2;
-      margin: -4px 0 0;
-      color: var(--ed-muted);
-      font-size: 14px;
-    }
-    .doc-table-wrap {
-      margin-top: 12px;
-      overflow: auto;
-      border: 1px solid var(--ed-border);
-      border-radius: var(--ed-radius);
-    }
-    table {
-      width: 100%;
-      min-width: 760px;
-      border-collapse: collapse;
-      font-size: 14px;
-    }
-    th, td {
-      padding: 10px 12px;
-      border-bottom: 1px solid var(--ed-border);
-      text-align: left;
-      vertical-align: top;
-    }
-    tr:last-child td { border-bottom: 0; }
-    th {
-      background: #f8fafc;
-      color: #475569;
-      font-weight: 700;
-    }
-
-    @media (max-width: 992px) {
-      .openapi-docs-page { padding: 12px; }
-      .panel-card__head { flex-direction: column; align-items: flex-start; }
-      .openapi-docs-embed__actions { justify-content: flex-start; }
-      .openapi-docs-embed__layout {
-        grid-template-columns: 1fr;
-        min-height: auto;
-      }
-      .openapi-docs-embed__nav { max-height: 320px; }
-      .openapi-docs-embed__article { max-height: none; }
-      .endpoint { grid-template-columns: 1fr; }
-      .endpoint p { grid-column: 1; margin-top: 0; }
-    }
-  </style>
-</head>
-<body>
-  <div class="openapi-docs-page">
-    <section class="openapi-docs-embed">
-      <div class="panel-card openapi-docs-embed__shell">
-        <header class="panel-card__head">
-          <div>
-            <div class="openapi-docs-embed__heading">
-              <h1>Easy Deploy OpenAPI 接入文档</h1>
-              <span class="openapi-docs-embed__tag">接口文档</span>
-            </div>
-            <p class="openapi-docs-embed__summary">面向开发者、CI 脚本和其他项目中的 AI。AI 读取本文后，应能完成：识别服务、创建应用、写入部署配置、上传版本包、触发部署、轮询任务和定位失败步骤。</p>
-          </div>
-          <div class="openapi-docs-embed__actions">
-            <a class="openapi-docs-embed__button" href="/docs/openapi">刷新</a>
-            <a class="openapi-docs-embed__button" href="/openapi.json" target="_blank" rel="noreferrer">OpenAPI JSON</a>
-            <a class="openapi-docs-embed__button openapi-docs-embed__button--primary" href="/openapi.json" download="easy-deploy-openapi.json">下载 JSON</a>
-          </div>
-        </header>
-        <div class="panel-card__body">
-          <div class="openapi-docs-embed__layout">
-          <aside class="openapi-docs-embed__nav" aria-label="接口文档目录">
-            <div class="openapi-docs-embed__navHead">目录</div>
-            <ul class="openapi-docs-embed__tree">
-              <li>
-                <span class="openapi-docs-embed__treeSection">快速接入</span>
-                <ul>
-                  <li><a href="#rules">AI 执行总规则</a></li>
-                  <li><a href="#auth">认证</a></li>
-                  <li><a href="#fields">字段约定</a></li>
-                  <li><a href="#package-name">版本包命名规范</a></li>
-                </ul>
-              </li>
-              <li>
-                <span class="openapi-docs-embed__treeSection">推荐流程</span>
-                <ul>
-                  <li><a href="#binary-flow">推荐流程：二进制服务</a></li>
-                  <li><a href="#compose-flow">推荐流程：Compose 服务</a></li>
-                  <li><a href="#decision-tree">给其他项目 AI 的最小决策树</a></li>
-                </ul>
-              </li>
-              <li>
-                <span class="openapi-docs-embed__treeSection">接口与示例</span>
-                <ul>
-                  <li><a href="#endpoints">接口清单</a></li>
-                  <li><a href="#create-app">创建二进制应用示例</a></li>
-                  <li><a href="#update-config">更新配置示例</a></li>
-                  <li><a href="#upload-package">上传版本包并自动部署</a></li>
-                  <li><a href="#deploy">手动触发部署</a></li>
-                  <li><a href="#task-logs">轮询任务和读取步骤日志</a></li>
-                  <li><a href="#errors">错误处理</a></li>
-                </ul>
-              </li>
-            </ul>
-          </aside>
-
-          <main class="openapi-docs-embed__content">
-            <p class="openapi-docs-embed__description">这份文档无需登录即可访问。后台 API Token 页面负责创建调用凭证，业务项目或 AI 只需要保存平台地址、Token、服务标识和版本包路径。</p>
-            <article class="openapi-docs-embed__article">
-              <section id="rules" class="openapi-docs-embed__section">
-                <h2>AI 执行总规则</h2>
-                <div class="openapi-docs-embed__callout">
-                  <ol>
-                    <li>优先使用 <code>service_key</code> 作为服务唯一标识，不要依赖应用 ID。推荐格式：<code>项目名-环境</code>，例如 <code>orders-api-test</code>。</li>
-                    <li>先调用 <code>GET /api/v1/services/{service_key}/app</code>。返回 200 表示已存在；返回 404 才创建应用。</li>
-                    <li>配置属于平台，不要把生产环境变量写死在业务仓库。业务项目只上传版本包，平台保存环境变量、启动参数、目标节点、健康检查等配置。</li>
-                    <li>二进制服务首次创建后，先 <code>PUT /api/v1/services/{service_key}/config</code> 写入运行参数，再上传版本包。</li>
-                    <li>上传版本包后，如需一键部署，使用 <code>auto_deploy=true</code>；否则再调用 <code>POST /api/v1/services/{service_key}/deploy</code>。</li>
-                    <li>部署接口返回 <code>task_id</code> 后，轮询 <code>GET /api/v1/tasks/{task_id}</code>。当任务状态为 <code>success</code>、<code>failed</code> 或 <code>canceled</code> 时停止。</li>
-                  </ol>
-                </div>
-                <div class="openapi-docs-embed__grid">
-                  <div class="openapi-docs-embed__metric"><strong>应用配置归平台管理</strong><span>环境变量、启动参数、目标节点和健康检查都由 easy-deploy 保存并记录配置版本。</span></div>
-                  <div class="openapi-docs-embed__metric"><strong>版本包归业务项目产出</strong><span>业务项目本地构建后上传规范命名的包，平台负责登记版本与部署。</span></div>
-                  <div class="openapi-docs-embed__metric"><strong>部署结果归任务追踪</strong><span>任务详情返回步骤与日志，失败时优先展示 failed step 和关联输出。</span></div>
-                </div>
-              </section>
-
-              <section id="auth" class="openapi-docs-embed__section">
-                <h2>认证</h2>
-                <p>除文档和健康检查外，v1 接口都需要 API Token。</p>
-                <pre><code>Authorization: Bearer $EASY_DEPLOY_TOKEN</code></pre>
-                <p>Token 在后台「API Token」页面创建。创建时填写来源，例如 <code>orders-api-ci</code> 或 <code>ai-agent-local</code>，方便后续追责。</p>
-              </section>
-
-              <section id="fields" class="openapi-docs-embed__section">
-                <h2>字段约定</h2>
-                <div class="doc-table-wrap">
-                  <table>
-                    <thead><tr><th>字段</th><th>说明</th></tr></thead>
-                    <tbody>
-                      <tr><td><code>service_key</code></td><td>服务唯一标识。创建后不要随意变更。接口路径中的 <code>{service_key}</code> 就是它。</td></tr>
-                      <tr><td><code>environment</code></td><td>固定枚举：<code>production</code> 正式环境，<code>test</code> 测试环境。默认建议用 <code>test</code>。</td></tr>
-                      <tr><td><code>app_type</code></td><td><code>compose</code> 表示 Docker Compose 服务，可不上传版本包直接部署；<code>binary</code> 表示二进制包 + systemd 部署。</td></tr>
-                      <tr><td><code>target_node_keys</code></td><td>目标节点标识数组。未传时默认 <code>[&quot;local&quot;]</code>。AI 应优先使用节点 key，而不是节点 ID。</td></tr>
-                      <tr><td><code>deploy_strategy</code></td><td><code>rolling_stop_on_failure</code> 或 <code>rolling_continue</code>。多节点推荐默认 <code>rolling_stop_on_failure</code>。</td></tr>
-                      <tr><td><code>health_check_kind</code></td><td><code>none</code>、<code>compose_running</code>、<code>systemd_active</code>、<code>http</code>、<code>tcp</code>。二进制服务常用 <code>systemd_active</code> 或 <code>http</code>。</td></tr>
-                      <tr><td><code>versionCode</code></td><td>版本排序数字，越大越新。未传时平台会优先从规范包名解析。</td></tr>
-                      <tr><td><code>publishedAt</code></td><td>发布时间，建议 ISO 8601，例如 <code>2026-06-15T10:30:00Z</code>。</td></tr>
-                    </tbody>
-                  </table>
-                </div>
-              </section>
-
-              <section id="package-name" class="openapi-docs-embed__section">
-                <h2>版本包命名规范</h2>
-                <p>二进制版本包必须按服务名和版本命名，否则平台会返回明确错误。</p>
-                <pre><code>{service_key}_version_{x_y_z}.tar.gz
-orders-api-prod_version_1_2_3.tar.gz</code></pre>
-                <p>平台会解析出 <code>release_version=1.2.3</code> 和可排序的 <code>versionCode</code>。如果请求里传了 <code>release_version</code>，必须和文件名解析结果一致。</p>
-                <p>常见错误码：<code>INVALID_PACKAGE_VERSION_NAME</code>、<code>PACKAGE_SERVICE_KEY_MISMATCH</code>、<code>PACKAGE_VERSION_CONFLICT</code>。</p>
-              </section>
-
-              <section id="binary-flow" class="openapi-docs-embed__section">
-                <h2>推荐流程：二进制服务</h2>
-                <ol>
-                  <li>生成服务标识，例如 <code>orders-api-test</code>。</li>
-                  <li>读取服务：<code>GET /api/v1/services/orders-api-test/app</code>。</li>
-                  <li>如果 404，创建应用：<code>POST /api/v1/apps</code>，<code>app_type</code> 填 <code>binary</code>。</li>
-                  <li>写入或更新配置：<code>PUT /api/v1/services/orders-api-test/config</code>。</li>
-                  <li>业务项目本地构建 tar.gz，按规范命名。</li>
-                  <li>上传版本包：<code>POST /api/v1/services/orders-api-test/packages</code>。</li>
-                  <li>如果上传时没有 <code>auto_deploy=true</code>，再调用部署：<code>POST /api/v1/services/orders-api-test/deploy</code>。</li>
-                  <li>轮询任务详情，读取 <code>steps</code> 和 <code>logs</code>。失败时把失败步骤和关联日志展示给用户。</li>
-                </ol>
-              </section>
-
-              <section id="compose-flow" class="openapi-docs-embed__section">
-                <h2>推荐流程：Compose 服务</h2>
-                <ol>
-                  <li>适合 Redis、Postgres、Nginx 或只有 compose 配置的服务。</li>
-                  <li>创建应用时 <code>app_type=compose</code>，写入 <code>compose_content</code> 和 <code>env_content</code>。</li>
-                  <li>Compose 服务不需要版本包。配置确认后直接调用 <code>deploy</code>，action 使用 <code>up</code> 或 <code>restart</code>。</li>
-                  <li>如果只是停止服务，action 使用 <code>down</code>。</li>
-                </ol>
-              </section>
-
-              <section id="endpoints" class="openapi-docs-embed__section">
-                <h2>接口清单</h2>
-                <div class="endpoint"><span class="method">GET</span><code>/api/v1/nodes</code><p>读取节点，AI 可用它确认 <code>target_node_keys</code>。</p></div>
-                <div class="endpoint"><span class="method">GET</span><code>/api/v1/services/{service_key}/app</code><p>按服务标识读取应用详情。不存在返回 404。</p></div>
-                <div class="endpoint"><span class="method">POST</span><code>/api/v1/apps</code><p>创建应用和初始部署配置。</p></div>
-                <div class="endpoint"><span class="method">PUT</span><code>/api/v1/services/{service_key}/config</code><p>更新 Compose、环境变量、二进制启动参数、健康检查、Blue/Green 配置。</p></div>
-                <div class="endpoint"><span class="method">POST</span><code>/api/v1/services/{service_key}/packages</code><p>上传二进制版本包。支持字段别名：<code>package_file</code>/<code>file</code>/<code>artifact_file</code>，<code>release_version</code>/<code>artifact_version</code>，<code>versionCode</code>/<code>version_code</code>，<code>publishedAt</code>/<code>published_at</code>。</p></div>
-                <div class="endpoint"><span class="method">POST</span><code>/api/v1/services/{service_key}/deploy</code><p>创建部署任务。Compose action：<code>up</code>、<code>down</code>、<code>restart</code>。二进制 action：<code>binary_restart</code>、<code>binary_stop</code>。</p></div>
-                <div class="endpoint"><span class="method">GET</span><code>/api/v1/tasks/{task_id}</code><p>读取任务状态、步骤和日志。<code>logs.step_id</code> 对应 <code>steps.id</code>。</p></div>
-              </section>
-
-              <section id="create-app" class="openapi-docs-embed__section">
-                <h2>创建二进制应用示例</h2>
-                <pre><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/apps" \
-  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"app_key":"orders-api-test","name":"订单 API 测试","environment":"test","app_type":"binary","target_node_keys":["qfy-sc-test"],"deploy_strategy":"rolling_stop_on_failure","binary_exec_args":"--config /etc/orders-api/config.toml","binary_service_user":"root","binary_unit_name":"orders-api-test.service","health_check_kind":"http","health_endpoint":"http://127.0.0.1:8080/health","health_timeout_secs":5,"health_expected_status":200}'</code></pre>
-              </section>
-
-              <section id="update-config" class="openapi-docs-embed__section">
-                <h2>更新配置示例</h2>
-                <pre><code>curl -X PUT "$EASY_DEPLOY_URL/api/v1/services/orders-api-test/config" \
-  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"env_content":"RUST_LOG=info\nDATABASE_URL=sqlite:///data/orders.db\n","binary_exec_args":"--port 8080","health_check_kind":"http","health_endpoint":"http://127.0.0.1:8080/health"}'</code></pre>
-                <p>注意：更新配置会记录配置版本。不同版本包可以复用同一份配置，也可以在上传新版本包前先更新配置。</p>
-              </section>
-
-              <section id="upload-package" class="openapi-docs-embed__section">
-                <h2>上传版本包并自动部署</h2>
-                <pre><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/services/orders-api-test/packages" \
-  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
-  -F "package_file=@./dist/orders-api-test_version_1_2_3.tar.gz" \
-  -F "entry_file=orders-api" \
-  -F "source=local-build" \
-  -F "auto_deploy=true"</code></pre>
-                <p>成功响应会包含 <code>task_id</code>。如果 <code>auto_deploy=false</code> 或不传，则只上传版本包，不创建部署任务。</p>
-              </section>
-
-              <section id="deploy" class="openapi-docs-embed__section">
-                <h2>手动触发部署</h2>
-                <pre><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/services/orders-api-test/deploy" \
-  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"action":"binary_restart"}'</code></pre>
-              </section>
-
-              <section id="task-logs" class="openapi-docs-embed__section">
-                <h2>轮询任务和读取步骤日志</h2>
-                <pre><code>curl -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
-  "$EASY_DEPLOY_URL/api/v1/tasks/123"</code></pre>
-                <p>AI 判断规则：</p>
-                <ul>
-                  <li><code>data.task.status=queued/running</code>：继续等待，建议 2 秒后重试。</li>
-                  <li><code>success</code>：部署完成。</li>
-                  <li><code>failed</code>：读取 <code>steps</code> 中 status 为 <code>failed</code> 的步骤，再用 <code>logs.step_id</code> 过滤相关日志，给用户展示失败命令和输出。</li>
-                </ul>
-                <pre><code>{"data":{"task":{"id":123,"status":"failed","summary":"远程 systemctl daemon-reload 失败"},"steps":[{"id":9,"step_no":3,"title":"准备 orders-node-1 的二进制运行文件","status":"failed","command":"sync runtime files && systemctl link && daemon-reload","exit_code":1}],"logs":[{"id":41,"step_id":9,"stream":"system","content":"systemctl daemon-reload · 退出码 1"},{"id":42,"step_id":9,"stream":"combined","content":"Failed to reload daemon"}]}}</code></pre>
-              </section>
-
-              <section id="errors" class="openapi-docs-embed__section">
-                <h2>错误处理</h2>
-                <div class="openapi-docs-embed__callout openapi-docs-embed__callout--danger">
-                  <ul>
-                    <li>401/403：Token 无效或权限不足。请让用户在后台创建或调整 API Token。</li>
-                    <li>404：服务不存在。AI 可以在确认 service_key 正确后创建应用。</li>
-                    <li>400 且 code 为 <code>INVALID_PACKAGE_VERSION_NAME</code>：版本包命名不符合规范，重新打包命名。</li>
-                    <li>400 且 code 为 <code>PACKAGE_SERVICE_KEY_MISMATCH</code>：包名里的 service_key 和接口路径不一致。</li>
-                    <li>400 且 code 为 <code>PACKAGE_VERSION_CONFLICT</code>：请求传入版本和包名解析版本不一致。</li>
-                  </ul>
-                </div>
-              </section>
-
-              <section id="decision-tree" class="openapi-docs-embed__section">
-                <h2>给其他项目 AI 的最小决策树</h2>
-                <pre><code>1. 读取环境变量 EASY_DEPLOY_URL 和 EASY_DEPLOY_TOKEN
-2. 确定 service_key
-3. GET /api/v1/services/{service_key}/app
-4. 若 404，POST /api/v1/apps 创建
-5. PUT /api/v1/services/{service_key}/config 写入或更新运行配置
-6. 若 app_type=compose，POST /deploy action=up 或 restart
-7. 若 app_type=binary，上传 {service_key}_version_x_y_z.tar.gz
-8. 拿到 task_id 后轮询 /api/v1/tasks/{task_id}
-9. 失败时输出 failed step + logs</code></pre>
-              </section>
-            </article>
-          </main>
-        </div>
-        </div>
-      </div>
-    </section>
-  </div>
-</body>
-</html>"###
-        .to_owned()
-}
-
-fn openapi_docs_public_html() -> String {
-    r###"<!doctype html>
-<html class="light" lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Easy Deploy OpenAPI 接入文档</title>
+  <title>Easy Deploy 版本包投递接口</title>
   <style>
     :root {
       color-scheme: light;
+      --bg: #f5f7fb;
       --panel: #ffffff;
-      --border: rgba(199, 196, 215, 0.28);
-      --text: #0d1c2e;
-      --muted: #54647a;
-      --muted-strong: #464554;
-      --primary: #2a14b4;
-      --success: #0f766e;
-      --success-soft: rgba(15, 118, 110, 0.12);
-      --warning: #a16207;
-      --warning-soft: rgba(161, 98, 7, 0.12);
-      --danger: #ba1a1a;
-      --danger-soft: rgba(186, 26, 26, 0.11);
-      --inverse-surface: #233144;
-      --inverse-text: #eaf1ff;
-      --sidebar-surface: rgba(246, 248, 252, 0.96);
-      --sidebar-surface-strong: rgba(255, 255, 255, 0.78);
-      --sidebar-input-surface: #ffffff;
-      --sidebar-border: rgba(224, 230, 239, 0.96);
-      --sidebar-text: #445468;
-      --sidebar-muted: #6b778c;
-      --sidebar-accent: #2f55c7;
+      --text: #182230;
+      --muted: #667085;
+      --line: #d9e0ec;
+      --brand: #1f6feb;
+      --brand-soft: #e8f1ff;
+      --code-bg: #101828;
+      --code-text: #e6edf6;
     }
-
     * { box-sizing: border-box; }
-
-    html,
     body {
       margin: 0;
-      height: 100%;
-      min-height: 100%;
-      overflow: hidden;
-      scroll-behavior: smooth;
-    }
-
-    body {
-      background:
-        radial-gradient(circle at top left, rgba(208, 225, 251, 0.42), transparent 24%),
-        linear-gradient(180deg, rgba(255, 255, 255, 0.96) 0%, #f8f9ff 18%, #f8f9ff 100%);
+      background: var(--bg);
       color: var(--text);
-      font-family:
-        "Segoe UI",
-        "PingFang SC",
-        "Hiragino Sans GB",
-        "Microsoft YaHei",
-        "Noto Sans CJK SC",
-        sans-serif;
-      line-height: 1.72;
-      -webkit-font-smoothing: antialiased;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.7;
     }
-
-    a {
-      color: inherit;
-      text-decoration: none;
-    }
-
-    input { font: inherit; }
-
-    code,
-    pre {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-    }
-
-    .layout-root {
-      display: flex;
-      flex-direction: column;
-      width: 100%;
-      height: 100%;
-    }
-
-    .site-header {
-      position: sticky;
-      top: 0;
-      z-index: 40;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      min-height: 64px;
-      padding: 12px 16px;
-      border-bottom: 1px solid rgba(224, 230, 239, 0.92);
-      background: rgba(255, 255, 255, 0.88);
-      backdrop-filter: blur(20px);
-    }
-
-    .site-header__brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      min-width: 0;
-    }
-
-    .site-header__logo {
-      width: 40px;
-      height: 40px;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      border-radius: 18px;
-      background: var(--primary);
-      color: #ffffff;
-      font-size: 14px;
-      font-weight: 800;
-      letter-spacing: 0.18em;
-      flex: none;
-    }
-
-    .site-header__eyebrow {
-      margin: 0 0 2px;
-      color: rgba(84, 100, 122, 0.72);
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.16em;
-      text-transform: uppercase;
-    }
-
-    .site-header__title {
-      margin: 0;
-      color: var(--text);
-      font-size: 16px;
-      font-weight: 650;
-      line-height: 1.35;
-    }
-
-    .workspace {
-      display: flex;
-      min-height: 0;
-      flex: 1 1 auto;
-      width: 100%;
-    }
-
-    .portal-sidebar {
-      width: 288px;
-      min-width: 288px;
-      height: 100%;
-      min-height: 0;
-      flex: none;
-      border-right: 1px solid var(--sidebar-border);
-      background: var(--sidebar-surface);
-    }
-
-    .portal-sidebar__inner {
-      display: flex;
-      flex-direction: column;
-      gap: 20px;
-      height: 100%;
-      min-height: 0;
-      overflow-y: auto;
-      padding: 24px 16px;
-    }
-
-    .doc-meta {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }
-
-    .doc-badge {
-      display: inline-flex;
-      align-items: center;
-      min-height: 30px;
-      padding: 0 12px;
-      border-radius: 999px;
-      background: rgba(255, 255, 255, 0.86);
-      color: var(--muted-strong);
-      font-size: 12px;
-      font-weight: 700;
-      outline: 1px solid rgba(219, 226, 237, 0.82);
-    }
-
-    .doc-badge--accent {
-      background: rgba(231, 238, 255, 0.9);
-      color: var(--sidebar-accent);
-      outline-color: rgba(47, 85, 199, 0.12);
-    }
-
-    .doc-ref {
-      display: inline-flex;
-      align-items: center;
-      width: max-content;
-      max-width: 100%;
-      min-height: 34px;
-      padding: 0 14px;
+    .page { max-width: 1120px; margin: 0 auto; padding: 32px 20px 56px; }
+    .hero {
+      padding: 28px 30px;
+      border: 1px solid var(--line);
       border-radius: 12px;
-      background: rgba(255, 255, 255, 0.82);
-      color: var(--text);
-      font-size: 13px;
-      outline: 1px solid rgba(219, 226, 237, 0.88);
-      word-break: break-all;
+      background: linear-gradient(135deg, #fff 0%, #eef5ff 100%);
     }
-
-    .nav-shell {
-      display: flex;
-      flex-direction: column;
-      gap: 0;
-      min-height: 0;
-      flex: 1 1 auto;
-    }
-
-    .nav-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 0 6px;
-      margin-bottom: 12px;
-    }
-
-    .nav-head__title {
-      color: rgba(96, 108, 126, 0.92);
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.16em;
-      text-transform: uppercase;
-    }
-
-    .nav-head__count {
-      color: rgba(120, 132, 151, 0.90);
-      font-size: 12px;
-      font-weight: 600;
-      font-variant-numeric: tabular-nums;
-    }
-
-    .portal-search-shell {
-      margin-bottom: 16px;
-      padding: 12px;
-      border-radius: 18px;
-      background: var(--sidebar-surface-strong);
-      outline: 1px solid rgba(223, 229, 238, 0.94);
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
-    }
-
-    .portal-search-shell label {
-      display: block;
-      margin-bottom: 8px;
-      color: var(--sidebar-muted);
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-    }
-
-    .portal-search-input {
-      width: 100%;
-      min-height: 42px;
-      padding: 0 14px;
-      border: 0;
-      border-radius: 14px;
-      background: var(--sidebar-input-surface);
-      color: var(--text);
-      outline: 1px solid rgba(219, 226, 237, 0.88);
-      box-shadow:
-        0 1px 0 rgba(255, 255, 255, 0.96),
-        0 10px 20px rgba(114, 130, 153, 0.06);
-    }
-
-    .portal-search-input::placeholder {
-      color: rgba(107, 119, 140, 0.62);
-    }
-
-    .portal-search-input:focus {
-      outline: 2px solid rgba(42, 20, 180, 0.16);
-    }
-
-    .nav-tree {
-      min-height: 0;
-      overflow: auto;
-      padding: 0 6px 12px 0;
-    }
-
-    .nav-tree::-webkit-scrollbar {
-      width: 6px;
-    }
-
-    .nav-tree::-webkit-scrollbar-thumb {
-      border-radius: 999px;
-      background: rgba(146, 157, 177, 0.30);
-    }
-
-    .tree-section + .tree-section {
-      margin-top: 20px;
-    }
-
-    .tree-section-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 0 8px;
-      margin-bottom: 6px;
-    }
-
-    .tree-section-title {
-      color: rgba(96, 108, 126, 0.92);
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-    }
-
-    .tree-section-count {
-      color: rgba(120, 132, 151, 0.90);
-      font-size: 11px;
-      font-weight: 600;
-      font-variant-numeric: tabular-nums;
-    }
-
-    .tree-section-body {
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-    }
-
-    .tree-item {
-      display: block;
-      width: 100%;
-      min-height: 38px;
-      padding: 8px 10px 8px 12px;
+    .eyebrow { margin: 0 0 10px; color: var(--brand); font-size: 13px; font-weight: 700; }
+    h1 { margin: 0; font-size: clamp(28px, 4vw, 44px); line-height: 1.14; letter-spacing: 0; }
+    .summary { max-width: 820px; margin: 14px 0 0; color: var(--muted); font-size: 16px; }
+    .layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 22px; margin-top: 22px; align-items: start; }
+    nav, section {
+      border: 1px solid var(--line);
       border-radius: 10px;
-      color: var(--sidebar-text);
-      font-size: 13px;
-      line-height: 1.45;
-      text-align: left;
-      transition:
-        background 0.16s ease,
-        color 0.16s ease,
-        box-shadow 0.16s ease;
-    }
-
-    .tree-item:hover {
-      background: rgba(231, 238, 255, 0.48);
-      color: var(--sidebar-accent);
-    }
-
-    .tree-item.active {
-      box-shadow: inset 2px 0 0 var(--sidebar-accent);
-      background: rgba(231, 238, 255, 0.52);
-      color: var(--sidebar-accent);
-    }
-
-    .tree-item__label {
-      display: inline-flex;
-      align-items: center;
-      min-height: 1.2rem;
-      font-weight: 600;
-    }
-
-    .tree-empty {
-      padding: 18px 12px;
-      color: rgba(84, 100, 122, 0.72);
-      font-size: 13px;
-      line-height: 1.8;
-    }
-
-    .doc-main {
-      position: relative;
-      min-width: 0;
-      min-height: 0;
-      flex: 1 1 auto;
-      overflow-y: auto;
-      background: rgba(255, 255, 255, 0.42);
-    }
-
-    .doc-main__inner {
-      width: min(1120px, 100%);
-      margin: 0 auto;
-      padding: 32px 24px 72px;
-    }
-
-    .doc-hero {
-      margin-bottom: 32px;
-      padding-bottom: 24px;
-      border-bottom: 1px solid rgba(224, 230, 239, 0.88);
-    }
-
-    .doc-title {
-      margin: 0;
-      color: var(--text);
-      font-size: 54px;
-      font-weight: 700;
-      line-height: 1.08;
-    }
-
-    .doc-meta {
-      margin-top: 20px;
-      align-items: center;
-    }
-
-    .doc-lead {
-      margin: 20px 0 0;
-      max-width: 1024px;
-      color: var(--muted);
-      font-size: 16px;
-      line-height: 1.96;
-    }
-
-    .doc-status {
-      margin-bottom: 24px;
-    }
-
-    .callout {
-      border-radius: 12px;
-      padding: 16px 18px;
-      font-size: 14px;
-      line-height: 1.85;
-      outline: 1px solid transparent;
-    }
-
-    .callout ul,
-    .callout ol {
-      margin: 0;
-      padding-left: 20px;
-    }
-
-    .callout.info {
-      background: rgba(208, 225, 251, 0.45);
-      color: var(--primary);
-      outline-color: rgba(42, 20, 180, 0.08);
-    }
-
-    .callout.warning {
-      background: var(--warning-soft);
-      color: var(--warning);
-      outline-color: rgba(161, 98, 7, 0.12);
-    }
-
-    .callout.danger {
-      background: var(--danger-soft);
-      color: var(--danger);
-      outline-color: rgba(186, 26, 26, 0.12);
-    }
-
-    .doc-body {
-      display: flex;
-      flex-direction: column;
-      gap: 72px;
-    }
-
-    .section {
-      margin: 0;
-      scroll-margin-top: 88px;
-    }
-
-    .section-header {
-      margin-bottom: 32px;
-    }
-
-    .section-header h2 {
-      margin: 0 0 12px;
-      color: var(--text);
-      font-size: 24px;
-      line-height: 1.3;
-      font-weight: 600;
-      letter-spacing: 0.02em;
-    }
-
-    .section-header p {
-      margin: 0;
-      max-width: 58rem;
-      color: var(--muted);
-      font-size: 16px;
-      line-height: 1.96;
-    }
-
-    .section-stack {
-      display: flex;
-      flex-direction: column;
-      gap: 24px;
-    }
-
-    .section-card {
-      border-radius: 12px;
       background: var(--panel);
-      outline: 1px solid var(--border);
     }
-
-    .section-card__body {
-      padding: 16px;
-    }
-
-    .section-card__body > :first-child {
-      margin-top: 0;
-    }
-
-    .section-card__body > :last-child {
-      margin-bottom: 0;
-    }
-
-    .section-card__body p,
-    .section-card__body ul,
-    .section-card__body ol {
-      color: var(--text);
-      font-size: 16px;
-      line-height: 1.92;
-    }
-
-    .section-card__body ul,
-    .section-card__body ol {
-      margin: 0;
-      padding-left: 20px;
-    }
-
-    .section-card__body li + li {
-      margin-top: 8px;
-    }
-
-    .section-card__body code {
-      padding: 2px 6px;
-      border-radius: 6px;
-      background: #eef2ff;
-      color: #1e3a8a;
-      font-size: 13px;
-    }
-
-    .code-shell {
-      overflow: hidden;
-      border-radius: 14px;
-      background: var(--inverse-surface);
-      outline: 1px solid rgba(199, 196, 215, 0.18);
-    }
-
-    .code-toolbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 12px 16px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-    }
-
-    .code-toolbar-label {
-      color: #c9e6ff;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-    }
-
-    .code-block {
-      margin: 0;
-      overflow: auto;
-      padding: 18px 20px;
-      color: var(--inverse-text);
-      font-size: 13px;
-      line-height: 1.9;
-      white-space: pre;
-      word-break: normal;
-      tab-size: 2;
-    }
-
-    .table-wrap {
-      overflow: auto;
-      border-radius: 14px;
-      background: var(--panel);
-      outline: 1px solid rgba(199, 196, 215, 0.24);
-    }
-
-    table {
-      width: 100%;
-      min-width: 720px;
-      border-collapse: separate;
-      border-spacing: 0;
-    }
-
-    th,
-    td {
-      padding: 14px 16px;
-      border-bottom: 1px solid rgba(199, 196, 215, 0.18);
-      text-align: left;
-      vertical-align: top;
-    }
-
-    th {
-      background: rgba(239, 244, 255, 0.75);
-      color: rgba(84, 100, 122, 0.88);
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.04em;
-    }
-
-    td {
-      color: var(--text);
-      font-size: 14px;
-      line-height: 1.78;
-    }
-
-    tr:last-child td {
-      border-bottom: none;
-    }
-
-    .endpoint-list {
-      display: flex;
-      flex-direction: column;
-      gap: 14px;
-    }
-
-    .endpoint-card {
-      display: grid;
-      grid-template-columns: 92px minmax(0, 1fr);
-      gap: 12px 16px;
-      align-items: start;
-      padding: 18px;
-      border-radius: 16px;
-      background: rgba(248, 250, 255, 0.84);
-      outline: 1px solid rgba(219, 226, 237, 0.84);
-    }
-
-    .endpoint-card p {
-      margin: 0;
-      color: var(--muted);
-      font-size: 14px;
-      line-height: 1.84;
-      grid-column: 2;
-    }
-
-    .method {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 72px;
-      min-height: 30px;
-      padding: 0 10px;
-      border-radius: 999px;
-      background: rgba(231, 238, 255, 0.90);
-      color: var(--sidebar-accent);
-      font-size: 12px;
-      font-weight: 800;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-    }
-
-    @media (max-width: 1100px) {
-      .portal-sidebar {
-        width: 260px;
-        min-width: 260px;
-      }
-
-      .doc-title {
-        font-size: 46px;
-      }
-    }
-
-    @media (max-width: 960px) {
-      html,
-      body {
-        overflow: auto;
-      }
-
-      .workspace {
-        display: block;
-      }
-
-      .portal-sidebar {
-        width: 100%;
-        min-width: 0;
-        height: auto;
-        border-right: none;
-        border-bottom: 1px solid var(--sidebar-border);
-      }
-
-      .portal-sidebar__inner {
-        height: auto;
-        overflow: visible;
-      }
-
-      .doc-main {
-        overflow: visible;
-      }
-
-      .doc-main__inner {
-        padding: 28px 16px 48px;
-      }
-
-      .doc-title {
-        font-size: 38px;
-      }
-    }
-
-    @media (max-width: 640px) {
-      .site-header {
-        flex-direction: column;
-        align-items: flex-start;
-      }
-
-      .endpoint-card {
-        grid-template-columns: 1fr;
-      }
-
-      .endpoint-card p {
-        grid-column: 1;
-      }
-
-      table {
-        min-width: 560px;
-      }
+    nav { position: sticky; top: 16px; padding: 16px; }
+    nav strong { display: block; margin-bottom: 10px; }
+    nav a { display: block; padding: 8px 10px; border-radius: 8px; color: #344054; text-decoration: none; }
+    nav a:hover { background: var(--brand-soft); color: var(--brand); }
+    article { display: grid; gap: 18px; }
+    section { padding: 22px 24px; }
+    h2 { margin: 0 0 12px; font-size: 21px; letter-spacing: 0; }
+    h3 { margin: 18px 0 8px; font-size: 16px; letter-spacing: 0; }
+    p, ul, ol { margin-top: 0; }
+    li + li { margin-top: 6px; }
+    code { padding: 2px 5px; border-radius: 5px; background: #eef2f7; color: #174a83; font-family: "JetBrains Mono", Consolas, monospace; font-size: 0.92em; }
+    pre { margin: 12px 0 0; overflow: auto; border-radius: 10px; background: var(--code-bg); }
+    pre code { display: block; padding: 18px; background: transparent; color: var(--code-text); line-height: 1.7; white-space: pre; }
+    .callout { padding: 14px 16px; border-radius: 10px; background: var(--brand-soft); color: #18406f; }
+    .endpoint { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 10px 0 14px; }
+    .method { padding: 4px 8px; border-radius: 6px; background: #16a34a; color: #fff; font-size: 12px; font-weight: 800; }
+    .field-list { display: grid; gap: 10px; }
+    .field { padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #fbfcff; }
+    .field strong { display: block; margin-bottom: 4px; }
+    @media (max-width: 860px) {
+      .layout { grid-template-columns: 1fr; }
+      nav { position: static; }
     }
   </style>
 </head>
 <body>
-  <div class="layout-root">
-    <header class="site-header">
-      <div class="site-header__brand">
-        <span class="site-header__logo" aria-hidden="true">E</span>
-        <div>
-          <p class="site-header__eyebrow">Easy Deploy 开放接口文档</p>
-          <h1 class="site-header__title">OpenAPI 接入文档</h1>
-        </div>
-      </div>
+  <div class="page">
+    <header class="hero">
+      <p class="eyebrow">Easy Deploy OpenAPI</p>
+      <h1>版本包投递接口</h1>
+      <p class="summary">这份文档无需登录即可访问。Easy Deploy 对外只提供版本包上传能力；应用、节点、环境变量、Compose、脚本阶段、立即发布或定时发布都在后台页面配置。</p>
     </header>
-
-    <div class="workspace">
-      <aside class="portal-sidebar" aria-label="接口文档导航">
-        <div class="portal-sidebar__inner">
-          <section class="nav-shell">
-            <div class="nav-head">
-              <span class="nav-head__title">文档导航</span>
-              <span id="nav-count" class="nav-head__count">0</span>
-            </div>
-            <div class="portal-search-shell">
-              <label for="nav-search">搜索文档</label>
-              <input id="nav-search" class="portal-search-input" type="search" placeholder="搜索章节、接口、字段">
-            </div>
-            <div id="nav-tree" class="nav-tree"></div>
-          </section>
-        </div>
-      </aside>
-
-      <main class="doc-main">
-        <div class="doc-main__inner">
-          <header class="doc-hero">
-            <h1 class="doc-title">Easy Deploy OpenAPI 接入文档</h1>
-            <div class="doc-meta">
-              <span class="doc-badge doc-badge--accent">接口文档</span>
-              <span class="doc-badge">给开发者和 AI 使用</span>
-              <span class="doc-badge">版本包驱动部署</span>
-              <code class="doc-ref">Authorization: Bearer $EASY_DEPLOY_TOKEN</code>
-            </div>
-            <p class="doc-lead">这份文档无需登录即可访问。后台 API Token 页面负责创建调用凭证；业务项目或 AI 只需要保存平台地址、Token、服务标识和版本包路径，就可以自动创建应用、写入配置、上传包并发起部署。</p>
-          </header>
-
-          <section class="doc-status">
-            <div class="callout info">
-              建议 AI 固定使用 <code>service_key</code> 作为服务唯一标识，不要依赖应用 ID。部署时优先读取现有服务配置；不存在时再创建应用。
-            </div>
-          </section>
-
-          <div class="doc-body">
-            <section id="rules" class="section" data-nav-group="快速接入" data-nav-label="AI 执行总规则">
-              <header class="section-header">
-                <h2>AI 执行总规则</h2>
-                <p>给其他项目中的脚本或 AI 使用时，先按统一规则判断应用是否已存在，再决定是创建应用、更新配置，还是上传版本包并触发部署。</p>
-              </header>
-              <div class="section-stack">
-                <div class="section-card"><div class="section-card__body"><ol>
-                  <li>优先使用 <code>service_key</code> 作为服务唯一标识，不要依赖应用 ID。推荐格式：<code>项目名-环境</code>，例如 <code>orders-api-test</code>。</li>
-                  <li>先调用 <code>GET /api/v1/services/{service_key}/app</code>。返回 200 表示已存在；返回 404 才创建应用。</li>
-                  <li>配置属于平台，不要把生产环境变量写死在业务仓库。业务项目只上传版本包，平台保存环境变量、启动参数、目标节点和健康检查等配置。</li>
-                  <li>二进制服务首次创建后，先 <code>PUT /api/v1/services/{service_key}/config</code> 写入运行参数，再上传版本包。</li>
-                  <li>上传版本包后，如需一键部署，使用 <code>auto_deploy=true</code>；否则再调用 <code>POST /api/v1/services/{service_key}/deploy</code>。</li>
-                  <li>部署接口返回 <code>task_id</code> 后，轮询 <code>GET /api/v1/tasks/{task_id}</code>。当任务状态为 <code>success</code>、<code>failed</code> 或 <code>canceled</code> 时停止。</li>
-                </ol></div></div>
-              </div>
-            </section>
-
-            <section id="auth" class="section" data-nav-group="快速接入" data-nav-label="认证">
-              <header class="section-header">
-                <h2>认证</h2>
-                <p>除文档和健康检查外，v1 接口都需要 API Token。建议为每个调用来源单独生成 Token，并填写来源标识方便追责。</p>
-              </header>
-              <div class="section-stack">
-                <div class="section-card"><div class="section-card__body">
-                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">Authorization Header</span></div><pre class="code-block"><code>Authorization: Bearer $EASY_DEPLOY_TOKEN</code></pre></div>
-                  <p>Token 在后台“API Token”页面创建。创建时建议填写来源，例如 <code>orders-api-ci</code>、<code>orders-api-local</code> 或 <code>ai-agent-local</code>。</p>
-                </div></div>
-              </div>
-            </section>
-
-            <section id="fields" class="section" data-nav-group="快速接入" data-nav-label="字段约定">
-              <header class="section-header">
-                <h2>字段约定</h2>
-                <p>先理解下面这些核心字段，再去写创建应用、更新配置和上传版本包的请求，能减少大部分接入错误。</p>
-              </header>
-              <div class="section-stack">
-                <div class="section-card"><div class="section-card__body">
-                  <div class="table-wrap"><table>
-                    <thead><tr><th>字段</th><th>说明</th></tr></thead>
-                    <tbody>
-                      <tr><td><code>service_key</code></td><td>服务唯一标识。创建后不要随意变更。接口路径中的 <code>{service_key}</code> 就是它。</td></tr>
-                      <tr><td><code>environment</code></td><td>固定枚举：<code>production</code> 正式环境，<code>test</code> 测试环境。默认建议用 <code>test</code>。</td></tr>
-                      <tr><td><code>app_type</code></td><td><code>compose</code> 表示 Docker Compose 服务，可不上传版本包直接部署；<code>binary</code> 表示二进制包 + systemd 部署。</td></tr>
-                      <tr><td><code>target_node_keys</code></td><td>目标节点标识数组。未传时默认 <code>["local"]</code>。AI 应优先使用节点 key，而不是节点 ID。</td></tr>
-                      <tr><td><code>deploy_strategy</code></td><td><code>rolling_stop_on_failure</code> 或 <code>rolling_continue</code>。多节点推荐默认 <code>rolling_stop_on_failure</code>。</td></tr>
-                      <tr><td><code>health_check_kind</code></td><td><code>none</code>、<code>compose_running</code>、<code>systemd_active</code>、<code>http</code>、<code>tcp</code>。二进制服务常用 <code>systemd_active</code> 或 <code>http</code>。</td></tr>
-                      <tr><td><code>versionCode</code></td><td>版本排序数字，越大越新。未传时平台会优先从规范包名解析。</td></tr>
-                      <tr><td><code>publishedAt</code></td><td>发布时间，建议 ISO 8601，例如 <code>2026-06-15T10:30:00Z</code>。</td></tr>
-                    </tbody>
-                  </table></div>
-                </div></div>
-              </div>
-            </section>
-
-            <section id="package-name" class="section" data-nav-group="快速接入" data-nav-label="版本包命名规范">
-              <header class="section-header">
-                <h2>版本包命名规范</h2>
-                <p>平台通过包名解析版本号和 service_key。命名不规范时，OpenAPI 接口会直接返回错误，不会登记错误版本。</p>
-              </header>
-              <div class="section-stack">
-                <div class="section-card"><div class="section-card__body">
-                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">Package Name</span></div><pre class="code-block"><code>{service_key}_version_{x_y_z}.tar.gz
-orders-api-prod_version_1_2_3.tar.gz</code></pre></div>
-                  <p>平台会解析出 <code>release_version=1.2.3</code> 和可排序的 <code>versionCode</code>。如果请求里传了 <code>release_version</code>，必须和文件名解析结果一致。</p>
-                  <div class="callout warning">常见错误码：<code>INVALID_PACKAGE_VERSION_NAME</code>、<code>PACKAGE_SERVICE_KEY_MISMATCH</code>、<code>PACKAGE_VERSION_CONFLICT</code>。</div>
-                </div></div>
-              </div>
-            </section>
-
-            <section id="binary-flow" class="section" data-nav-group="推荐流程" data-nav-label="推荐流程：二进制服务">
-              <header class="section-header">
-                <h2>推荐流程：二进制服务</h2>
-                <p>适合 Go、Rust、Java 打包后可直接运行的应用。业务项目负责本地构建 tar.gz，easy-deploy 负责保存配置、同步文件和执行 systemd 操作。</p>
-              </header>
-              <div class="section-stack">
-                <div class="section-card"><div class="section-card__body"><ol>
-                  <li>生成服务标识，例如 <code>orders-api-test</code>。</li>
-                  <li>读取服务：<code>GET /api/v1/services/orders-api-test/app</code>。</li>
-                  <li>如果 404，创建应用：<code>POST /api/v1/apps</code>，<code>app_type</code> 填 <code>binary</code>。</li>
-                  <li>写入或更新配置：<code>PUT /api/v1/services/orders-api-test/config</code>。</li>
-                  <li>业务项目本地构建 tar.gz，按规范命名。</li>
-                  <li>上传版本包：<code>POST /api/v1/services/orders-api-test/packages</code>。</li>
-                  <li>如果上传时没传 <code>auto_deploy=true</code>，再调用部署：<code>POST /api/v1/services/orders-api-test/deploy</code>。</li>
-                  <li>轮询任务详情，读取 <code>steps</code> 和 <code>logs</code>。失败时把失败步骤和关联日志展示给用户。</li>
-                </ol></div></div>
-              </div>
-            </section>
-
-            <section id="compose-flow" class="section" data-nav-group="推荐流程" data-nav-label="推荐流程：Compose 服务">
-              <header class="section-header">
-                <h2>推荐流程：Compose 服务</h2>
-                <p>适合 Redis、Postgres、Nginx 这类不需要业务项目额外打版本包的基础组件，或者只维护 compose 配置的内部服务。</p>
-              </header>
-              <div class="section-stack">
-                <div class="section-card"><div class="section-card__body"><ol>
-                  <li>创建应用时 <code>app_type=compose</code>，写入 <code>compose_content</code> 和 <code>env_content</code>。</li>
-                  <li>Compose 服务不需要版本包。配置确认后直接调用 <code>deploy</code>，action 使用 <code>up</code> 或 <code>restart</code>。</li>
-                  <li>如果只是停止服务，action 使用 <code>down</code>。</li>
-                  <li>同样可以通过任务详情读取步骤输出，排查 compose 渲染、镜像拉取或容器启动失败。</li>
-                </ol></div></div>
-              </div>
-            </section>
-
-            <section id="decision-tree" class="section" data-nav-group="推荐流程" data-nav-label="给其他项目 AI 的最小决策树">
-              <header class="section-header">
-                <h2>给其他项目 AI 的最小决策树</h2>
-                <p>如果是让其他项目里的 AI 直接接入 easy-deploy，这个顺序已经足够覆盖第一次创建、后续更新和失败排查。</p>
-              </header>
-              <div class="section-stack">
-                <div class="section-card"><div class="section-card__body">
-                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">Decision Tree</span></div><pre class="code-block"><code>1. 读取环境变量 EASY_DEPLOY_URL 和 EASY_DEPLOY_TOKEN
-2. 确定 service_key
-3. GET /api/v1/services/{service_key}/app
-4. 若 404，POST /api/v1/apps 创建
-5. PUT /api/v1/services/{service_key}/config 写入或更新运行配置
-6. 若 app_type=compose，POST /deploy action=up 或 restart
-7. 若 app_type=binary，上传 {service_key}_version_x_y_z.tar.gz
-8. 拿到 task_id 后轮询 /api/v1/tasks/{task_id}
-9. 失败时输出 failed step + logs</code></pre></div>
-                </div></div>
-              </div>
-            </section>
-
-            <section id="endpoints" class="section" data-nav-group="接口与示例" data-nav-label="接口清单">
-              <header class="section-header">
-                <h2>接口清单</h2>
-                <p>下面这些是业务项目和 AI 最常用的最小接口集合。第一次接入通常只需要节点读取、应用读取、应用创建、配置更新、版本上传、部署触发和任务轮询。</p>
-              </header>
-              <div class="section-stack">
-                <div class="section-card"><div class="section-card__body"><div class="endpoint-list">
-                  <div class="endpoint-card"><span class="method">GET</span><code>/api/v1/nodes</code><p>读取节点，AI 可用它确认 <code>target_node_keys</code>。</p></div>
-                  <div class="endpoint-card"><span class="method">GET</span><code>/api/v1/services/{service_key}/app</code><p>按服务标识读取应用详情。不存在返回 404。</p></div>
-                  <div class="endpoint-card"><span class="method">POST</span><code>/api/v1/apps</code><p>创建应用和初始部署配置。</p></div>
-                  <div class="endpoint-card"><span class="method">PUT</span><code>/api/v1/services/{service_key}/config</code><p>更新 Compose、环境变量、二进制启动参数和健康检查。</p></div>
-                  <div class="endpoint-card"><span class="method">POST</span><code>/api/v1/services/{service_key}/packages</code><p>上传二进制版本包。支持字段别名：<code>package_file</code>/<code>file</code>/<code>artifact_file</code>、<code>release_version</code>/<code>artifact_version</code>、<code>versionCode</code>/<code>version_code</code>、<code>publishedAt</code>/<code>published_at</code>。</p></div>
-                  <div class="endpoint-card"><span class="method">POST</span><code>/api/v1/services/{service_key}/deploy</code><p>创建部署任务。Compose action：<code>up</code>、<code>down</code>、<code>restart</code>。二进制 action：<code>binary_restart</code>、<code>binary_stop</code>。</p></div>
-                  <div class="endpoint-card"><span class="method">GET</span><code>/api/v1/tasks/{task_id}</code><p>读取任务状态、步骤和日志。<code>logs.step_id</code> 对应 <code>steps.id</code>。</p></div>
-                </div></div></div>
-              </div>
-            </section>
-
-            <section id="create-app" class="section" data-nav-group="接口与示例" data-nav-label="创建二进制应用示例">
-              <header class="section-header">
-                <h2>创建二进制应用示例</h2>
-                <p>第一次创建应用时，建议同时把环境、目标节点、部署策略、systemd 运行参数和健康检查一起写进去。</p>
-              </header>
-              <div class="section-stack">
-                <div class="section-card"><div class="section-card__body">
-                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">POST /api/v1/apps</span></div><pre class="code-block"><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/apps" \
-  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"app_key":"orders-api-test","name":"订单 API 测试","environment":"test","app_type":"binary","target_node_keys":["qfy-sc-test"],"deploy_strategy":"rolling_stop_on_failure","binary_exec_args":"--config /etc/orders-api/config.toml","binary_service_user":"root","binary_unit_name":"orders-api-test.service","health_check_kind":"http","health_endpoint":"http://127.0.0.1:8080/health","health_timeout_secs":5,"health_expected_status":200}'</code></pre></div>
-                </div></div>
-              </div>
-            </section>
-
-            <section id="update-config" class="section" data-nav-group="接口与示例" data-nav-label="更新配置示例">
-              <header class="section-header">
-                <h2>更新配置示例</h2>
-                <p>配置可以独立演进。你可以在不上传新版本包的前提下，先更新环境变量、启动参数或健康检查。</p>
-              </header>
-              <div class="section-stack">
-                <div class="section-card"><div class="section-card__body">
-                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">PUT /api/v1/services/{service_key}/config</span></div><pre class="code-block"><code>curl -X PUT "$EASY_DEPLOY_URL/api/v1/services/orders-api-test/config" \
-  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"env_content":"RUST_LOG=info\nDATABASE_URL=sqlite:///data/orders.db\n","binary_exec_args":"--port 8080","health_check_kind":"http","health_endpoint":"http://127.0.0.1:8080/health"}'</code></pre></div>
-                  <p>注意：更新配置会记录配置版本。不同版本包可以复用同一份配置，也可以在上传新版本包前先更新配置。</p>
-                </div></div>
-              </div>
-            </section>
-
-            <section id="upload-package" class="section" data-nav-group="接口与示例" data-nav-label="上传版本包并自动部署">
-              <header class="section-header">
-                <h2>上传版本包并自动部署</h2>
-                <p>这是业务项目最常用的调用方式：先本地构建包，再通过 multipart 直接传给平台，平台登记版本后顺手触发部署。</p>
-              </header>
-              <div class="section-stack">
-                <div class="section-card"><div class="section-card__body">
-                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">POST /api/v1/services/{service_key}/packages</span></div><pre class="code-block"><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/services/orders-api-test/packages" \
-  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
-  -F "package_file=@./dist/orders-api-test_version_1_2_3.tar.gz" \
-  -F "entry_file=orders-api" \
-  -F "source=local-build" \
-  -F "auto_deploy=true"</code></pre></div>
-                  <p>成功响应会包含 <code>task_id</code>。如果 <code>auto_deploy=false</code> 或不传，则只上传版本包，不创建部署任务。</p>
-                </div></div>
-              </div>
-            </section>
-
-            <section id="deploy" class="section" data-nav-group="接口与示例" data-nav-label="手动触发部署">
-              <header class="section-header">
-                <h2>手动触发部署</h2>
-                <p>如果你想把“上传版本包”和“上线部署”拆开做，可以在版本包已登记后单独调用部署接口。</p>
-              </header>
-              <div class="section-stack">
-                <div class="section-card"><div class="section-card__body">
-                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">POST /api/v1/services/{service_key}/deploy</span></div><pre class="code-block"><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/services/orders-api-test/deploy" \
-  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"action":"binary_restart"}'</code></pre></div>
-                </div></div>
-              </div>
-            </section>
-
-            <section id="task-logs" class="section" data-nav-group="接口与示例" data-nav-label="轮询任务和读取步骤日志">
-              <header class="section-header">
-                <h2>轮询任务和读取步骤日志</h2>
-                <p>部署动作都是异步任务。AI 或脚本拿到 <code>task_id</code> 后，需要继续轮询任务状态，并在失败时读取具体步骤和日志。</p>
-              </header>
-              <div class="section-stack">
-                <div class="section-card"><div class="section-card__body">
-                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">GET /api/v1/tasks/{task_id}</span></div><pre class="code-block"><code>curl -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
-  "$EASY_DEPLOY_URL/api/v1/tasks/123"</code></pre></div>
-                  <p>AI 判断规则：</p>
-                  <ul>
-                    <li><code>data.task.status=queued/running</code>：继续等待，建议 2 秒后重试。</li>
-                    <li><code>success</code>：部署完成。</li>
-                    <li><code>failed</code>：读取 <code>steps</code> 里 status 为 <code>failed</code> 的步骤，再用 <code>logs.step_id</code> 过滤相关日志，给用户展示失败命令和输出。</li>
-                  </ul>
-                  <div class="code-shell"><div class="code-toolbar"><span class="code-toolbar-label">Failed Task Example</span></div><pre class="code-block"><code>{"data":{"task":{"id":123,"status":"failed","summary":"远程 systemctl daemon-reload 失败"},"steps":[{"id":9,"step_no":3,"title":"准备 orders-node-1 的二进制运行文件","status":"failed","command":"sync runtime files && systemctl link && daemon-reload","exit_code":1}],"logs":[{"id":41,"step_id":9,"stream":"system","content":"systemctl daemon-reload · 退出码 1"},{"id":42,"step_id":9,"stream":"combined","content":"Failed to reload daemon"}]}}</code></pre></div>
-                </div></div>
-              </div>
-            </section>
-
-            <section id="errors" class="section" data-nav-group="接口与示例" data-nav-label="错误处理">
-              <header class="section-header">
-                <h2>错误处理</h2>
-                <p>下面这些错误码是业务项目和 AI 在接入时最容易碰到的几类，建议把它们纳入自动提示和重试策略。</p>
-              </header>
-              <div class="section-stack">
-                <div class="section-card"><div class="section-card__body">
-                  <div class="callout danger"><ul>
-                    <li>401/403：Token 无效或权限不足。请让用户在后台创建或调整 API Token。</li>
-                    <li>404：服务不存在。AI 可以在确认 <code>service_key</code> 正确后创建应用。</li>
-                    <li>400 且 <code>code=INVALID_PACKAGE_VERSION_NAME</code>：版本包命名不符合规范，重新打包命名。</li>
-                    <li>400 且 <code>code=PACKAGE_SERVICE_KEY_MISMATCH</code>：包名里的 <code>service_key</code> 和接口路径不一致。</li>
-                    <li>400 且 <code>code=PACKAGE_VERSION_CONFLICT</code>：请求传入版本和包名解析版本不一致。</li>
-                  </ul></div>
-                </div></div>
-              </div>
-            </section>
+    <div class="layout">
+      <nav aria-label="接口文档目录">
+        <strong>目录</strong>
+        <a href="#scope">职责边界</a>
+        <a href="#prepare">接入准备</a>
+        <a href="#package-name">包名规范</a>
+        <a href="#endpoint">接口</a>
+        <a href="#fields">字段</a>
+        <a href="#example">示例</a>
+        <a href="#errors">错误处理</a>
+      </nav>
+      <article>
+        <section id="scope">
+          <h2>职责边界</h2>
+          <div class="callout">业务项目或 AI 只负责构建并上传版本包，不创建应用、不更新部署配置、不触发部署、不轮询任务。</div>
+          <ul>
+            <li>后台先创建应用并配置目标节点、Compose、环境变量、部署脚本和健康检查。</li>
+            <li>后台选择发布策略：自动上传即入队、手动发布或定时发布。</li>
+            <li>上传接口只登记版本包并返回 release/queue 信息；真正发布过程由平台队列按应用串行执行。</li>
+          </ul>
+        </section>
+        <section id="prepare">
+          <h2>接入准备</h2>
+          <ol>
+            <li>在后台确认服务标识，例如 <code>qfy-sc-test-backend</code>。</li>
+            <li>在 API Token 页面创建 token，并赋予版本包上传权限。</li>
+            <li>业务项目本地或 CI 构建版本包，文件名必须包含服务标识和版本号。</li>
+            <li>调用上传接口，把包投递到 Easy Deploy。</li>
+          </ol>
+        </section>
+        <section id="package-name">
+          <h2>包名规范</h2>
+          <p>推荐格式：</p>
+          <pre><code>{service_key}_version_{x_y_z}.tar.gz</code></pre>
+          <p>示例：</p>
+          <pre><code>qfy-sc-test-backend_version_1_2_3.tar.gz
+qfy-sc-test-admin_version_v1.2.3.tar.gz</code></pre>
+          <p>如果包名前缀和路径中的 <code>service_key</code> 不一致，接口会返回 400。</p>
+        </section>
+        <section id="endpoint">
+          <h2>接口</h2>
+          <div class="endpoint"><span class="method">POST</span><code>/api/v1/services/{service_key}/packages</code></div>
+          <p>认证方式：</p>
+          <pre><code>Authorization: Bearer &lt;API_TOKEN&gt;</code></pre>
+          <p>请求类型：</p>
+          <pre><code>multipart/form-data</code></pre>
+        </section>
+        <section id="fields">
+          <h2>字段</h2>
+          <div class="field-list">
+            <div class="field"><strong><code>package_file</code> 必填</strong>版本包文件。兼容字段名：<code>file</code>、<code>artifact_file</code>。</div>
+            <div class="field"><strong><code>release_version</code> 可选</strong>显式版本号。填写时必须和包名解析出的版本一致。兼容字段名：<code>artifact_version</code>。</div>
+            <div class="field"><strong><code>version_code</code> 可选</strong>版本排序号。不填时平台从包名版本解析。兼容字段名：<code>versionCode</code>。</div>
+            <div class="field"><strong><code>published_at</code> 可选</strong>业务项目构建或发布时间。兼容字段名：<code>publishedAt</code>。</div>
+            <div class="field"><strong><code>source</code> 可选</strong>来源标记，例如 <code>ci</code>、<code>local-script</code>、<code>ai-agent</code>。</div>
           </div>
-        </div>
-      </main>
+        </section>
+        <section id="example">
+          <h2>示例</h2>
+          <pre><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/services/qfy-sc-test-backend/packages" \
+  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
+  -F "package_file=@qfy-sc-test-backend_version_1_2_3.tar.gz" \
+  -F "source=ci" \
+  -F "published_at=2026-07-03T10:00:00+08:00"</code></pre>
+          <p>成功响应会包含 <code>release_id</code>、<code>queue_id</code>、<code>release_version</code>、<code>config_revision</code>。如果应用设置为非自动入队，<code>queue_id</code> 可能为空。</p>
+        </section>
+        <section id="errors">
+          <h2>错误处理</h2>
+          <ul>
+            <li><code>400</code>：包名不符合规范、版本冲突、文件为空或字段读取失败。</li>
+            <li><code>401</code>：没有提供有效 API Token。</li>
+            <li><code>403</code>：Token 没有版本包上传权限。</li>
+            <li><code>404</code>：服务标识不存在，需要先在后台创建并配置应用。</li>
+          </ul>
+          <p>包名错误会返回 <code>expected_pattern</code> 和 <code>example</code>，调用方可以直接把错误内容展示给开发者或 AI。</p>
+        </section>
+      </article>
     </div>
   </div>
-
-  <script>
-    (() => {
-      const sections = Array.from(document.querySelectorAll(".section"));
-      const navTree = document.getElementById("nav-tree");
-      const navCount = document.getElementById("nav-count");
-      const navSearch = document.getElementById("nav-search");
-      const docMain = document.querySelector(".doc-main");
-
-      if (!sections.length || !navTree || !navCount || !navSearch || !docMain) {
-        return;
-      }
-
-      const groups = [];
-      const groupMap = new Map();
-
-      sections.forEach((section) => {
-        const id = section.id;
-        const group = section.dataset.navGroup || "未分组";
-        const label = section.dataset.navLabel || id;
-        const item = { id, group, label };
-        if (!groupMap.has(group)) {
-          const nextGroup = { name: group, items: [] };
-          groupMap.set(group, nextGroup);
-          groups.push(nextGroup);
-        }
-        groupMap.get(group).items.push(item);
-      });
-
-      const navLinks = [];
-
-      function renderTree(filterText) {
-        const keyword = filterText.trim().toLowerCase();
-        navTree.innerHTML = "";
-        navLinks.length = 0;
-        let visibleCount = 0;
-
-        groups.forEach((group) => {
-          const items = group.items.filter((item) => {
-            if (!keyword) {
-              return true;
-            }
-            return item.label.toLowerCase().includes(keyword) || item.id.toLowerCase().includes(keyword);
-          });
-
-          if (!items.length) {
-            return;
-          }
-
-          const sectionEl = document.createElement("section");
-          sectionEl.className = "tree-section";
-
-          const head = document.createElement("div");
-          head.className = "tree-section-head";
-          head.innerHTML = '<span class="tree-section-title"></span><span class="tree-section-count"></span>';
-          head.querySelector(".tree-section-title").textContent = group.name;
-          head.querySelector(".tree-section-count").textContent = String(items.length);
-          sectionEl.appendChild(head);
-
-          const body = document.createElement("div");
-          body.className = "tree-section-body";
-
-          items.forEach((item) => {
-            const link = document.createElement("a");
-            link.className = "tree-item";
-            link.href = `#${item.id}`;
-            link.dataset.target = item.id;
-            link.innerHTML = '<span class="tree-item__label"></span>';
-            link.querySelector(".tree-item__label").textContent = item.label;
-            body.appendChild(link);
-            navLinks.push(link);
-            visibleCount += 1;
-          });
-
-          sectionEl.appendChild(body);
-          navTree.appendChild(sectionEl);
-        });
-
-        if (visibleCount === 0) {
-          const empty = document.createElement("div");
-          empty.className = "tree-empty";
-          empty.textContent = "没有匹配的章节。";
-          navTree.appendChild(empty);
-        }
-
-        navCount.textContent = String(visibleCount);
-        syncActiveLink();
-      }
-
-      function syncActiveLink() {
-        const current = sections.find((section) => {
-          const rect = section.getBoundingClientRect();
-          return rect.top <= 180 && rect.bottom >= 180;
-        }) || sections[0];
-
-        navLinks.forEach((link) => {
-          link.classList.toggle("active", current && link.dataset.target === current.id);
-        });
-      }
-
-      navSearch.addEventListener("input", () => {
-        renderTree(navSearch.value);
-      });
-
-      docMain.addEventListener("scroll", syncActiveLink, { passive: true });
-      window.addEventListener("hashchange", syncActiveLink);
-
-      renderTree("");
-    })();
-  </script>
 </body>
-</html>"###
-        .to_owned()
+</html>"###.to_owned()
 }
-
 async fn record_audit_event(
     state: &AppState,
     session: &CurrentSession,
@@ -10960,13 +8080,6 @@ fn compose_audit_action(action: ComposeTaskAction) -> &'static str {
         ComposeTaskAction::Up => "deploy.compose_up",
         ComposeTaskAction::Down => "deploy.compose_down",
         ComposeTaskAction::Restart => "deploy.compose_restart",
-    }
-}
-
-fn binary_audit_action(action: BinaryTaskAction) -> &'static str {
-    match action {
-        BinaryTaskAction::Restart => "deploy.binary_restart",
-        BinaryTaskAction::Stop => "deploy.binary_stop",
     }
 }
 
@@ -11120,6 +8233,18 @@ fn valid_csrf(session: &CurrentSession, submitted: &str) -> bool {
     !submitted.is_empty() && submitted == session.csrf_token
 }
 
+fn default_if_blank<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.trim().is_empty() {
+        fallback
+    } else {
+        value
+    }
+}
+
+fn default_i64(value: i64, fallback: i64) -> i64 {
+    if value == 0 { fallback } else { value }
+}
+
 fn parse_create_app_form(bytes: &[u8]) -> Result<CreateAppForm, String> {
     let fields = parse_urlencoded_fields(bytes);
     Ok(CreateAppForm {
@@ -11128,24 +8253,21 @@ fn parse_create_app_form(bytes: &[u8]) -> Result<CreateAppForm, String> {
         name: required_form_value(&fields, "name")?,
         description: first_form_value(&fields, "description"),
         environment: first_form_value(&fields, "environment"),
-        app_type: required_form_value(&fields, "app_type")?,
         deploy_strategy: first_form_value(&fields, "deploy_strategy"),
+        release_source: first_form_value(&fields, "release_source"),
+        auto_queue_release: form_bool(&fields, "auto_queue_release"),
         work_dir: first_form_value(&fields, "work_dir"),
         compose_content: first_form_value(&fields, "compose_content"),
         env_content: first_form_value(&fields, "env_content"),
-        binary_artifact_version: first_form_value(&fields, "binary_artifact_version"),
-        binary_artifact_path: first_form_value(&fields, "binary_artifact_path"),
-        binary_exec_args: first_form_value(&fields, "binary_exec_args"),
-        binary_service_user: first_form_value(&fields, "binary_service_user"),
-        binary_unit_name: first_form_value(&fields, "binary_unit_name"),
-        binary_release_strategy: first_form_value(&fields, "binary_release_strategy"),
-        binary_active_slot: first_form_value(&fields, "binary_active_slot"),
-        binary_base_port: optional_form_i64(&fields, "binary_base_port")?,
-        binary_standby_port: optional_form_i64(&fields, "binary_standby_port")?,
-        binary_proxy_enabled: form_bool(&fields, "binary_proxy_enabled"),
-        binary_proxy_kind: first_form_value(&fields, "binary_proxy_kind"),
-        binary_proxy_domain: first_form_value(&fields, "binary_proxy_domain"),
-        binary_proxy_config_path: first_form_value(&fields, "binary_proxy_config_path"),
+        deploy_script_pre_deploy: first_form_value(&fields, "deploy_script_pre_deploy"),
+        deploy_script_deploy: first_form_value(&fields, "deploy_script_deploy"),
+        deploy_script_post_deploy: first_form_value(&fields, "deploy_script_post_deploy"),
+        deploy_script_switch_traffic: first_form_value(&fields, "deploy_script_switch_traffic"),
+        deploy_script_cleanup: first_form_value(&fields, "deploy_script_cleanup"),
+        health_check_kind: first_form_value(&fields, "health_check_kind"),
+        health_endpoint: first_form_value(&fields, "health_endpoint"),
+        health_timeout_secs: optional_form_i64(&fields, "health_timeout_secs")?,
+        health_expected_status: optional_form_i64(&fields, "health_expected_status")?,
         target_node_ids: parse_form_ids(&fields, "target_node_ids")?,
     })
 }
@@ -11159,6 +8281,8 @@ fn parse_update_app_metadata_form(bytes: &[u8]) -> Result<UpdateAppMetadataForm,
         environment: first_form_value(&fields, "environment"),
         work_dir: required_form_value(&fields, "work_dir")?,
         deploy_strategy: first_form_value(&fields, "deploy_strategy"),
+        release_source: first_form_value(&fields, "release_source"),
+        auto_queue_release: form_bool(&fields, "auto_queue_release"),
         target_node_ids: parse_form_ids(&fields, "target_node_ids")?,
     })
 }
@@ -11537,18 +8661,11 @@ fn api_package_error(status: StatusCode, err: BinaryPackageNameError) -> Respons
         Json(ApiPackageErrorBody {
             code: err.code(),
             error: err.message(),
-            expected_pattern: BINARY_PACKAGE_PATTERN,
-            example: BINARY_PACKAGE_EXAMPLE,
+            expected_pattern: RELEASE_PACKAGE_PATTERN,
+            example: RELEASE_PACKAGE_EXAMPLE,
         }),
     )
         .into_response()
-}
-
-fn parse_api_bool(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "true" | "1" | "yes" | "y" | "on"
-    )
 }
 
 fn parse_optional_i64(value: &str) -> Result<Option<i64>, String> {
@@ -11593,13 +8710,6 @@ struct ApiSession {
 impl ApiSession {
     fn can(&self, permission_key: &str) -> bool {
         self.inner.session.can(permission_key)
-    }
-
-    fn actor(&self) -> String {
-        format!(
-            "api:{}@{}",
-            self.inner.source, self.inner.session.account.username
-        )
     }
 }
 
@@ -11657,7 +8767,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::{
-        apps::{AppService, CreateAppInput},
+        apps::{AppService, CreateAppInput, UploadBinaryArtifactInput},
         auth::{AuthService, MemorySessionStore},
         deploy::{ComposeExecutor, SystemdExecutor, TokioCommandRunner},
         nodes::NodeService,
@@ -11773,10 +8883,14 @@ mod tests {
             environment: "test".to_owned(),
             app_type: "binary".to_owned(),
             deploy_strategy: "rolling_stop_on_failure".to_owned(),
+            release_source: "manual".to_owned(),
+            auto_queue_release: true,
             work_dir: format!("/opt/easy-deploy/apps/{app_key}"),
             target_node_ids: vec![1],
             compose_content: String::new(),
             env_content: "RUST_LOG=info".to_owned(),
+            deploy_scripts: DeployScriptSet::default(),
+            health_check: Default::default(),
             binary_artifact_version: "v1.0.0".to_owned(),
             binary_artifact_path: format!(
                 "/opt/easy-deploy/apps/{app_key}/releases/v1.0.0/{app_key}"
@@ -11795,6 +8909,245 @@ mod tests {
         })
         .await
         .expect("create binary app")
+    }
+
+    async fn create_binary_test_app_with_mode(
+        apps: &AppService,
+        app_key: &str,
+        auto_queue_release: bool,
+    ) -> i64 {
+        apps.create_app(CreateAppInput {
+            app_key: app_key.to_owned(),
+            name: format!("{app_key} app"),
+            description: String::new(),
+            environment: "test".to_owned(),
+            app_type: "binary".to_owned(),
+            deploy_strategy: "rolling_stop_on_failure".to_owned(),
+            release_source: "manual".to_owned(),
+            auto_queue_release,
+            work_dir: format!("/opt/easy-deploy/apps/{app_key}"),
+            target_node_ids: vec![1],
+            compose_content: String::new(),
+            env_content: "RUST_LOG=info".to_owned(),
+            deploy_scripts: DeployScriptSet::default(),
+            health_check: Default::default(),
+            binary_artifact_version: "v1.0.0".to_owned(),
+            binary_artifact_path: format!(
+                "/opt/easy-deploy/apps/{app_key}/releases/v1.0.0/{app_key}"
+            ),
+            binary_exec_args: "--port 8080".to_owned(),
+            binary_service_user: "deploy".to_owned(),
+            binary_unit_name: format!("easy-deploy-{app_key}.service"),
+            binary_release_strategy: "restart".to_owned(),
+            binary_active_slot: "blue".to_owned(),
+            binary_base_port: 8080,
+            binary_standby_port: 18080,
+            binary_proxy_enabled: false,
+            binary_proxy_kind: "none".to_owned(),
+            binary_proxy_domain: String::new(),
+            binary_proxy_config_path: String::new(),
+        })
+        .await
+        .expect("create binary app")
+    }
+
+    async fn create_compose_test_app(apps: &AppService, app_key: &str) -> i64 {
+        create_compose_test_app_with_mode(apps, app_key, true).await
+    }
+
+    async fn create_compose_test_app_with_mode(
+        apps: &AppService,
+        app_key: &str,
+        auto_queue_release: bool,
+    ) -> i64 {
+        apps.create_app(CreateAppInput {
+            app_key: app_key.to_owned(),
+            name: format!("{app_key} app"),
+            description: String::new(),
+            environment: "test".to_owned(),
+            app_type: "compose".to_owned(),
+            deploy_strategy: "rolling_stop_on_failure".to_owned(),
+            release_source: "package_upload".to_owned(),
+            auto_queue_release,
+            work_dir: format!("/opt/easy-deploy/apps/{app_key}"),
+            target_node_ids: vec![1],
+            compose_content: "services:\n  app:\n    image: nginx:alpine\n".to_owned(),
+            env_content: "RUST_LOG=info".to_owned(),
+            deploy_scripts: DeployScriptSet::default(),
+            health_check: Default::default(),
+            binary_artifact_version: String::new(),
+            binary_artifact_path: String::new(),
+            binary_exec_args: String::new(),
+            binary_service_user: String::new(),
+            binary_unit_name: String::new(),
+            binary_release_strategy: "restart".to_owned(),
+            binary_active_slot: "blue".to_owned(),
+            binary_base_port: 8080,
+            binary_standby_port: 18080,
+            binary_proxy_enabled: false,
+            binary_proxy_kind: "none".to_owned(),
+            binary_proxy_domain: String::new(),
+            binary_proxy_config_path: String::new(),
+        })
+        .await
+        .expect("create compose app")
+    }
+
+    #[tokio::test]
+    async fn apps_page_only_exposes_compose_creation() {
+        let app = test_web_app().await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/apps")
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("创建一个 Docker Compose 发布单元"));
+        assert!(html.contains("name=\"app_type\" value=\"compose\""));
+        assert!(html.contains("name=\"release_source\""));
+        assert!(html.contains("value=\"package_upload\""));
+        assert!(!html.contains("二进制直部署"));
+        assert!(!html.contains("systemd 管理"));
+    }
+
+    #[tokio::test]
+    async fn app_create_route_forces_compose_app_type() {
+        let app = test_web_app().await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+        let form = format!(
+            "csrf_token={}&app_key=forced-compose&name=Forced+Compose&description=&environment=test&app_type=binary&deploy_strategy=rolling_stop_on_failure&auto_queue_release=true&work_dir=/opt/easy-deploy/apps/forced-compose&compose_content=services%3A%0A++app%3A%0A++++image%3A+nginx%3Aalpine%0A&env_content=&target_node_ids=1",
+            login.session.csrf_token
+        );
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apps")
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        let status = response.status();
+        if status != StatusCode::SEE_OTHER {
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read failure body");
+            panic!(
+                "expected create app redirect, got {status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        let apps = app.apps.list_apps().await.expect("list apps");
+        let created = apps
+            .into_iter()
+            .find(|item| item.app_key == "forced-compose")
+            .expect("created app");
+        assert_eq!(created.app_type, "compose");
+        assert_eq!(created.release_source, "package_upload");
+    }
+
+    #[tokio::test]
+    async fn app_create_route_persists_template_scripts_and_health_check() {
+        let app = test_web_app().await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+        let form = format!(
+            "csrf_token={}&app_key=qfy-sc-test-backend&name=qfy-sc+测试+API&description=&environment=testing&deploy_strategy=rolling_stop_on_failure&release_source=package_upload&auto_queue_release=true&work_dir=/opt/easy-deploy/apps/qfy-sc-test-backend&compose_content=services%3A%0A++api%3A%0A++++image%3A+qfy-sc-test-api%3Alatest%0A&env_content=APP_ENV%3Dtesting%0A&deploy_script_pre_deploy=set+-eu%0Aecho+preflight%0A&deploy_script_deploy=docker+compose+up+-d%0A&deploy_script_post_deploy=.%2Foc-api+seed+core%0A&health_check_kind=http&health_endpoint=http%3A%2F%2F127.0.0.1%3A23710%2Fhealthz&health_timeout_secs=5&health_expected_status=200&target_node_ids=1",
+            login.session.csrf_token
+        );
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apps")
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let created = app
+            .apps
+            .list_apps()
+            .await
+            .expect("list apps")
+            .into_iter()
+            .find(|item| item.app_key == "qfy-sc-test-backend")
+            .expect("created app");
+        let detail = app.apps.app_detail(created.id).await.expect("app detail");
+
+        assert_eq!(detail.app.release_source, "package_upload");
+        assert_eq!(detail.health_check.kind.as_str(), "http");
+        assert_eq!(
+            detail.health_check.endpoint,
+            "http://127.0.0.1:23710/healthz"
+        );
+        assert!(detail.deploy_scripts.pre_deploy.contains("preflight"));
+        assert!(
+            detail
+                .deploy_scripts
+                .deploy
+                .contains("docker compose up -d")
+        );
+        assert!(detail.deploy_scripts.post_deploy.contains("seed core"));
     }
 
     fn multipart_body(
@@ -11861,6 +9214,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_host_metrics_returns_authenticated_snapshot() {
+        let app = test_web_app().await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+
+        let response = app
+            .router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard/host-metrics")
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("host metrics json response");
+
+        assert!(payload["cpu"]["percent"].is_number());
+        assert!(payload["memory"]["detail"].is_string());
+        assert!(payload["disk"]["mount_point"].is_string());
+        assert!(payload["disk_rate"]["detail"].is_string());
+        assert!(payload["disk_rate"]["utilization_label"].is_string());
+        assert!(payload["network_rate"]["detail"].is_string());
+    }
+
+    #[tokio::test]
     async fn login_page_renders_session_notice() {
         let response = test_app()
             .await
@@ -11903,109 +9299,29 @@ mod tests {
             spec["components"]["securitySchemes"]["BearerAuth"]["scheme"],
             "bearer"
         );
+        let paths = spec["paths"].as_object().expect("paths object");
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains_key("/api/v1/services/{service_key}/packages"));
         assert_eq!(
             spec["paths"]["/api/v1/services/{service_key}/packages"]["post"]["operationId"],
             "uploadServicePackage"
         );
+        assert!(spec["paths"]["/api/v1/apps"].is_null());
+        assert!(spec["paths"]["/api/v1/tasks"].is_null());
+        assert!(spec["paths"]["/api/v1/services/{service_key}/deploy"].is_null());
         assert_eq!(
-            spec["paths"]["/api/v1/services/{service_key}/app"]["get"]["operationId"],
-            "getServiceApp"
+            spec["components"]["schemas"]["UploadServicePackageRequest"]["properties"]["package_file"]
+                ["format"],
+            "binary"
         );
         assert_eq!(
-            spec["paths"]["/api/v1/services/{service_key}/config"]["put"]["operationId"],
-            "updateServiceConfig"
-        );
-        assert!(spec["paths"]["/api/v1/services/{service_key}/source"].is_null());
-        assert!(spec["paths"]["/api/v1/services/{service_key}/source/publish"].is_null());
-        assert_eq!(
-            spec["paths"]["/api/v1/services/{service_key}/deploy"]["post"]["operationId"],
-            "deployService"
-        );
-        assert_eq!(
-            spec["paths"]["/api/v1/services/{service_key}/deploy"]["post"]["responses"]["200"]["content"]
-                ["application/json"]["schema"]["$ref"],
-            "#/components/schemas/DeployTaskResponse"
-        );
-        assert_eq!(
-            spec["paths"]["/api/v1/services/{service_key}/enable"]["post"]["operationId"],
-            "enableService"
-        );
-        assert_eq!(
-            spec["paths"]["/api/v1/services/{service_key}/disable"]["post"]["operationId"],
-            "disableService"
-        );
-        assert_eq!(
-            spec["components"]["schemas"]["AppEnableResponse"]["properties"]["data"]["properties"]
-                ["management_status"]["enum"][1],
-            "disabled"
-        );
-        assert_eq!(
-            spec["components"]["schemas"]["ServiceAppResponse"]["properties"]["data"]["properties"]
-                ["package_upload_url"]["type"],
-            "string"
-        );
-        assert_eq!(
-            spec["components"]["schemas"]["ServiceAppResponse"]["properties"]["data"]["properties"]
-                ["app"]["properties"]["management_status"]["enum"][0],
-            "enabled"
-        );
-        assert_eq!(
-            spec["components"]["schemas"]["ServiceAppResponse"]["properties"]["data"]["properties"]
-                ["app"]["properties"]["runtime_status"]["enum"][1],
-            "healthy"
-        );
-        assert_eq!(
-            spec["components"]["schemas"]["ServiceAppResponse"]["properties"]["data"]["properties"]
-                ["app"]["properties"]["environment"]["enum"][1],
-            "test"
-        );
-        assert_eq!(
-            spec["components"]["schemas"]["UpdateAppConfigRequest"]["properties"]["health_check_kind"]
-                ["default"],
-            "none"
-        );
-        assert_eq!(
-            spec["components"]["schemas"]["UpdateAppConfigRequest"]["properties"]["health_check_kind"]
-                ["enum"][3],
-            "http"
-        );
-        assert_eq!(
-            spec["components"]["schemas"]["CreateAppRequest"]["properties"]["target_node_keys"]["description"],
-            "目标节点标识，例：local、prod-1。推荐 AI 和脚本优先使用"
-        );
-        assert_eq!(
-            spec["components"]["schemas"]["CreateAppRequest"]["properties"]["environment"]["enum"]
-                [0],
-            "production"
-        );
-        assert_eq!(
-            spec["components"]["schemas"]["CreateAppRequest"]["properties"]["environment"]["default"],
-            "test"
-        );
-        assert_eq!(
-            spec["components"]["schemas"]["UploadServicePackageRequest"]["properties"]["versionCode"]
-                ["type"],
-            "integer"
-        );
-        assert_eq!(
-            spec["components"]["schemas"]["UploadServicePackageRequest"]["properties"]["publishedAt"]
-                ["type"],
-            "string"
-        );
-        assert!(spec["components"]["schemas"]["SourceConfigRequest"].is_null());
-        assert!(spec["components"]["schemas"]["PublishSourceRequest"].is_null());
-        assert_eq!(
-            spec["components"]["schemas"]["PackageError"]["properties"]["code"]["enum"][0],
-            "INVALID_PACKAGE_VERSION_NAME"
-        );
-        assert_eq!(
-            spec["components"]["schemas"]["TaskStep"]["properties"]["status"]["enum"][3],
-            "failed"
-        );
-        assert_eq!(
-            spec["components"]["schemas"]["TaskLog"]["properties"]["step_id"]["type"][1],
+            spec["components"]["schemas"]["UploadServicePackageResponse"]["properties"]["data"]["properties"]
+                ["task_id"]["type"][1],
             "null"
         );
+        assert!(spec["components"]["schemas"]["CreateAppRequest"].is_null());
+        assert!(spec["components"]["schemas"]["DeployAppRequest"].is_null());
+        assert!(spec["components"]["schemas"]["TaskDetailResponse"].is_null());
 
         let response = app
             .oneshot(
@@ -12022,23 +9338,15 @@ mod tests {
             .expect("read body");
         let html = String::from_utf8_lossy(&body);
         assert!(html.contains("Easy Deploy OpenAPI"));
-        assert!(html.contains("AI 执行总规则"));
-        assert!(html.contains("推荐流程：二进制服务"));
-        assert!(html.contains("推荐流程：Compose 服务"));
-        assert!(html.contains("INVALID_PACKAGE_VERSION_NAME"));
-        assert!(html.contains("上传版本包并自动部署"));
-        assert!(html.contains("轮询任务和读取步骤日志"));
-        assert!(html.contains("versionCode"));
-        assert!(html.contains("publishedAt"));
-        assert!(html.contains("environment"));
-        assert!(html.contains("production"));
+        assert!(html.contains("版本包投递接口"));
+        assert!(html.contains("后台页面配置"));
+        assert!(html.contains("/api/v1/services/{service_key}/packages"));
         assert!(html.contains("{service_key}_version_{x_y_z}.tar.gz"));
-        assert!(html.contains("logs.step_id"));
-        assert!(html.contains("/api/v1/services/{service_key}/app"));
-        assert!(html.contains("/api/v1/services/{service_key}/config"));
-        assert!(!html.contains("/api/v1/services/{service_key}/source"));
-        assert!(!html.contains("/api/v1/services/{key}/source/publish"));
-        assert!(html.contains("/api/v1/services/{service_key}/deploy"));
+        assert!(html.contains("package_file"));
+        assert!(html.contains("source"));
+        assert!(!html.contains("/api/v1/apps"));
+        assert!(!html.contains("/api/v1/tasks"));
+        assert!(!html.contains("/api/v1/services/{service_key}/deploy"));
         assert!(!html.contains("Git 源码发布"));
     }
 
@@ -12048,7 +9356,8 @@ mod tests {
             .await
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/apps")
+                    .method("POST")
+                    .uri("/api/v1/services/orders-api-prod/packages")
                     .body(Body::empty())
                     .expect("build request"),
             )
@@ -12063,30 +9372,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_token_can_call_v1_apps() {
-        let (app, auth) = test_app_with_auth().await;
-        let token = super_admin_api_token(&auth, "test-suite").await;
+    async fn api_token_can_call_package_upload_api() {
+        let app = test_web_app().await;
+        create_compose_test_app(&app.apps, "orders-api-prod").await;
+        let token = super_admin_api_token(&app.auth, "test-suite").await;
+        let boundary = "easy-deploy-test-boundary";
+        let body = multipart_body(
+            boundary,
+            "package_file",
+            "orders-api-prod-v1.2.3.tar.gz",
+            "binary data",
+            &[],
+        );
 
         let response = app
+            .router
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/apps")
+                    .method("POST")
+                    .uri("/api/v1/services/orders-api-prod/packages")
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(Body::empty())
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
                     .expect("build request"),
             )
             .await
             .expect("send request");
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read body");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&body).expect("api apps json response");
-        assert!(payload["data"].is_array());
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-        let listed = auth.list_api_tokens().await.expect("list api tokens");
+        let listed = app.auth.list_api_tokens().await.expect("list api tokens");
         assert_eq!(listed[0].source, "test-suite");
         assert!(listed[0].last_used_at.is_some());
     }
@@ -12198,7 +9516,7 @@ mod tests {
     #[tokio::test]
     async fn api_v1_package_upload_requires_artifact_permission() {
         let app = test_web_app().await;
-        create_binary_test_app(&app.apps, "orders-api-prod").await;
+        create_compose_test_app(&app.apps, "orders-api-prod").await;
         let login = app
             .auth
             .bootstrap_init(LoginInput {
@@ -12275,313 +9593,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_v1_create_binary_app_accepts_node_keys_and_empty_initial_release() {
+    async fn api_v1_control_endpoints_are_not_routed() {
         let app = test_web_app().await;
-        let token = super_admin_api_token(&app.auth, "ai-create-app").await;
+        let token = super_admin_api_token(&app.auth, "control-api-removed").await;
 
-        let response = app
-            .router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/apps")
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "app_key": "orders-api-prod",
-                            "name": "订单服务-生产",
-                            "environment": "production",
-                            "app_type": "binary",
-                            "target_node_keys": ["local"],
-                            "binary_exec_args": "--port 8080",
-                            "env_content": "RUST_LOG=info\n"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("build request"),
-            )
-            .await
-            .expect("send request");
+        let cases = [
+            ("GET", "/api/v1/apps"),
+            ("POST", "/api/v1/apps"),
+            ("GET", "/api/v1/services/orders-api-prod/app"),
+            ("PUT", "/api/v1/services/orders-api-prod/config"),
+            ("POST", "/api/v1/services/orders-api-prod/deploy"),
+            ("GET", "/api/v1/tasks/1"),
+        ];
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read body");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&body).expect("create app json response");
-        let app_id = payload["data"]["id"].as_i64().expect("app id");
-        assert_eq!(payload["data"]["environment"], "production");
-
-        let detail = app.apps.app_detail(app_id).await.expect("app detail");
-        assert_eq!(detail.app.app_key, "orders-api-prod");
-        assert_eq!(detail.app.environment, "production");
-        assert_eq!(detail.app.status, "ready");
-        assert_eq!(detail.binary_config.artifact_version, "");
-        assert_eq!(detail.binary_config.artifact_path, "");
-        assert_eq!(
-            detail.binary_config.unit_name,
-            "easy-deploy-orders-api-prod.service"
-        );
-        assert_eq!(detail.binary_config.exec_args, "--port 8080");
-        assert_eq!(detail.target_nodes[0].node_key, "local");
-    }
-
-    #[tokio::test]
-    async fn api_v1_service_enable_disable_updates_management_state() {
-        let app = test_web_app().await;
-        let app_id = create_binary_test_app(&app.apps, "orders-api-prod").await;
-        let token = super_admin_api_token(&app.auth, "ai-enable-disable").await;
-
-        let disable_response = app
-            .router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/services/orders-api-prod/disable")
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .expect("build request"),
-            )
-            .await
-            .expect("send disable request");
-        assert_eq!(disable_response.status(), StatusCode::OK);
-        let body = to_bytes(disable_response.into_body(), usize::MAX)
-            .await
-            .expect("read disable body");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&body).expect("disable json response");
-        assert_eq!(payload["data"]["app_id"], app_id);
-        assert_eq!(payload["data"]["enabled"], false);
-        assert_eq!(payload["data"]["management_status"], "disabled");
-        assert_eq!(
-            app.apps
-                .app_detail(app_id)
+        for (method, uri) in cases {
+            let response = app
+                .router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .expect("build request"),
+                )
                 .await
-                .expect("disabled app detail")
-                .app
-                .status,
-            "disabled"
-        );
-
-        let enable_response = app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/services/orders-api-prod/enable")
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .expect("build request"),
-            )
-            .await
-            .expect("send enable request");
-        assert_eq!(enable_response.status(), StatusCode::OK);
-        let body = to_bytes(enable_response.into_body(), usize::MAX)
-            .await
-            .expect("read enable body");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&body).expect("enable json response");
-        assert_eq!(payload["data"]["enabled"], true);
-        assert_eq!(payload["data"]["previous_enabled"], false);
-        assert_eq!(payload["data"]["management_status"], "enabled");
-        assert_eq!(
-            app.apps
-                .app_detail(app_id)
-                .await
-                .expect("enabled app detail")
-                .app
-                .status,
-            "ready"
-        );
+                .expect("send request");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        }
     }
-
-    #[tokio::test]
-    async fn api_v1_service_app_detail_returns_app_by_service_key() {
-        let app = test_web_app().await;
-        let app_id = create_binary_test_app(&app.apps, "orders-api-prod").await;
-        let token = super_admin_api_token(&app.auth, "ai-read-app").await;
-
-        let response = app
-            .router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/services/orders-api-prod/app")
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .expect("build request"),
-            )
-            .await
-            .expect("send request");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read body");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&body).expect("service app json response");
-        assert_eq!(payload["data"]["service_key"], "orders-api-prod");
-        assert_eq!(payload["data"]["app"]["id"], app_id);
-        assert_eq!(payload["data"]["app"]["app_key"], "orders-api-prod");
-        assert_eq!(payload["data"]["app"]["environment"], "test");
-        assert_eq!(payload["data"]["app"]["status"], "ready");
-        assert_eq!(payload["data"]["app"]["enabled"], true);
-        assert_eq!(payload["data"]["app"]["management_status"], "enabled");
-        assert_eq!(payload["data"]["app"]["runtime_status"], "unknown");
-        assert!(
-            payload["data"]["app"]["runtime_summary"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("未知")
-        );
-        assert_eq!(
-            payload["data"]["package_upload_url"],
-            "/api/v1/services/orders-api-prod/packages"
-        );
-        assert_eq!(
-            payload["data"]["deploy_url"],
-            format!("/api/v1/apps/{app_id}/deploy")
-        );
-        assert_eq!(
-            payload["data"]["binary_config"]["unit_name"],
-            "easy-deploy-orders-api-prod.service"
-        );
-        assert_eq!(
-            payload["data"]["current_release_version"],
-            payload["data"]["binary_config"]["artifact_version"]
-        );
-        assert_eq!(payload["data"]["target_nodes"][0]["node_key"], "local");
-    }
-
-    #[tokio::test]
-    async fn api_v1_service_app_detail_returns_404_for_missing_service() {
-        let app = test_web_app().await;
-        let token = super_admin_api_token(&app.auth, "ai-read-missing-app").await;
-
-        let response = app
-            .router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/services/missing-service/app")
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .expect("build request"),
-            )
-            .await
-            .expect("send request");
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read body");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&body).expect("service app error json response");
-        assert_eq!(payload["error"], "服务标识不存在");
-    }
-
-    #[tokio::test]
-    async fn api_v1_update_service_config_records_config_revision() {
-        let app = test_web_app().await;
-        let app_id = create_binary_test_app(&app.apps, "orders-api-prod").await;
-        let token = super_admin_api_token(&app.auth, "ai-update-config").await;
-
-        let response = app
-            .router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/api/v1/services/orders-api-prod/config")
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "env_content": "RUST_LOG=debug\nFEATURE_FLAG=true\n",
-                            "binary_artifact_version": "v1.0.0",
-                            "binary_artifact_path": "/opt/easy-deploy/apps/orders-api-prod/releases/v1.0.0/orders-api-prod",
-                            "binary_exec_args": "--port 9090",
-                            "binary_service_user": "deploy",
-                            "binary_unit_name": "easy-deploy-orders-api-prod.service",
-                            "binary_release_strategy": "restart",
-                            "binary_active_slot": "blue",
-                            "binary_proxy_kind": "none",
-                            "health_check_kind": "tcp",
-                            "health_endpoint": "127.0.0.1:9090",
-                            "health_timeout_secs": 5,
-                            "health_expected_status": 200
-                        })
-                        .to_string(),
-                    ))
-                    .expect("build request"),
-            )
-            .await
-            .expect("send request");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read body");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&body).expect("update config json response");
-        assert_eq!(payload["data"]["app_id"], app_id);
-        assert_eq!(payload["data"]["service_key"], "orders-api-prod");
-        assert_eq!(
-            payload["data"]["package_upload_url"],
-            "/api/v1/services/orders-api-prod/packages"
-        );
-        assert!(
-            payload["data"]["config_revision_no"]
-                .as_i64()
-                .unwrap_or_default()
-                > 0
-        );
-
-        let detail = app.apps.app_detail(app_id).await.expect("app detail");
-        assert!(detail.env_content.contains("RUST_LOG=debug"));
-        assert!(detail.env_content.contains("FEATURE_FLAG=true"));
-        assert_eq!(detail.binary_config.exec_args, "--port 9090");
-        assert_eq!(detail.health_check.kind.as_str(), "tcp");
-        assert_eq!(detail.health_check.endpoint, "127.0.0.1:9090");
-    }
-
-    #[tokio::test]
-    async fn api_v1_deploy_service_creates_task_by_service_key() {
-        let app = test_web_app().await;
-        let app_id = create_binary_test_app(&app.apps, "orders-api-prod").await;
-        let token = super_admin_api_token(&app.auth, "ai-deploy-service").await;
-
-        let response = app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/services/orders-api-prod/deploy")
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({ "action": "binary_restart" }).to_string(),
-                    ))
-                    .expect("build request"),
-            )
-            .await
-            .expect("send request");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read body");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&body).expect("deploy service json response");
-        assert_eq!(payload["data"]["app_id"], app_id);
-        assert!(payload["data"]["task_id"].as_i64().unwrap_or_default() > 0);
-    }
-
     #[tokio::test]
     async fn api_v1_package_upload_rejects_invalid_file_name() {
         let app = test_web_app().await;
-        create_binary_test_app(&app.apps, "orders-api-prod").await;
+        create_compose_test_app(&app.apps, "orders-api-prod").await;
         let token = super_admin_api_token(&app.auth, "package-test").await;
         let boundary = "easy-deploy-test-boundary";
         let body = multipart_body(
@@ -12616,14 +9661,14 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_slice(&body).expect("package error json response");
         assert_eq!(payload["code"], "INVALID_PACKAGE_VERSION_NAME");
-        assert_eq!(payload["expected_pattern"], BINARY_PACKAGE_PATTERN);
-        assert_eq!(payload["example"], BINARY_PACKAGE_EXAMPLE);
+        assert_eq!(payload["expected_pattern"], RELEASE_PACKAGE_PATTERN);
+        assert_eq!(payload["example"], RELEASE_PACKAGE_EXAMPLE);
     }
 
     #[tokio::test]
     async fn api_v1_package_upload_records_release_and_config_revision() {
         let app = test_web_app().await;
-        let app_id = create_binary_test_app(&app.apps, "orders-api-prod").await;
+        let app_id = create_compose_test_app(&app.apps, "orders-api-prod").await;
         let token = super_admin_api_token(&app.auth, "package-test").await;
         let boundary = "easy-deploy-test-boundary";
         let body = multipart_body(
@@ -12656,10 +9701,11 @@ mod tests {
             .await
             .expect("send request");
 
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read body");
+        assert_eq!(status, StatusCode::OK);
         let payload: serde_json::Value =
             serde_json::from_slice(&body).expect("package upload json response");
         assert_eq!(payload["data"]["app_id"], app_id);
@@ -12667,7 +9713,9 @@ mod tests {
         assert_eq!(payload["data"]["release_version"], "v1.2.3");
         assert_eq!(payload["data"]["versionCode"], 1002003);
         assert_eq!(payload["data"]["publishedAt"], "2026-06-09T10:00:00Z");
-        assert_eq!(payload["data"]["auto_deploy"], false);
+        assert_eq!(payload["data"]["queued"], true);
+        assert!(payload["data"]["release_id"].as_i64().unwrap_or_default() > 0);
+        assert!(payload["data"]["queue_id"].as_i64().unwrap_or_default() > 0);
         assert!(
             payload["data"]["config_revision_no"]
                 .as_i64()
@@ -12675,10 +9723,47 @@ mod tests {
                 > 0
         );
         assert_eq!(payload["data"]["task_id"], serde_json::Value::Null);
+        let releases = app
+            .apps
+            .list_app_releases()
+            .await
+            .expect("list app releases");
+        let release = releases
+            .into_iter()
+            .find(|item| item.app_id == app_id && item.version == "v1.2.3")
+            .expect("release item");
+        assert_eq!(release.id, payload["data"]["release_id"]);
+        assert!(
+            matches!(
+                release.status.as_str(),
+                "queued" | "deploying" | "deployed" | "failed"
+            ),
+            "unexpected release status: {}",
+            release.status
+        );
+        let queue_items = app
+            .apps
+            .list_app_release_queue()
+            .await
+            .expect("list release queue");
+        let queue_item = queue_items
+            .into_iter()
+            .find(|item| item.app_id == app_id && item.version == "v1.2.3")
+            .expect("queue item");
+        assert_eq!(queue_item.id, payload["data"]["queue_id"]);
+        assert_eq!(queue_item.release_id, release.id);
+        assert!(
+            matches!(
+                queue_item.status.as_str(),
+                "queued" | "running" | "success" | "failed"
+            ),
+            "unexpected queue status: {}",
+            queue_item.status
+        );
     }
 
     #[tokio::test]
-    async fn app_detail_can_deploy_uploaded_binary_release() {
+    async fn app_detail_hides_legacy_binary_release_controls() {
         let app = test_web_app().await;
         let app_id = create_binary_test_app(&app.apps, "orders-api-prod").await;
         app.apps
@@ -12734,45 +9819,19 @@ mod tests {
             .await
             .expect("read body");
         let html = String::from_utf8_lossy(&body);
-        assert!(html.contains("部署此版本"));
-        assert!(html.contains("versionCode 1002003"));
+        assert!(html.contains("运行配置"));
+        assert!(!html.contains("versionCode 1002003"));
         assert!(!html.contains(&format!("/apps/{app_id}/binary/upload")));
-        assert!(html.contains("发布时间 2026-06-09T10:00:00Z"));
-        assert!(html.contains(&format!(
-            "/apps/{app_id}/binary/releases/{artifact_id}/deploy"
-        )));
-
-        let deploy_response = app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!(
-                        "/apps/{app_id}/binary/releases/{artifact_id}/deploy"
-                    ))
-                    .header(header::COOKIE, &cookie_value)
-                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(format!(
-                        "csrf_token={}",
-                        login.session.csrf_token
-                    )))
-                    .expect("build request"),
-            )
-            .await
-            .expect("send request");
-        assert_eq!(deploy_response.status(), StatusCode::SEE_OTHER);
-        let location = deploy_response
-            .headers()
-            .get(header::LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .expect("redirect location");
-        assert!(location.starts_with("/tasks/"));
+        assert!(!html.contains("二进制配置"));
+        assert!(!html.contains("systemd 操作"));
+        assert!(!html.contains("发布时间 2026-06-09T10:00:00Z"));
+        assert!(artifact_id > 0);
     }
 
     #[tokio::test]
-    async fn artifacts_page_uploads_binary_package_for_selected_app() {
+    async fn artifacts_page_uploads_release_package_for_selected_app() {
         let app = test_web_app().await;
-        let app_id = create_binary_test_app(&app.apps, "orders-api-prod").await;
+        let app_id = create_compose_test_app(&app.apps, "orders-api-prod").await;
         let login = app
             .auth
             .bootstrap_init(LoginInput {
@@ -12844,21 +9903,175 @@ mod tests {
         assert_eq!(upload_response.status(), StatusCode::SEE_OTHER);
         assert_eq!(
             upload_response.headers().get(header::LOCATION),
-            Some(
-                &"/artifacts?status=active&source=upload"
-                    .parse()
-                    .expect("valid header")
-            )
+            Some(&"/artifacts?source=upload".parse().expect("valid header"))
         );
 
-        let detail = app.apps.app_detail(app_id).await.expect("app detail");
-        let release = detail
-            .binary_releases
+        let release = app
+            .apps
+            .list_app_releases()
+            .await
+            .expect("list releases")
             .into_iter()
-            .find(|release| release.version == "v1.3.0")
+            .find(|release| release.app_id == app_id && release.version == "v1.3.0")
             .expect("uploaded release");
         assert_eq!(release.version_code, 1_003_000);
-        assert_eq!(release.metadata_value("source"), "upload");
+        assert_eq!(
+            artifact_metadata_value(&release.metadata, "source"),
+            "package_upload"
+        );
+        assert_eq!(
+            artifact_metadata_value(&release.metadata, "source_detail"),
+            "upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_publish_mode_keeps_uploaded_release_received() {
+        let app = test_web_app().await;
+        let app_id = create_compose_test_app_with_mode(&app.apps, "orders-api-manual", false).await;
+
+        let result = app
+            .apps
+            .upload_release_package(UploadReleasePackageInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: Some(1_002_003),
+                published_at: "2026-06-09T10:00:00Z".to_owned(),
+                file_name: "orders-api-manual".to_owned(),
+                bytes: b"manual release".to_vec(),
+                entry_file: String::new(),
+                source: "local-script".to_owned(),
+            })
+            .await
+            .expect("upload release package");
+
+        assert!(!result.queued);
+        let releases = app.apps.list_app_releases().await.expect("list releases");
+        let release = releases
+            .into_iter()
+            .find(|item| item.id == result.release_id)
+            .expect("release");
+        assert_eq!(release.status, "received");
+        assert_eq!(release.source, "openapi");
+        assert_eq!(
+            artifact_metadata_value(&release.metadata, "source"),
+            "package_upload"
+        );
+        assert_eq!(
+            artifact_metadata_value(&release.metadata, "source_detail"),
+            "local-script"
+        );
+        let queue = app.apps.list_app_release_queue().await.expect("list queue");
+        assert!(
+            queue
+                .into_iter()
+                .all(|item| item.release_id != result.release_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_release_accepts_datetime_local_value() {
+        let app = test_web_app().await;
+        let app_id =
+            create_compose_test_app_with_mode(&app.apps, "orders-api-schedule", false).await;
+        let result = app
+            .apps
+            .upload_release_package(UploadReleasePackageInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: Some(1_002_003),
+                published_at: "2026-06-09T10:00:00Z".to_owned(),
+                file_name: "orders-api-schedule".to_owned(),
+                bytes: b"scheduled release".to_vec(),
+                entry_file: String::new(),
+                source: "upload".to_owned(),
+            })
+            .await
+            .expect("upload release package");
+
+        let scheduled = app
+            .apps
+            .schedule_release_publish(result.release_id, "2026-06-23T15:30")
+            .await
+            .expect("schedule release");
+
+        assert_eq!(scheduled, "2026-06-23T07:30:00Z");
+        let releases = app.apps.list_app_releases().await.expect("list releases");
+        let release = releases
+            .into_iter()
+            .find(|item| item.id == result.release_id)
+            .expect("release");
+        assert_eq!(release.status, "queued");
+        assert_eq!(
+            release.scheduled_publish_at.as_deref(),
+            Some("2026-06-23T07:30:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn artifacts_page_filters_and_formats_release_center_rows() {
+        let app = test_web_app().await;
+        let app_id = create_compose_test_app_with_mode(&app.apps, "orders-api-center", false).await;
+        app.apps
+            .upload_release_package(UploadReleasePackageInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: Some(1_002_003),
+                published_at: "2026-06-09T10:00:00Z".to_owned(),
+                file_name: "orders-api-center".to_owned(),
+                bytes: b"release center".to_vec(),
+                entry_file: String::new(),
+                source: "local-script".to_owned(),
+            })
+            .await
+            .expect("upload release package");
+        let release = app
+            .apps
+            .list_app_releases()
+            .await
+            .expect("list releases")
+            .into_iter()
+            .find(|item| item.app_id == app_id && item.version == "v1.2.3")
+            .expect("release");
+        app.apps
+            .schedule_release_publish(release.id, "2026-06-23T15:30")
+            .await
+            .expect("schedule release");
+
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/artifacts?status=queued&source=openapi")
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("OpenAPI"));
+        assert!(html.contains("2026-06-09 18:00:00"));
+        assert!(html.contains("计划 2026-06-23 15:30:00"));
+        assert!(html.contains("action=\"/artifacts/schedule/cancel\""));
     }
 
     #[tokio::test]
@@ -12968,6 +10181,9 @@ mod tests {
             app_type: "binary".to_owned(),
             deploy_mode: "binary".to_owned(),
             deploy_strategy: "rolling_stop_on_failure".to_owned(),
+            release_source: "package_upload".to_owned(),
+            compose_strategy: "recreate".to_owned(),
+            auto_queue_release: 1,
             work_dir: "/opt/easy-deploy/apps/orders-api".to_owned(),
             status: "ready".to_owned(),
             runtime_status: "healthy".to_owned(),
@@ -13045,23 +10261,13 @@ mod tests {
         };
 
         let missing = node_capability_guides(&node);
-        assert_eq!(missing.len(), 4);
+        assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].title, "安装 Docker Engine");
         assert!(
             missing[0]
                 .command
                 .contains("ssh -p 22 -i /tmp/easy-deploy/id_ed25519 -o IdentitiesOnly=yes deploy@10.0.2.11 curl -fsSL https://get.docker.com")
         );
-        assert_eq!(missing[1].title, "确认 systemd 可用");
-        assert!(
-            missing[1]
-                .command
-                .contains("ssh -p 22 -i /tmp/easy-deploy/id_ed25519 -o IdentitiesOnly=yes deploy@10.0.2.11 systemctl --version")
-        );
-        assert_eq!(missing[2].title, "安装 Caddy");
-        assert!(missing[2].command.contains("caddy"));
-        assert_eq!(missing[3].title, "安装 Nginx");
-        assert!(missing[3].command.contains("nginx"));
 
         node.docker_available = 1;
         node.last_docker_version = Some("Docker version 27.0.2".to_owned());
@@ -13081,6 +10287,7 @@ mod tests {
         let ready = node_capability_guides(&node);
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].title, "节点能力已就绪");
+        assert_eq!(ready[0].verify, "可以继续作为 Compose 部署目标使用");
         assert_eq!(
             ready[0].command,
             "ssh -p 22 -i /tmp/easy-deploy/id_ed25519 -o IdentitiesOnly=yes deploy@10.0.2.11 docker compose version"

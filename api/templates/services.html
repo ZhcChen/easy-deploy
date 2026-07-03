@@ -14,11 +14,6 @@
     <strong>{{ compose_count }}</strong>
     <p>解析 compose.yaml</p>
   </article>
-  <article class="summary-card tone-neutral">
-    <span>二进制运行项</span>
-    <strong>{{ binary_count }}</strong>
-    <p>systemd 管理</p>
-  </article>
 </section>
 
 <section class="panel" aria-labelledby="services-title">
@@ -29,14 +24,6 @@
     </div>
   </div>
   <form class="filter-form services-filter-form" method="get" action="/services">
-    <label>
-      类型
-      <select name="kind">
-        <option value=""{% if selected_kind == "" %} selected{% endif %}>全部类型</option>
-        <option value="compose"{% if selected_kind == "compose" %} selected{% endif %}>Compose</option>
-        <option value="binary"{% if selected_kind == "binary" %} selected{% endif %}>二进制</option>
-      </select>
-    </label>
     <label>
       运行状态
       <select name="status">

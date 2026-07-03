@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 pub const META_DIR_NAME: &str = ".easy-deploy";
@@ -7,6 +8,12 @@ pub const COMPOSE_FILE_NAME: &str = "compose.yaml";
 pub const ENV_FILE_NAME: &str = ".env";
 pub const APP_META_FILE_NAME: &str = "app.yaml";
 pub const DEPLOY_SCRIPT_FILE_NAME: &str = "deploy.sh";
+pub const SCRIPTS_DIR_NAME: &str = "scripts";
+pub const PRE_DEPLOY_SCRIPT_FILE_NAME: &str = "pre_deploy.sh";
+pub const DEPLOY_STAGE_SCRIPT_FILE_NAME: &str = "deploy.sh";
+pub const POST_DEPLOY_SCRIPT_FILE_NAME: &str = "post_deploy.sh";
+pub const SWITCH_TRAFFIC_SCRIPT_FILE_NAME: &str = "switch_traffic.sh";
+pub const CLEANUP_SCRIPT_FILE_NAME: &str = "cleanup.sh";
 pub const RELEASES_DIR_NAME: &str = "releases";
 pub const CURRENT_RELEASE_FILE_NAME: &str = "current";
 pub const SYSTEMD_DIR_NAME: &str = "systemd";
@@ -53,6 +60,7 @@ pub struct AppRuntimeConfig {
     pub target_nodes: Vec<TargetNodeMetadata>,
     pub compose_content: String,
     pub env_content: String,
+    pub deploy_scripts: DeployScriptSet,
     pub binary: Option<BinaryRuntimeMetadata>,
 }
 
@@ -105,6 +113,39 @@ pub struct BinaryRuntimeConfig {
     pub env_content: String,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeployScriptSet {
+    #[serde(default)]
+    pub pre_deploy: String,
+    #[serde(default)]
+    pub deploy: String,
+    #[serde(default)]
+    pub post_deploy: String,
+    #[serde(default)]
+    pub switch_traffic: String,
+    #[serde(default)]
+    pub cleanup: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReleaseRuntimeMetadata {
+    pub app_key: String,
+    pub app_id: i64,
+    pub app_name: String,
+    pub release_version: String,
+    pub version_code: i64,
+    pub package_name: String,
+    pub package_path: String,
+    pub extract_dir: String,
+    pub checksum_sha256: String,
+    pub size_bytes: u64,
+    pub published_at: String,
+    pub received_at: String,
+    pub source: String,
+    pub config_snapshot_id: Option<i64>,
+    pub config_revision_no: Option<i64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct AppRuntimeWriteResult {
     pub root_dir: PathBuf,
@@ -116,6 +157,7 @@ pub struct AppRuntimeFiles {
     pub root_dir: PathBuf,
     pub compose_content: String,
     pub env_content: String,
+    pub deploy_scripts: DeployScriptSet,
     pub metadata_content: String,
 }
 
@@ -142,6 +184,19 @@ pub struct BinaryRuntimeFiles {
 #[derive(Clone, Debug)]
 pub struct BinaryRuntimeWriteResult {
     pub files: BinaryRuntimeFiles,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReleaseRuntimeWriteResult {
+    pub release_dir: PathBuf,
+    pub release_file: PathBuf,
+    pub content: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CurrentReleaseWriteResult {
+    pub current_file: PathBuf,
+    pub content: String,
 }
 
 impl RuntimeFs {
@@ -174,6 +229,7 @@ impl RuntimeFs {
             "",
         )
         .await?;
+        write_deploy_scripts(&meta_dir, &config.deploy_scripts).await?;
 
         let metadata_content = render_app_metadata(&config, &root_dir);
         write_file(meta_dir.join(APP_META_FILE_NAME), &metadata_content).await?;
@@ -190,10 +246,12 @@ impl RuntimeFs {
         let env_content = read_optional_file(root_dir.join(ENV_FILE_NAME)).await?;
         let metadata_content =
             read_optional_file(root_dir.join(META_DIR_NAME).join(APP_META_FILE_NAME)).await?;
+        let deploy_scripts = read_deploy_scripts(&root_dir.join(META_DIR_NAME)).await?;
         Ok(AppRuntimeFiles {
             root_dir,
             compose_content,
             env_content,
+            deploy_scripts,
             metadata_content,
         })
     }
@@ -205,6 +263,24 @@ impl RuntimeFs {
         env_content: &str,
         metadata_content: &str,
     ) -> Result<(), RuntimeFsError> {
+        self.save_app_runtime_files_with_scripts(
+            app_key,
+            compose_content,
+            env_content,
+            metadata_content,
+            &DeployScriptSet::default(),
+        )
+        .await
+    }
+
+    pub async fn save_app_runtime_files_with_scripts(
+        &self,
+        app_key: &str,
+        compose_content: &str,
+        env_content: &str,
+        metadata_content: &str,
+        deploy_scripts: &DeployScriptSet,
+    ) -> Result<(), RuntimeFsError> {
         let root_dir = self.app_root(app_key)?;
         let meta_dir = root_dir.join(META_DIR_NAME);
         fs::create_dir_all(&meta_dir)
@@ -212,6 +288,7 @@ impl RuntimeFs {
             .map_err(|err| io_error("创建应用配置目录", &root_dir, err))?;
         write_optional_file(root_dir.join(COMPOSE_FILE_NAME), compose_content).await?;
         write_file(root_dir.join(ENV_FILE_NAME), env_content).await?;
+        write_deploy_scripts(&meta_dir, deploy_scripts).await?;
         write_file(meta_dir.join(APP_META_FILE_NAME), metadata_content).await?;
         Ok(())
     }
@@ -239,7 +316,7 @@ impl RuntimeFs {
             render_blue_green_systemd_unit(&config, "blue", &paths.blue_env_relative);
         let green_unit_content =
             render_blue_green_systemd_unit(&config, "green", &paths.green_env_relative);
-        let current_content = render_current_release_pointer(&config, &paths);
+        let current_content = render_current_binary_release_pointer(&config, &paths);
 
         write_file(paths.unit_path.clone(), &unit_content).await?;
         write_file(paths.env_path.clone(), &env_content).await?;
@@ -279,17 +356,68 @@ impl RuntimeFs {
         file_name: &str,
         bytes: &[u8],
     ) -> Result<PathBuf, RuntimeFsError> {
+        self.save_release_package_file(app_key, artifact_version, file_name, bytes)
+            .await
+    }
+
+    pub async fn save_release_package_file(
+        &self,
+        app_key: &str,
+        release_version: &str,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<PathBuf, RuntimeFsError> {
         validate_key(app_key)?;
-        validate_release_id(artifact_version)?;
+        validate_release_id(release_version)?;
         let file_name = sanitize_file_name(file_name)?;
         let root_dir = self.app_root(app_key)?;
-        let release_dir = root_dir.join(RELEASES_DIR_NAME).join(artifact_version);
+        let release_dir = root_dir.join(RELEASES_DIR_NAME).join(release_version);
         fs::create_dir_all(&release_dir)
             .await
-            .map_err(|err| io_error("创建二进制发布目录", &release_dir, err))?;
+            .map_err(|err| io_error("创建发布版本目录", &release_dir, err))?;
         let artifact_path = release_dir.join(file_name);
         write_file(artifact_path.clone(), bytes).await?;
         Ok(artifact_path)
+    }
+
+    pub async fn save_release_runtime_metadata(
+        &self,
+        metadata: ReleaseRuntimeMetadata,
+    ) -> Result<ReleaseRuntimeWriteResult, RuntimeFsError> {
+        validate_key(&metadata.app_key)?;
+        validate_release_id(&metadata.release_version)?;
+        let root_dir = self.app_root(&metadata.app_key)?;
+        let release_dir = root_dir
+            .join(RELEASES_DIR_NAME)
+            .join(&metadata.release_version);
+        fs::create_dir_all(&release_dir)
+            .await
+            .map_err(|err| io_error("创建发布版本目录", &release_dir, err))?;
+        let release_file = release_dir.join(RELEASE_META_FILE_NAME);
+        let content = render_release_metadata(&metadata);
+        write_file(release_file.clone(), &content).await?;
+        Ok(ReleaseRuntimeWriteResult {
+            release_dir,
+            release_file,
+            content,
+        })
+    }
+
+    pub async fn mark_current_release(
+        &self,
+        app_key: &str,
+        release_version: &str,
+    ) -> Result<CurrentReleaseWriteResult, RuntimeFsError> {
+        validate_key(app_key)?;
+        validate_release_id(release_version)?;
+        let root_dir = self.app_root(app_key)?;
+        let current_file = root_dir.join(CURRENT_RELEASE_FILE_NAME);
+        let content = render_current_release_pointer(app_key, release_version);
+        write_file(current_file.clone(), &content).await?;
+        Ok(CurrentReleaseWriteResult {
+            current_file,
+            content,
+        })
     }
 
     pub async fn load_binary_runtime_files(
@@ -379,6 +507,50 @@ async fn read_optional_file(path: PathBuf) -> Result<String, RuntimeFsError> {
     }
 }
 
+async fn write_deploy_scripts(
+    meta_dir: &Path,
+    scripts: &DeployScriptSet,
+) -> Result<(), RuntimeFsError> {
+    let scripts_dir = meta_dir.join(SCRIPTS_DIR_NAME);
+    fs::create_dir_all(&scripts_dir)
+        .await
+        .map_err(|err| io_error("创建脚本目录", &scripts_dir, err))?;
+    write_optional_file(
+        scripts_dir.join(PRE_DEPLOY_SCRIPT_FILE_NAME),
+        &scripts.pre_deploy,
+    )
+    .await?;
+    write_optional_file(
+        scripts_dir.join(DEPLOY_STAGE_SCRIPT_FILE_NAME),
+        &scripts.deploy,
+    )
+    .await?;
+    write_optional_file(
+        scripts_dir.join(POST_DEPLOY_SCRIPT_FILE_NAME),
+        &scripts.post_deploy,
+    )
+    .await?;
+    write_optional_file(
+        scripts_dir.join(SWITCH_TRAFFIC_SCRIPT_FILE_NAME),
+        &scripts.switch_traffic,
+    )
+    .await?;
+    write_optional_file(scripts_dir.join(CLEANUP_SCRIPT_FILE_NAME), &scripts.cleanup).await?;
+    Ok(())
+}
+
+async fn read_deploy_scripts(meta_dir: &Path) -> Result<DeployScriptSet, RuntimeFsError> {
+    let scripts_dir = meta_dir.join(SCRIPTS_DIR_NAME);
+    Ok(DeployScriptSet {
+        pre_deploy: read_optional_file(scripts_dir.join(PRE_DEPLOY_SCRIPT_FILE_NAME)).await?,
+        deploy: read_optional_file(scripts_dir.join(DEPLOY_STAGE_SCRIPT_FILE_NAME)).await?,
+        post_deploy: read_optional_file(scripts_dir.join(POST_DEPLOY_SCRIPT_FILE_NAME)).await?,
+        switch_traffic: read_optional_file(scripts_dir.join(SWITCH_TRAFFIC_SCRIPT_FILE_NAME))
+            .await?,
+        cleanup: read_optional_file(scripts_dir.join(CLEANUP_SCRIPT_FILE_NAME)).await?,
+    })
+}
+
 fn render_app_metadata(config: &AppRuntimeConfig, root_dir: &Path) -> String {
     let mut output = String::new();
     output.push_str("app_id: ");
@@ -393,6 +565,37 @@ fn render_app_metadata(config: &AppRuntimeConfig, root_dir: &Path) -> String {
     push_yaml_string(&mut output, "deploy_strategy", &config.deploy_strategy);
     push_yaml_string(&mut output, "deploy_work_dir", &config.deploy_work_dir);
     push_yaml_string(&mut output, "runtime_root", &root_dir.to_string_lossy());
+    output.push_str("deploy_scripts:\n");
+    push_indented_yaml_string(
+        &mut output,
+        "pre_deploy",
+        script_metadata_path(PRE_DEPLOY_SCRIPT_FILE_NAME),
+        2,
+    );
+    push_indented_yaml_string(
+        &mut output,
+        "deploy",
+        script_metadata_path(DEPLOY_STAGE_SCRIPT_FILE_NAME),
+        2,
+    );
+    push_indented_yaml_string(
+        &mut output,
+        "post_deploy",
+        script_metadata_path(POST_DEPLOY_SCRIPT_FILE_NAME),
+        2,
+    );
+    push_indented_yaml_string(
+        &mut output,
+        "switch_traffic",
+        script_metadata_path(SWITCH_TRAFFIC_SCRIPT_FILE_NAME),
+        2,
+    );
+    push_indented_yaml_string(
+        &mut output,
+        "cleanup",
+        script_metadata_path(CLEANUP_SCRIPT_FILE_NAME),
+        2,
+    );
     output.push_str("target_nodes:\n");
     for node in &config.target_nodes {
         output.push_str("  - ");
@@ -446,6 +649,17 @@ fn render_app_metadata(config: &AppRuntimeConfig, root_dir: &Path) -> String {
         );
     }
     output
+}
+
+fn script_metadata_path(file_name: &str) -> &str {
+    match file_name {
+        PRE_DEPLOY_SCRIPT_FILE_NAME => ".easy-deploy/scripts/pre_deploy.sh",
+        DEPLOY_STAGE_SCRIPT_FILE_NAME => ".easy-deploy/scripts/deploy.sh",
+        POST_DEPLOY_SCRIPT_FILE_NAME => ".easy-deploy/scripts/post_deploy.sh",
+        SWITCH_TRAFFIC_SCRIPT_FILE_NAME => ".easy-deploy/scripts/switch_traffic.sh",
+        CLEANUP_SCRIPT_FILE_NAME => ".easy-deploy/scripts/cleanup.sh",
+        _ => "",
+    }
 }
 
 fn push_yaml_string(output: &mut String, key: &str, value: &str) {
@@ -593,13 +807,67 @@ fn render_binary_release_metadata(
     output
 }
 
-fn render_current_release_pointer(
+fn render_current_binary_release_pointer(
     config: &BinaryRuntimeConfig,
     paths: &BinaryRuntimePaths,
 ) -> String {
     let mut output = String::new();
     push_yaml_string(&mut output, "artifact_version", &config.artifact_version);
     push_yaml_string(&mut output, "release_file", &paths.release_relative);
+    output
+}
+
+fn render_release_metadata(metadata: &ReleaseRuntimeMetadata) -> String {
+    let mut output = String::new();
+    output.push_str("app_id: ");
+    output.push_str(&metadata.app_id.to_string());
+    output.push('\n');
+    push_yaml_string(&mut output, "app_key", &metadata.app_key);
+    push_yaml_string(&mut output, "app_name", &metadata.app_name);
+    push_yaml_string(&mut output, "release_version", &metadata.release_version);
+    output.push_str("version_code: ");
+    output.push_str(&metadata.version_code.to_string());
+    output.push('\n');
+    push_yaml_string(&mut output, "package_name", &metadata.package_name);
+    push_yaml_string(&mut output, "package_path", &metadata.package_path);
+    push_yaml_string(&mut output, "extract_dir", &metadata.extract_dir);
+    push_yaml_string(&mut output, "checksum_sha256", &metadata.checksum_sha256);
+    output.push_str("size_bytes: ");
+    output.push_str(&metadata.size_bytes.to_string());
+    output.push('\n');
+    push_yaml_string(&mut output, "published_at", &metadata.published_at);
+    push_yaml_string(&mut output, "received_at", &metadata.received_at);
+    push_yaml_string(&mut output, "source", &metadata.source);
+    if let Some(config_snapshot_id) = metadata.config_snapshot_id {
+        output.push_str("config_snapshot_id: ");
+        output.push_str(&config_snapshot_id.to_string());
+        output.push('\n');
+    }
+    if let Some(config_revision_no) = metadata.config_revision_no {
+        output.push_str("config_revision_no: ");
+        output.push_str(&config_revision_no.to_string());
+        output.push('\n');
+    }
+    push_yaml_string(
+        &mut output,
+        "release_file",
+        &format!(
+            "{RELEASES_DIR_NAME}/{}/{}",
+            metadata.release_version, RELEASE_META_FILE_NAME
+        ),
+    );
+    output
+}
+
+fn render_current_release_pointer(app_key: &str, release_version: &str) -> String {
+    let mut output = String::new();
+    push_yaml_string(&mut output, "app_key", app_key);
+    push_yaml_string(&mut output, "release_version", release_version);
+    push_yaml_string(
+        &mut output,
+        "release_file",
+        &format!("{RELEASES_DIR_NAME}/{release_version}/{RELEASE_META_FILE_NAME}"),
+    );
     output
 }
 
@@ -751,7 +1019,7 @@ fn validate_release_id(value: &str) -> Result<(), RuntimeFsError> {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
     {
         return Err(RuntimeFsError::InvalidInput(
-            "二进制发布版本仅支持字母、数字、短横线、下划线和点".to_owned(),
+            "发布版本仅支持字母、数字、短横线、下划线和点".to_owned(),
         ));
     }
     Ok(())
@@ -800,6 +1068,7 @@ fn io_error(action: &str, path: &Path, err: std::io::Error) -> RuntimeFsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn slot_exec_start_replaces_split_port_argument() {
@@ -818,5 +1087,125 @@ mod tests {
         let (_, args) = slot_exec_start("/opt/easy-deploy/worker", "--port=8080", 8080);
 
         assert_eq!(args, "--port=${PORT}");
+    }
+
+    #[tokio::test]
+    async fn save_release_runtime_metadata_writes_release_yaml() {
+        let data_dir = tempdir().expect("create temp data dir");
+        let runtime = RuntimeFs::new(data_dir.path());
+
+        let result = runtime
+            .save_release_runtime_metadata(ReleaseRuntimeMetadata {
+                app_key: "orders-api-prod".to_owned(),
+                app_id: 42,
+                app_name: "Orders API".to_owned(),
+                release_version: "v1.2.3".to_owned(),
+                version_code: 1_002_003,
+                package_name: "orders-api-prod_version_1_2_3.tar.gz".to_owned(),
+                package_path: "/opt/apps/orders/releases/v1.2.3/package.tar.gz".to_owned(),
+                extract_dir: "/opt/apps/orders/releases/v1.2.3".to_owned(),
+                checksum_sha256: "abc123".to_owned(),
+                size_bytes: 128,
+                published_at: "2026-06-23T00:00:00.000Z".to_owned(),
+                received_at: "2026-06-23T00:01:00.000Z".to_owned(),
+                source: "openapi".to_owned(),
+                config_snapshot_id: Some(7),
+                config_revision_no: Some(3),
+            })
+            .await
+            .expect("save release metadata");
+
+        assert!(result.release_file.is_file());
+        assert_eq!(
+            result.release_dir,
+            data_dir
+                .path()
+                .join("apps")
+                .join("orders-api-prod")
+                .join(RELEASES_DIR_NAME)
+                .join("v1.2.3")
+        );
+        assert!(result.content.contains("release_version: \"v1.2.3\""));
+        assert!(result.content.contains("version_code: 1002003"));
+        assert!(result.content.contains("config_revision_no: 3"));
+    }
+
+    #[tokio::test]
+    async fn save_app_config_persists_deploy_scripts() {
+        let data_dir = tempdir().expect("create temp data dir");
+        let runtime = RuntimeFs::new(data_dir.path());
+        let scripts = DeployScriptSet {
+            pre_deploy: "echo pre".to_owned(),
+            deploy: "docker compose up -d".to_owned(),
+            post_deploy: "echo post".to_owned(),
+            switch_traffic: "echo switch".to_owned(),
+            cleanup: "echo cleanup".to_owned(),
+        };
+
+        runtime
+            .save_app_config(AppRuntimeConfig {
+                app_key: "orders-api-prod".to_owned(),
+                app_id: 42,
+                name: "Orders API".to_owned(),
+                description: String::new(),
+                environment: "production".to_owned(),
+                app_type: "compose".to_owned(),
+                deploy_mode: "compose".to_owned(),
+                deploy_strategy: "rolling_stop_on_failure".to_owned(),
+                deploy_work_dir: "/opt/easy-deploy/apps/orders-api".to_owned(),
+                target_nodes: vec![TargetNodeMetadata {
+                    node_key: "node-1".to_owned(),
+                    name: "node 1".to_owned(),
+                }],
+                compose_content: "services: {}\n".to_owned(),
+                env_content: "APP_ENV=production\n".to_owned(),
+                deploy_scripts: scripts.clone(),
+                binary: None,
+            })
+            .await
+            .expect("save app config");
+
+        let loaded = runtime
+            .load_app_config("orders-api-prod")
+            .await
+            .expect("load app config");
+        assert_eq!(loaded.deploy_scripts, scripts);
+        let deploy_script_path = data_dir
+            .path()
+            .join("apps")
+            .join("orders-api-prod")
+            .join(META_DIR_NAME)
+            .join(SCRIPTS_DIR_NAME)
+            .join(DEPLOY_STAGE_SCRIPT_FILE_NAME);
+        let deploy_script = fs::read_to_string(deploy_script_path)
+            .await
+            .expect("read deploy script");
+        assert_eq!(deploy_script, "docker compose up -d");
+        assert!(loaded.metadata_content.contains("deploy_scripts:"));
+        assert!(
+            loaded
+                .metadata_content
+                .contains(".easy-deploy/scripts/deploy.sh")
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_current_release_writes_current_pointer() {
+        let data_dir = tempdir().expect("create temp data dir");
+        let runtime = RuntimeFs::new(data_dir.path());
+
+        let result = runtime
+            .mark_current_release("orders-api-prod", "v1.2.3")
+            .await
+            .expect("mark current release");
+
+        assert!(result.current_file.is_file());
+        assert!(result.content.contains("app_key: \"orders-api-prod\""));
+        assert!(result.content.contains("release_version: \"v1.2.3\""));
+        assert!(
+            result
+                .content
+                .contains("release_file: \"releases/v1.2.3/release.yaml\"")
+        );
     }
 }

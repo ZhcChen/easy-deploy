@@ -13,6 +13,71 @@
   {% endfor %}
 </section>
 
+<section class="panel host-metrics-panel" aria-labelledby="host-metrics-title" data-host-metrics>
+  <div class="panel-header host-metrics-header">
+    <div>
+      <h2 id="host-metrics-title">服务器资源</h2>
+      <p>本部署平台所在服务器的实时资源状态。</p>
+    </div>
+    <label class="metric-refresh-control">
+      <span>刷新</span>
+      <select data-host-metrics-interval aria-label="资源刷新间隔">
+        <option value="1000" selected>1s</option>
+        <option value="3000">3s</option>
+        <option value="5000">5s</option>
+        <option value="10000">10s</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="host-metrics-grid" aria-live="polite">
+    <article class="metric-card">
+      <span class="metric-label">CPU</span>
+      <strong data-host-metric="cpu.percent_label">--</strong>
+      <div class="metric-bar" aria-hidden="true">
+        <span data-host-metric-bar="cpu.percent"></span>
+      </div>
+      <p data-host-metric="cpu.detail">等待采集</p>
+    </article>
+
+    <article class="metric-card">
+      <span class="metric-label">RAM</span>
+      <strong data-host-metric="memory.percent_label">--</strong>
+      <div class="metric-bar" aria-hidden="true">
+        <span data-host-metric-bar="memory.percent"></span>
+      </div>
+      <p data-host-metric="memory.detail">等待采集</p>
+    </article>
+
+    <article class="metric-card">
+      <span class="metric-label">磁盘</span>
+      <strong data-host-metric="disk.percent_label">--</strong>
+      <div class="metric-bar" aria-hidden="true">
+        <span data-host-metric-bar="disk.percent"></span>
+      </div>
+      <p><span data-host-metric="disk.detail">等待采集</span> · <span data-host-metric="disk.mount_point">--</span></p>
+    </article>
+
+    <article class="metric-card metric-card-rate">
+      <span class="metric-label">磁盘速率</span>
+      <strong data-host-metric="disk_rate.detail">--</strong>
+      <div class="metric-bar" aria-hidden="true">
+        <span data-host-metric-bar="disk_rate.utilization_percent"></span>
+      </div>
+      <p>忙碌率 <span data-host-metric="disk_rate.utilization_label">--</span></p>
+    </article>
+
+    <article class="metric-card metric-card-rate">
+      <span class="metric-label">网络</span>
+      <strong data-host-metric="network_rate.detail">--</strong>
+      <p>当前入站与出站</p>
+    </article>
+  </div>
+  <div class="host-metrics-footer">
+    <span data-host-metrics-status>等待刷新</span>
+  </div>
+</section>
+
 <section class="main-grid">
   <section class="panel panel-large" aria-labelledby="apps-title">
     <div class="panel-header">

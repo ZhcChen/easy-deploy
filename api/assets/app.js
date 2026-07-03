@@ -1,40 +1,45 @@
 (() => {
   const MODAL_CLOSING_CLASS = "is-closing";
   const APP_CONFIG_KIND = "easy-deploy.app-config";
-  const APP_CONFIG_BASE_FIELDS = ["work_dir", "deploy_strategy"];
+  const COMPOSE_TEMPLATE_KIND = "easy-deploy.compose-template";
+  const APP_CONFIG_BASE_FIELDS = [
+    "app_key",
+    "name",
+    "description",
+    "environment",
+    "work_dir",
+    "deploy_strategy",
+    "release_source",
+    "auto_queue_release",
+  ];
   const APP_CONFIG_COMPOSE_FIELDS = ["compose_content", "env_content"];
+  const APP_CONFIG_SCRIPT_FIELDS = [
+    "deploy_script_pre_deploy",
+    "deploy_script_deploy",
+    "deploy_script_post_deploy",
+    "deploy_script_switch_traffic",
+    "deploy_script_cleanup",
+  ];
+  const APP_CONFIG_SCRIPT_FIELD_ALIASES = {
+    deploy_script_pre_deploy: "pre_deploy",
+    deploy_script_deploy: "deploy",
+    deploy_script_post_deploy: "post_deploy",
+    deploy_script_switch_traffic: "switch_traffic",
+    deploy_script_cleanup: "cleanup",
+  };
   const APP_CONFIG_HEALTH_FIELDS = [
     "health_check_kind",
     "health_endpoint",
     "health_timeout_secs",
     "health_expected_status",
   ];
-  const APP_CONFIG_BINARY_FIELDS = [
-    "binary_artifact_version",
-    "binary_artifact_path",
-    "binary_exec_args",
-    "binary_service_user",
-    "binary_unit_name",
-    "binary_release_strategy",
-    "binary_active_slot",
-    "binary_base_port",
-    "binary_standby_port",
-    "binary_proxy_kind",
-    "binary_proxy_domain",
-    "binary_proxy_config_path",
-  ];
-  const APP_CONFIG_BOOLEAN_FIELDS = ["binary_proxy_enabled"];
-  const APP_CONFIG_NUMBER_FIELDS = new Set([
-    "health_timeout_secs",
-    "health_expected_status",
-    "binary_base_port",
-    "binary_standby_port",
-  ]);
+  const APP_CONFIG_BOOLEAN_FIELDS = ["auto_queue_release"];
+  const APP_CONFIG_NUMBER_FIELDS = new Set(["health_timeout_secs", "health_expected_status"]);
   const APP_CONFIG_FIELD_NAMES = new Set([
     ...APP_CONFIG_BASE_FIELDS,
     ...APP_CONFIG_COMPOSE_FIELDS,
+    ...APP_CONFIG_SCRIPT_FIELDS,
     ...APP_CONFIG_HEALTH_FIELDS,
-    ...APP_CONFIG_BINARY_FIELDS,
     ...APP_CONFIG_BOOLEAN_FIELDS,
   ]);
   const UTC_TIMESTAMP_TEXT_PATTERN =
@@ -264,9 +269,18 @@
   const readFieldValue = (root, name) => {
     const control = preferredControl(namedControls(root, name));
     if (!control) {
+      if (name === "app_key") return root.getAttribute("data-app-key") || "";
+      if (name === "name") return root.getAttribute("data-app-name") || "";
+      if (name === "environment") return root.getAttribute("data-app-environment") || "";
       if (name === "work_dir") return root.getAttribute("data-app-work-dir") || "";
       if (name === "deploy_strategy") {
         return root.getAttribute("data-app-deploy-strategy") || "";
+      }
+      if (name === "release_source") {
+        return root.getAttribute("data-app-release-source") || "";
+      }
+      if (name === "auto_queue_release") {
+        return toBoolean(root.getAttribute("data-app-auto-queue-release") || "");
       }
       return "";
     }
@@ -297,6 +311,13 @@
     config: {
       ...fieldSnapshot(root, APP_CONFIG_BASE_FIELDS),
       ...fieldSnapshot(root, APP_CONFIG_COMPOSE_FIELDS),
+      deploy_scripts: {
+        pre_deploy: readFieldValue(root, "deploy_script_pre_deploy"),
+        deploy: readFieldValue(root, "deploy_script_deploy"),
+        post_deploy: readFieldValue(root, "deploy_script_post_deploy"),
+        switch_traffic: readFieldValue(root, "deploy_script_switch_traffic"),
+        cleanup: readFieldValue(root, "deploy_script_cleanup"),
+      },
       health_check: {
         kind: readFieldValue(root, "health_check_kind"),
         endpoint: readFieldValue(root, "health_endpoint"),
@@ -390,90 +411,141 @@
     }
   };
 
+  const unquoteYamlScalar = (value) => {
+    const trimmed = String(value ?? "").trim();
+    if (
+      (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'"))
+    ) {
+      return trimmed.slice(1, -1);
+    }
+    return trimmed;
+  };
+
+  const parseTemplateAppYaml = (content) => {
+    if (typeof content !== "string" || !content.trim()) return {};
+    return content.split(/\r?\n/).reduce((result, line) => {
+      if (!line || /^\s/.test(line) || line.trimStart().startsWith("#")) return result;
+      const match = line.match(/^([A-Za-z0-9_]+)\s*:\s*(.*)$/);
+      if (!match) return result;
+      result[match[1]] = unquoteYamlScalar(match[2]);
+      return result;
+    }, {});
+  };
+
+  const firstDefined = (...values) =>
+    values.find((value) => value !== undefined && value !== null);
+
+  const normalizeScriptKey = (key) =>
+    String(key || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\.(sh|bash)$/, "")
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "");
+
+  const scriptBlock = (name, content) =>
+    `\n# ${name}\n${String(content ?? "").trim()}\n`;
+
+  const normalizeTemplateScripts = (scripts) => {
+    if (!scripts || typeof scripts !== "object" || Array.isArray(scripts)) return {};
+    const normalized = {};
+    const extra = [];
+
+    Object.entries(scripts).forEach(([name, content]) => {
+      const script = String(content ?? "");
+      if (!script.trim()) return;
+      const key = normalizeScriptKey(name);
+      if (key === "pre_deploy") normalized.pre_deploy = script;
+      else if (key === "deploy") normalized.deploy = script;
+      else if (key === "post_deploy") normalized.post_deploy = script;
+      else if (key === "switch_traffic") normalized.switch_traffic = script;
+      else if (key === "cleanup") normalized.cleanup = script;
+      else extra.push([name, script]);
+    });
+
+    if (extra.length > 0 && !normalized.post_deploy) {
+      normalized.post_deploy = extra
+        .sort(([left], [right]) => String(left).localeCompare(String(right)))
+        .map(([name, content]) => scriptBlock(name, content))
+        .join("")
+        .trimStart();
+    }
+
+    return normalized;
+  };
+
   const normalizeImportedAppConfig = (payload) => {
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
       throw new Error("invalid config payload");
     }
 
-    if (payload.kind && payload.kind !== APP_CONFIG_KIND) {
+    if (payload.kind && ![APP_CONFIG_KIND, COMPOSE_TEMPLATE_KIND].includes(payload.kind)) {
       throw new Error("config kind mismatch");
     }
 
     const source =
       payload.config && typeof payload.config === "object" ? payload.config : payload;
+    const appYaml = parseTemplateAppYaml(
+      firstDefined(
+        source.app_yaml,
+        source.appYaml,
+        source["app.yaml"],
+        source["app.yaml.example"],
+      ),
+    );
     const health =
       source.health_check && typeof source.health_check === "object"
         ? source.health_check
         : {};
-    const binary =
-      source.binary && typeof source.binary === "object" ? source.binary : {};
+    const deployScripts =
+      source.deploy_scripts && typeof source.deploy_scripts === "object"
+        ? source.deploy_scripts
+        : normalizeTemplateScripts(source.scripts);
     const config = {};
 
     [...APP_CONFIG_BASE_FIELDS, ...APP_CONFIG_COMPOSE_FIELDS].forEach((key) => {
-      assignIfPresent(config, key, source[key]);
+      assignIfPresent(config, key, firstDefined(source[key], appYaml[key]));
+    });
+    assignIfPresent(
+      config,
+      "compose_content",
+      firstDefined(
+        source.compose_content,
+        source.compose_yaml,
+        source.composeYaml,
+        source.compose,
+        source["compose.yaml"],
+        source["compose.yaml.example"],
+      ),
+    );
+    assignIfPresent(
+      config,
+      "env_content",
+      firstDefined(
+        source.env_content,
+        source.env,
+        source.env_file,
+        source.envFile,
+        source[".env"],
+        source[".env.example"],
+      ),
+    );
+    APP_CONFIG_SCRIPT_FIELDS.forEach((key) => {
+      assignIfPresent(config, key, source[key] ?? deployScripts[APP_CONFIG_SCRIPT_FIELD_ALIASES[key]]);
     });
 
-    assignIfPresent(config, "health_check_kind", source.health_check_kind ?? health.kind);
-    assignIfPresent(config, "health_endpoint", source.health_endpoint ?? health.endpoint);
+    assignIfPresent(config, "health_check_kind", firstDefined(source.health_check_kind, health.kind, appYaml.health_check_kind));
+    assignIfPresent(config, "health_endpoint", firstDefined(source.health_endpoint, health.endpoint, appYaml.health_endpoint));
     assignIfPresent(
       config,
       "health_timeout_secs",
-      source.health_timeout_secs ?? health.timeout_secs,
+      firstDefined(source.health_timeout_secs, health.timeout_secs, appYaml.health_timeout_secs),
     );
     assignIfPresent(
       config,
       "health_expected_status",
-      source.health_expected_status ?? health.expected_status,
-    );
-
-    assignIfPresent(
-      config,
-      "binary_artifact_version",
-      source.binary_artifact_version ?? binary.artifact_version,
-    );
-    assignIfPresent(
-      config,
-      "binary_artifact_path",
-      source.binary_artifact_path ?? binary.artifact_path,
-    );
-    assignIfPresent(config, "binary_exec_args", source.binary_exec_args ?? binary.exec_args);
-    assignIfPresent(
-      config,
-      "binary_service_user",
-      source.binary_service_user ?? binary.service_user,
-    );
-    assignIfPresent(config, "binary_unit_name", source.binary_unit_name ?? binary.unit_name);
-    assignIfPresent(
-      config,
-      "binary_release_strategy",
-      source.binary_release_strategy ?? binary.release_strategy,
-    );
-    assignIfPresent(
-      config,
-      "binary_active_slot",
-      source.binary_active_slot ?? binary.active_slot,
-    );
-    assignIfPresent(config, "binary_base_port", source.binary_base_port ?? binary.base_port);
-    assignIfPresent(
-      config,
-      "binary_standby_port",
-      source.binary_standby_port ?? binary.standby_port,
-    );
-    assignIfPresent(
-      config,
-      "binary_proxy_enabled",
-      source.binary_proxy_enabled ?? binary.proxy_enabled,
-    );
-    assignIfPresent(config, "binary_proxy_kind", source.binary_proxy_kind ?? binary.proxy_kind);
-    assignIfPresent(
-      config,
-      "binary_proxy_domain",
-      source.binary_proxy_domain ?? binary.proxy_domain,
-    );
-    assignIfPresent(
-      config,
-      "binary_proxy_config_path",
-      source.binary_proxy_config_path ?? binary.proxy_config_path,
+      firstDefined(source.health_expected_status, health.expected_status, appYaml.health_expected_status),
     );
 
     return config;
@@ -723,6 +795,114 @@
     });
   };
 
+  const getPathValue = (source, path) =>
+    path.split(".").reduce((value, key) => {
+      if (value && typeof value === "object" && key in value) {
+        return value[key];
+      }
+      return undefined;
+    }, source);
+
+  const setHostMetricText = (panel, key, value) => {
+    panel.querySelectorAll(`[data-host-metric="${key}"]`).forEach((element) => {
+      element.textContent = value == null || value === "" ? "--" : String(value);
+    });
+  };
+
+  const setHostMetricBar = (panel, key, value) => {
+    const numeric = Number(value);
+    const width = Number.isFinite(numeric)
+      ? Math.max(0, Math.min(100, numeric))
+      : 0;
+    panel.querySelectorAll(`[data-host-metric-bar="${key}"]`).forEach((element) => {
+      element.style.width = `${width}%`;
+    });
+  };
+
+  const updateHostMetricsPanel = (panel, payload) => {
+    const metricKeys = [
+      "cpu.percent_label",
+      "cpu.detail",
+      "memory.percent_label",
+      "memory.detail",
+      "disk.percent_label",
+      "disk.detail",
+      "disk.mount_point",
+      "disk_rate.detail",
+      "disk_rate.utilization_label",
+      "network_rate.detail",
+    ];
+
+    metricKeys.forEach((key) => {
+      setHostMetricText(panel, key, getPathValue(payload, key));
+    });
+    [
+      "cpu.percent",
+      "memory.percent",
+      "disk.percent",
+      "disk_rate.utilization_percent",
+    ].forEach((key) => {
+      setHostMetricBar(panel, key, getPathValue(payload, key));
+    });
+
+    const status = panel.querySelector("[data-host-metrics-status]");
+    if (status) {
+      const sampledAt = Number(payload.sampled_at_epoch_ms);
+      const time = Number.isFinite(sampledAt)
+        ? new Date(sampledAt).toLocaleTimeString("zh-CN", { hour12: false })
+        : new Date().toLocaleTimeString("zh-CN", { hour12: false });
+      status.textContent = `已刷新 ${time}`;
+    }
+  };
+
+  const initHostMetrics = () => {
+    const panel = document.querySelector("[data-host-metrics]");
+    if (!panel) return;
+
+    const intervalSelect = panel.querySelector("[data-host-metrics-interval]");
+    const status = panel.querySelector("[data-host-metrics-status]");
+    let timer = null;
+    let loading = false;
+
+    const refresh = async () => {
+      if (loading) return;
+      loading = true;
+      try {
+        const response = await fetch("/api/dashboard/host-metrics", {
+          credentials: "same-origin",
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok) {
+          throw new Error(`status ${response.status}`);
+        }
+        const payload = await response.json();
+        updateHostMetricsPanel(panel, payload);
+      } catch (_err) {
+        if (status) {
+          status.textContent = "刷新失败";
+        }
+      } finally {
+        loading = false;
+      }
+    };
+
+    const intervalMs = () => {
+      const selected = Number(intervalSelect?.value || 1000);
+      return [1000, 3000, 5000, 10000].includes(selected) ? selected : 1000;
+    };
+
+    const restart = () => {
+      if (timer !== null) {
+        window.clearInterval(timer);
+      }
+      refresh();
+      timer = window.setInterval(refresh, intervalMs());
+    };
+
+    intervalSelect?.addEventListener("change", restart);
+    restart();
+  };
+
   document.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
@@ -902,5 +1082,6 @@
   window.addEventListener("hashchange", openHashModal);
   observeEast8Timestamps();
   initSearchableSelects();
+  initHostMetrics();
   openHashModal();
 })();

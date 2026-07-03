@@ -51,6 +51,7 @@ pub struct CreateTaskInput {
     pub task_kind: String,
     pub title: String,
     pub app_id: Option<i64>,
+    pub release_id: Option<i64>,
     pub node_id: Option<i64>,
     pub created_by: String,
 }
@@ -132,9 +133,25 @@ pub struct TaskLogItem {
 }
 
 #[derive(Clone, Debug, sqlx::FromRow)]
+pub struct TaskPhaseItem {
+    pub id: i64,
+    pub task_id: i64,
+    pub phase_no: i64,
+    pub phase_key: String,
+    pub title: String,
+    pub status: String,
+    pub summary: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
 pub struct TaskStepItem {
     pub id: i64,
     pub task_id: i64,
+    pub phase_id: Option<i64>,
     pub node_id: Option<i64>,
     pub node_name: Option<String>,
     pub step_no: i64,
@@ -147,6 +164,13 @@ pub struct TaskStepItem {
     pub finished_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct StartTaskPhaseInput<'a> {
+    pub task_id: i64,
+    pub phase_key: &'a str,
+    pub title: &'a str,
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +198,7 @@ pub struct TaskNodeResultInput<'a> {
 pub struct RecordDeploymentRunInput<'a> {
     pub app_id: i64,
     pub task_id: i64,
+    pub release_id: Option<i64>,
     pub deploy_action: &'a str,
     pub status: &'a str,
     pub message: &'a str,
@@ -320,12 +345,39 @@ impl TaskService {
         .map_err(TaskError::from)
     }
 
+    pub async fn task_phases(&self, task_id: i64) -> Result<Vec<TaskPhaseItem>, TaskError> {
+        sqlx::query_as::<_, TaskPhaseItem>(
+            r#"
+            SELECT
+                id,
+                task_id,
+                phase_no,
+                phase_key,
+                title,
+                status,
+                summary,
+                started_at,
+                finished_at,
+                created_at,
+                updated_at
+            FROM operation_task_phases
+            WHERE task_id = ?1
+            ORDER BY phase_no ASC, id ASC
+            "#,
+        )
+        .bind(task_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(TaskError::from)
+    }
+
     pub async fn task_steps(&self, task_id: i64) -> Result<Vec<TaskStepItem>, TaskError> {
         sqlx::query_as::<_, TaskStepItem>(
             r#"
             SELECT
                 s.id,
                 s.task_id,
+                s.phase_id,
                 s.node_id,
                 n.name AS node_name,
                 s.step_no,
@@ -395,6 +447,9 @@ impl TaskService {
                 'compose.restart',
                 'binary.restart',
                 'binary.stop',
+                'release.deploy',
+                'release.rollback',
+                'release.manual_apply',
                 'node.install.docker',
                 'node.install.compose',
                 'node.install.caddy',
@@ -433,6 +488,9 @@ impl TaskService {
                 'compose.restart',
                 'binary.restart',
                 'binary.stop',
+                'release.deploy',
+                'release.rollback',
+                'release.manual_apply',
                 'node.install.docker',
                 'node.install.compose',
                 'node.install.caddy',
@@ -456,17 +514,19 @@ impl TaskService {
                 task_kind,
                 title,
                 app_id,
+                release_id,
                 node_id,
                 status,
                 created_by
             )
-            VALUES (?1, ?2, ?3, ?4, 'queued', ?5)
+            VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)
             RETURNING id
             "#,
         )
         .bind(input.task_kind)
         .bind(input.title)
         .bind(input.app_id)
+        .bind(input.release_id)
         .bind(input.node_id)
         .bind(input.created_by)
         .fetch_one(&self.db)
@@ -513,7 +573,9 @@ impl TaskService {
 
     pub async fn update_phase(&self, task_id: i64, phase: &str) -> Result<(), TaskError> {
         let phase = normalize_task_phase(phase)?;
-        sqlx::query(
+        let phase_title = task_phase_title(phase);
+        let mut tx = self.db.begin().await?;
+        let result = sqlx::query(
             r#"
             UPDATE operation_tasks
             SET phase = ?2,
@@ -524,8 +586,76 @@ impl TaskService {
         )
         .bind(task_id)
         .bind(phase)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(());
+        }
+        sqlx::query(
+            r#"
+            UPDATE operation_task_phases
+            SET status = 'success',
+                finished_at = COALESCE(finished_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE task_id = ?1
+              AND phase_key != ?2
+              AND status = 'running'
+            "#,
+        )
+        .bind(task_id)
+        .bind(phase)
+        .execute(&mut *tx)
+        .await?;
+        let updated_phase = sqlx::query(
+            r#"
+            UPDATE operation_task_phases
+            SET title = ?3,
+                status = 'running',
+                started_at = COALESCE(started_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                finished_at = NULL,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE task_id = ?1
+              AND phase_key = ?2
+            "#,
+        )
+        .bind(task_id)
+        .bind(phase)
+        .bind(phase_title)
+        .execute(&mut *tx)
+        .await?;
+        if updated_phase.rows_affected() == 0 {
+            let phase_no = sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT COALESCE(MAX(phase_no), 0) + 1
+                FROM operation_task_phases
+                WHERE task_id = ?1
+                "#,
+            )
+            .bind(task_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                INSERT INTO operation_task_phases(
+                    task_id,
+                    phase_no,
+                    phase_key,
+                    title,
+                    status,
+                    started_at
+                )
+                VALUES (?1, ?2, ?3, ?4, 'running', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                "#,
+            )
+            .bind(task_id)
+            .bind(phase_no)
+            .bind(phase)
+            .bind(phase_title)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -591,6 +721,8 @@ impl TaskService {
         .bind(output.status_code)
         .execute(&self.db)
         .await?;
+        self.finish_open_phases(task_id, if output.success { "success" } else { "failed" })
+            .await?;
         self.append_log(task_id, "combined", &output.output).await
     }
 
@@ -618,6 +750,7 @@ impl TaskService {
         .bind(summary)
         .execute(&self.db)
         .await?;
+        self.finish_open_phases(task_id, "success").await?;
         self.append_log(task_id, "system", summary).await
     }
 
@@ -673,6 +806,100 @@ impl TaskService {
         Ok(())
     }
 
+    pub async fn start_phase(&self, input: StartTaskPhaseInput<'_>) -> Result<i64, TaskError> {
+        let phase_key = normalize_step_key(input.phase_key)?;
+        let title = required_step_text(input.title, "任务阶段名称不能为空")?;
+        let mut tx = self.db.begin().await?;
+        let phase_no = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COALESCE(MAX(phase_no), 0) + 1
+            FROM operation_task_phases
+            WHERE task_id = ?1
+            "#,
+        )
+        .bind(input.task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let phase_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO operation_task_phases(
+                task_id,
+                phase_no,
+                phase_key,
+                title,
+                status,
+                started_at
+            )
+            VALUES (?1, ?2, ?3, ?4, 'running', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            RETURNING id
+            "#,
+        )
+        .bind(input.task_id)
+        .bind(phase_no)
+        .bind(phase_key)
+        .bind(title)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO operation_task_logs(task_id, stream, content)
+            VALUES (?1, 'system', ?2)
+            "#,
+        )
+        .bind(input.task_id)
+        .bind(format!("开始阶段: {}", title))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(phase_id)
+    }
+
+    pub async fn finish_phase(
+        &self,
+        task_id: i64,
+        phase_id: i64,
+        status: &str,
+        summary: &str,
+    ) -> Result<(), TaskError> {
+        let status = normalize_step_status(status)?;
+        let summary = summary.trim();
+        let mut tx = self.db.begin().await?;
+        let result = sqlx::query(
+            r#"
+            UPDATE operation_task_phases
+            SET status = ?3,
+                summary = ?4,
+                finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE task_id = ?1
+              AND id = ?2
+            "#,
+        )
+        .bind(task_id)
+        .bind(phase_id)
+        .bind(status)
+        .bind(summary)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(TaskError::NotFound("任务阶段不存在".to_owned()));
+        }
+        if !summary.is_empty() {
+            sqlx::query(
+                r#"
+                INSERT INTO operation_task_logs(task_id, stream, content)
+                VALUES (?1, 'system', ?2)
+                "#,
+            )
+            .bind(task_id)
+            .bind(summary)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn start_step(&self, input: StartTaskStepInput<'_>) -> Result<i64, TaskError> {
         let step_key = normalize_step_key(input.step_key)?;
         let title = required_step_text(input.title, "步骤名称不能为空")?;
@@ -688,10 +915,24 @@ impl TaskService {
         .bind(input.task_id)
         .fetch_one(&mut *tx)
         .await?;
+        let phase_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT id
+            FROM operation_task_phases
+            WHERE task_id = ?1
+              AND status = 'running'
+            ORDER BY phase_no DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(input.task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let step_id = sqlx::query_scalar::<_, i64>(
             r#"
             INSERT INTO operation_task_steps(
                 task_id,
+                phase_id,
                 node_id,
                 step_no,
                 step_key,
@@ -700,11 +941,12 @@ impl TaskService {
                 status,
                 started_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'running', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             RETURNING id
             "#,
         )
         .bind(input.task_id)
+        .bind(phase_id)
         .bind(input.node_id)
         .bind(step_no)
         .bind(step_key)
@@ -846,7 +1088,27 @@ impl TaskService {
         .bind(message)
         .execute(&self.db)
         .await?;
+        self.finish_open_phases(task_id, "failed").await?;
         self.append_log(task_id, "system", message).await
+    }
+
+    async fn finish_open_phases(&self, task_id: i64, status: &str) -> Result<(), TaskError> {
+        let status = normalize_step_status(status)?;
+        sqlx::query(
+            r#"
+            UPDATE operation_task_phases
+            SET status = ?2,
+                finished_at = COALESCE(finished_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE task_id = ?1
+              AND status = 'running'
+            "#,
+        )
+        .bind(task_id)
+        .bind(status)
+        .execute(&self.db)
+        .await?;
+        Ok(())
     }
 
     pub async fn finish_failed(&self, task_id: i64, message: &str) -> Result<(), TaskError> {
@@ -883,6 +1145,7 @@ impl TaskService {
             INSERT INTO deployment_runs(
                 app_id,
                 task_id,
+                release_id,
                 deploy_action,
                 status,
                 finished_at,
@@ -896,16 +1159,18 @@ impl TaskService {
                 ?2,
                 ?3,
                 ?4,
-                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                 ?5,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                 ?6,
                 ?7,
-                ?8
+                ?8,
+                ?9
             )
             "#,
         )
         .bind(input.app_id)
         .bind(input.task_id)
+        .bind(input.release_id)
         .bind(input.deploy_action)
         .bind(input.status)
         .bind(input.message)
@@ -971,6 +1236,9 @@ fn normalize_task_filter(mut filter: TaskListFilter) -> Result<TaskListFilter, T
                 | "compose.restart"
                 | "binary.restart"
                 | "binary.stop"
+                | "release.deploy"
+                | "release.rollback"
+                | "release.manual_apply"
                 | "node.install.docker"
                 | "node.install.compose"
                 | "node.install.caddy"
@@ -986,9 +1254,32 @@ fn normalize_task_filter(mut filter: TaskListFilter) -> Result<TaskListFilter, T
 
 fn normalize_task_phase(phase: &str) -> Result<&str, TaskError> {
     match phase {
-        "queued" | "preflight" | "preparing_files" | "executing" | "healthchecking"
-        | "completed" | "failed" | "canceled" => Ok(phase),
+        "queued" | "preflight" | "preparing_files" | "executing" | "healthchecking" | "prepare"
+        | "render" | "pre_deploy" | "deploy" | "post_deploy" | "switch_traffic" | "cleanup"
+        | "finalize" | "completed" | "failed" | "canceled" => Ok(phase),
         _ => Err(TaskError::InvalidState("任务阶段不支持".to_owned())),
+    }
+}
+
+fn task_phase_title(phase: &str) -> &'static str {
+    match phase {
+        "queued" => "等待入队",
+        "preflight" => "部署前预检",
+        "preparing_files" => "准备运行文件",
+        "executing" => "执行命令",
+        "healthchecking" => "健康检查",
+        "prepare" => "准备发布",
+        "render" => "渲染配置",
+        "pre_deploy" => "发布前脚本",
+        "deploy" => "部署脚本",
+        "post_deploy" => "发布后脚本",
+        "switch_traffic" => "切换流量",
+        "cleanup" => "清理现场",
+        "finalize" => "收尾确认",
+        "completed" => "已完成",
+        "failed" => "失败收尾",
+        "canceled" => "已取消",
+        _ => "未知阶段",
     }
 }
 
@@ -1111,6 +1402,7 @@ mod tests {
                 task_kind: "compose.up".to_owned(),
                 title: "Deploy multi node app".to_owned(),
                 app_id: None,
+                release_id: None,
                 node_id: None,
                 created_by: "admin".to_owned(),
             })
@@ -1164,6 +1456,7 @@ mod tests {
                 task_kind: "compose.up".to_owned(),
                 title: "Deploy redis".to_owned(),
                 app_id: None,
+                release_id: None,
                 node_id: None,
                 created_by: "admin".to_owned(),
             })
@@ -1207,6 +1500,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_steps_attach_to_current_phase() {
+        let tasks = task_service().await;
+        let task_id = tasks
+            .create_task(CreateTaskInput {
+                task_kind: "release.deploy".to_owned(),
+                title: "Deploy orders".to_owned(),
+                app_id: None,
+                release_id: None,
+                node_id: None,
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect("create task");
+
+        assert!(
+            tasks
+                .mark_running(task_id, "release deploy", "preflight")
+                .await
+                .expect("mark running")
+        );
+        tasks
+            .update_phase(task_id, "preflight")
+            .await
+            .expect("start preflight phase");
+        let preflight_step_id = tasks
+            .start_step(StartTaskStepInput {
+                task_id,
+                node_id: None,
+                step_key: "node.preflight",
+                title: "Node preflight",
+                command: "docker info",
+            })
+            .await
+            .expect("start preflight step");
+        tasks
+            .finish_step(task_id, preflight_step_id, Some(0), "preflight ok")
+            .await
+            .expect("finish preflight step");
+        tasks
+            .update_phase(task_id, "executing")
+            .await
+            .expect("start executing phase");
+        let deploy_step_id = tasks
+            .start_step(StartTaskStepInput {
+                task_id,
+                node_id: None,
+                step_key: "compose.deploy",
+                title: "Compose deploy",
+                command: "docker compose up -d",
+            })
+            .await
+            .expect("start deploy step");
+        tasks
+            .finish_step(task_id, deploy_step_id, Some(0), "deploy ok")
+            .await
+            .expect("finish deploy step");
+        tasks
+            .finish_success(task_id, "release deploy", "done")
+            .await
+            .expect("finish task");
+
+        let phases = tasks.task_phases(task_id).await.expect("task phases");
+        assert_eq!(phases.len(), 2);
+        assert_eq!(phases[0].phase_key, "preflight");
+        assert_eq!(phases[0].status, "success");
+        assert_eq!(phases[1].phase_key, "executing");
+        assert_eq!(phases[1].status, "success");
+
+        let steps = tasks.task_steps(task_id).await.expect("task steps");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].id, preflight_step_id);
+        assert_eq!(steps[0].phase_id, Some(phases[0].id));
+        assert_eq!(steps[1].id, deploy_step_id);
+        assert_eq!(steps[1].phase_id, Some(phases[1].id));
+    }
+
+    #[tokio::test]
     async fn cancel_queued_task_marks_canceled_and_writes_log() {
         let tasks = task_service().await;
         let task_id = tasks
@@ -1214,6 +1584,7 @@ mod tests {
                 task_kind: "compose.up".to_owned(),
                 title: "部署订单服务".to_owned(),
                 app_id: None,
+                release_id: None,
                 node_id: None,
                 created_by: "admin".to_owned(),
             })
@@ -1240,6 +1611,7 @@ mod tests {
                 task_kind: "compose.up".to_owned(),
                 title: "部署订单服务".to_owned(),
                 app_id: None,
+                release_id: None,
                 node_id: None,
                 created_by: "admin".to_owned(),
             })
@@ -1297,6 +1669,7 @@ mod tests {
                 task_kind: "binary.restart".to_owned(),
                 title: "重启 Worker".to_owned(),
                 app_id: Some(app_id),
+                release_id: None,
                 node_id: None,
                 created_by: "admin".to_owned(),
             })
@@ -1307,6 +1680,7 @@ mod tests {
             .record_deployment_run(RecordDeploymentRunInput {
                 app_id,
                 task_id,
+                release_id: None,
                 deploy_action: "binary_restart",
                 status: "success",
                 message: "ok",
@@ -1355,6 +1729,7 @@ mod tests {
                 task_kind: "compose.up".to_owned(),
                 title: "部署订单服务".to_owned(),
                 app_id: Some(app_id),
+                release_id: None,
                 node_id: None,
                 created_by: "admin".to_owned(),
             })
@@ -1366,6 +1741,7 @@ mod tests {
                 task_kind: "compose.restart".to_owned(),
                 title: "重启订单服务".to_owned(),
                 app_id: Some(app_id),
+                release_id: None,
                 node_id: None,
                 created_by: "admin".to_owned(),
             })
@@ -1390,6 +1766,7 @@ mod tests {
                 task_kind: "compose.restart".to_owned(),
                 title: "重启订单服务".to_owned(),
                 app_id: Some(app_id),
+                release_id: None,
                 node_id: None,
                 created_by: "admin".to_owned(),
             })
