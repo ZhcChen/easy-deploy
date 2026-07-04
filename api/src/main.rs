@@ -195,3 +195,110 @@ fn init_tracing() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use tempfile::{TempDir, tempdir};
+
+    use super::*;
+
+    fn temp_settings() -> (Settings, TempDir) {
+        let temp_dir = tempdir().expect("create temp dir");
+        let database_path = temp_dir.path().join("easy-deploy-test.db");
+        let database_url = format!("sqlite://{}", database_path.to_string_lossy());
+        let settings = Settings {
+            bind: "127.0.0.1:0"
+                .parse::<SocketAddr>()
+                .expect("parse bind addr"),
+            database_url,
+            data_dir: temp_dir.path().join("data"),
+            cookie_secure: false,
+            uploaded_binary_releases_to_keep: 4,
+            command_timeout_secs: 120,
+        };
+        (settings, temp_dir)
+    }
+
+    #[test]
+    fn cli_parses_clean_demo_data_and_migrate_commands() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let cli = Cli::try_parse_from([
+            "easy-deploy-api",
+            "--bind",
+            "127.0.0.1:0",
+            "--database-url",
+            "sqlite://easy-deploy-test.db",
+            "--data-dir",
+            temp_dir.path().to_string_lossy().as_ref(),
+            "--cookie-secure",
+            "--uploaded-binary-releases-to-keep",
+            "8",
+            "--command-timeout-secs",
+            "15",
+            "clean-demo-data",
+            "--dry-run",
+            "--no-backup",
+        ])
+        .expect("parse clean-demo-data cli");
+
+        assert_eq!(cli.settings.bind.port(), 0);
+        assert!(cli.settings.cookie_secure);
+        assert_eq!(cli.settings.uploaded_binary_releases_to_keep, 8);
+        assert_eq!(cli.settings.command_timeout_secs, 15);
+        assert!(matches!(
+            cli.command,
+            Some(Command::CleanDemoData {
+                dry_run: true,
+                no_backup: true
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["easy-deploy-api", "migrate", "guard", "HEAD"])
+            .expect("parse migrate guard cli");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Migrate {
+                command: MigrationCommand::Guard { base_ref: Some(_) }
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn migration_commands_run_against_temp_database() {
+        let (settings, _temp_dir) = temp_settings();
+
+        run_migration_command(MigrationCommand::Status, &settings)
+            .await
+            .expect("status handles missing database");
+        run_migration_command(MigrationCommand::Up, &settings)
+            .await
+            .expect("migrate up");
+        run_migration_command(MigrationCommand::Status, &settings)
+            .await
+            .expect("status handles migrated database");
+    }
+
+    #[tokio::test]
+    async fn clean_demo_data_command_runs_with_temp_database() {
+        let (settings, _temp_dir) = temp_settings();
+        let db = migrations::connect_database(&settings.database_url, true)
+            .await
+            .expect("connect temp database");
+        migrations::run_pending(&db)
+            .await
+            .expect("run migrations before clean");
+
+        run_command(
+            Command::CleanDemoData {
+                dry_run: true,
+                no_backup: true,
+            },
+            db,
+            settings,
+        )
+        .await
+        .expect("run clean-demo-data dry run");
+    }
+}

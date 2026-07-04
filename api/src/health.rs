@@ -323,6 +323,10 @@ mod tests {
 
     use async_trait::async_trait;
     use tempfile::tempdir;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     use crate::deploy::{CommandResult, CommandRunner, CommandSpec};
 
@@ -361,6 +365,32 @@ mod tests {
         )
     }
 
+    async fn http_endpoint_with_status(status: u16) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test http server");
+        let addr = listener.local_addr().expect("read test http addr");
+        tokio::spawn(async move {
+            let Ok((mut stream, _peer)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer).await;
+            let reason = match status {
+                204 => "No Content",
+                500 => "Internal Server Error",
+                _ => "OK",
+            };
+            let body = if status == 204 { "" } else { "ok" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        format!("http://{addr}/healthz")
+    }
+
     #[test]
     fn normalize_tcp_config_accepts_host_port() {
         let config =
@@ -368,6 +398,31 @@ mod tests {
 
         assert_eq!(config.kind, HealthCheckKind::Tcp);
         assert_eq!(config.endpoint, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn health_kind_and_error_helpers_cover_labels_and_wrapping() {
+        let kinds = [
+            (HealthCheckKind::None, "none"),
+            (HealthCheckKind::Http, "http"),
+            (HealthCheckKind::Tcp, "tcp"),
+            (HealthCheckKind::ComposeRunning, "compose_running"),
+            (HealthCheckKind::SystemdActive, "systemd_active"),
+        ];
+        for (kind, value) in kinds {
+            assert_eq!(kind.as_str(), value);
+            assert!(!kind.label().trim().is_empty());
+            assert_eq!(HealthCheckKind::try_from(value).expect("known kind"), kind);
+        }
+        assert!(HealthCheckKind::try_from("unknown").is_err());
+
+        let err = HealthError::CheckFailed("boom".to_owned());
+        assert_eq!(err.message(), "boom");
+        assert_eq!(err.to_string(), "boom");
+        assert_eq!(
+            HealthError::from(DeployError::Command("command failed".to_owned())).message(),
+            "command failed"
+        );
     }
 
     #[test]
@@ -393,11 +448,16 @@ mod tests {
             .expect_err("empty unit should fail");
 
         assert!(matches!(err, HealthError::InvalidInput(_)));
+
+        let config = normalize_health_config("systemd_active", "easy-deploy.service", 5, 200)
+            .expect("valid systemd config");
+        assert_eq!(config.endpoint, "easy-deploy.service");
     }
 
     #[test]
     fn parse_tcp_endpoint_rejects_missing_or_invalid_port() {
         assert!(parse_tcp_endpoint("localhost").is_err());
+        assert!(parse_tcp_endpoint(":8080").is_err());
         assert!(parse_tcp_endpoint("localhost:not-a-port").is_err());
         assert_eq!(
             parse_tcp_endpoint(" 127.0.0.1:8080 ").expect("valid tcp endpoint"),
@@ -448,6 +508,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compose_running_check_reports_command_failure_summary() {
+        let work_dir = tempdir().expect("work dir");
+        let config = HealthCheckConfig {
+            kind: HealthCheckKind::ComposeRunning,
+            ..Default::default()
+        };
+        let (compose, systemd) = executors(Some(1), "daemon unavailable\nsecond line\n", "");
+
+        let outcome = run_health_check(&config, &compose, &systemd, work_dir.path().to_path_buf())
+            .await
+            .expect("run failed compose health check");
+
+        assert!(!outcome.healthy);
+        assert!(outcome.message.contains("daemon unavailable"));
+    }
+
+    #[tokio::test]
     async fn systemd_active_check_uses_is_active_output() {
         let work_dir = tempdir().expect("work dir");
         let config = HealthCheckConfig {
@@ -470,10 +547,112 @@ mod tests {
 
         assert!(!outcome.healthy);
         assert_eq!(outcome.message, "inactive");
+
+        let (compose, systemd) = executors(Some(3), "", "");
+        let outcome = run_health_check(&config, &compose, &systemd, work_dir.path().to_path_buf())
+            .await
+            .expect("run inactive systemd health check without output");
+        assert!(!outcome.healthy);
+        assert!(!outcome.message.trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_health_check_reports_expected_and_unexpected_status() {
+        let (compose, systemd) = executors(Some(1), "", "");
+        let success_endpoint = http_endpoint_with_status(204).await;
+        let config = HealthCheckConfig {
+            kind: HealthCheckKind::Http,
+            endpoint: success_endpoint,
+            timeout_secs: 2,
+            expected_status: 204,
+        };
+
+        let outcome = run_health_check(
+            &config,
+            &compose,
+            &systemd,
+            tempdir().expect("work dir").path().to_path_buf(),
+        )
+        .await
+        .expect("run successful http check");
+        assert!(outcome.healthy);
+
+        let mismatch_endpoint = http_endpoint_with_status(500).await;
+        let config = HealthCheckConfig {
+            kind: HealthCheckKind::Http,
+            endpoint: mismatch_endpoint,
+            timeout_secs: 2,
+            expected_status: 204,
+        };
+        let outcome = run_health_check(
+            &config,
+            &compose,
+            &systemd,
+            tempdir().expect("work dir").path().to_path_buf(),
+        )
+        .await
+        .expect("run mismatched http check");
+        assert!(!outcome.healthy);
+        assert!(outcome.message.contains("500"));
+    }
+
+    #[tokio::test]
+    async fn tcp_health_check_reports_success_and_refusal() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tcp test server");
+        let addr = listener.local_addr().expect("read tcp test addr");
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let (compose, systemd) = executors(Some(1), "", "");
+        let config = HealthCheckConfig {
+            kind: HealthCheckKind::Tcp,
+            endpoint: addr.to_string(),
+            timeout_secs: 2,
+            expected_status: 200,
+        };
+
+        let outcome = run_health_check(
+            &config,
+            &compose,
+            &systemd,
+            tempdir().expect("work dir").path().to_path_buf(),
+        )
+        .await
+        .expect("run successful tcp check");
+        assert!(outcome.healthy);
+        let _ = accept.await;
+
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind closed tcp port");
+        let closed_addr = closed.local_addr().expect("read closed tcp addr");
+        drop(closed);
+        let config = HealthCheckConfig {
+            kind: HealthCheckKind::Tcp,
+            endpoint: closed_addr.to_string(),
+            timeout_secs: 1,
+            expected_status: 200,
+        };
+        let outcome = run_health_check(
+            &config,
+            &compose,
+            &systemd,
+            tempdir().expect("work dir").path().to_path_buf(),
+        )
+        .await
+        .expect("run refused tcp check");
+        assert!(!outcome.healthy);
     }
 
     #[test]
     fn normalize_http_config_rejects_non_http_url() {
+        let config = normalize_health_config("http", "https://example.com/healthz", 5, 204)
+            .expect("https health config");
+        assert_eq!(config.endpoint, "https://example.com/healthz");
+        assert!(normalize_health_config("bad", "https://example.com", 5, 200).is_err());
+
         let err = normalize_health_config("http", "file:///tmp/health", 5, 200)
             .expect_err("file URL should fail");
 

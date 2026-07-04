@@ -7223,6 +7223,95 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn command_runner_returns_registered_normalized_and_default_results() {
+        let runner = Arc::new(E2eCommandRunner::default());
+        runner.with_result(
+            "ssh -p 22 root@example.com uptime",
+            CommandResult {
+                status_code: Some(0),
+                stdout: "registered\n".to_owned(),
+                stderr: String::new(),
+            },
+        );
+
+        let result = runner
+            .run(CommandSpec {
+                program: "ssh".to_owned(),
+                args: vec![
+                    "-p".to_owned(),
+                    "22".to_owned(),
+                    "-o".to_owned(),
+                    "UserKnownHostsFile=.easy-deploy/ssh/known_hosts".to_owned(),
+                    "-o".to_owned(),
+                    "StrictHostKeyChecking=yes".to_owned(),
+                    "root@example.com".to_owned(),
+                    "uptime".to_owned(),
+                ],
+                current_dir: std::path::PathBuf::from("/work"),
+            })
+            .await
+            .expect("run normalized command");
+        assert_eq!(result.stdout, "registered\n");
+
+        let default = runner
+            .run(CommandSpec {
+                program: "docker".to_owned(),
+                args: vec!["ps".to_owned()],
+                current_dir: std::path::PathBuf::from("/work"),
+            })
+            .await
+            .expect("run default command");
+        assert!(default.stdout.contains("docker ps"));
+        assert_eq!(
+            runner
+                .commands
+                .lock()
+                .expect("commands")
+                .first()
+                .map(String::as_str),
+            Some(
+                "ssh -p 22 -o UserKnownHostsFile=.easy-deploy/ssh/known_hosts -o StrictHostKeyChecking=yes root@example.com uptime"
+            )
+        );
+        assert!(
+            runner
+                .command_specs
+                .lock()
+                .expect("command specs")
+                .iter()
+                .any(|(command, work_dir)| command == "docker ps" && work_dir == "/work")
+        );
+    }
+
+    #[test]
+    fn command_runner_synthesizes_ssh_probe_output() {
+        let runner = Arc::new(E2eCommandRunner::default());
+        runner.with_result(
+            "ssh -p 22 root@10.0.0.1 docker --version",
+            CommandResult {
+                status_code: Some(1),
+                stdout: String::new(),
+                stderr: "docker missing\n".to_owned(),
+            },
+        );
+        assert!(
+            runner
+                .ssh_probe_result("ssh -p 22 root@10.0.0.1 uptime")
+                .is_none()
+        );
+
+        let output = runner
+            .ssh_probe_result("ssh -p 22 root@10.0.0.1 sh -lc 'run_probe'")
+            .expect("probe output");
+        assert!(output.success());
+        assert!(output.stdout.contains("ED_PROBE_FIELD=work_dir"));
+        assert!(output.stdout.contains("ED_PROBE_FIELD=docker_version"));
+        assert!(output.stdout.contains("ED_PROBE_STATUS=missing"));
+        assert!(output.stdout.contains("docker missing"));
+        assert!(output.stdout.contains("ED_PROBE_END=nginx_version"));
+    }
+
     #[test]
     fn extracts_hidden_values_and_reports_missing_parts() {
         let html = r#"
@@ -7238,6 +7327,13 @@ mod tests {
             "42"
         );
         assert!(extract_hidden_value(html, "missing").is_err());
+        assert!(
+            extract_hidden_value(
+                r#"<input name="csrf_token" value="unterminated>"#,
+                "csrf_token"
+            )
+            .is_err()
+        );
         assert!(ensure_contains_all(html, &["csrf-123", "role_id"], "form").is_ok());
         assert!(ensure_contains_all(html, &["not-present"], "form").is_err());
     }
@@ -7262,8 +7358,18 @@ mod tests {
             "/apps/1/binary/releases/12/deploy?source=test"
         );
         assert!(html_table_body("<table></table>").is_err());
+        assert!(html_table_body("<tbody><tr></tr>").is_err());
         assert!(html_table_row_containing(html, "v2.0.0").is_err());
+        assert!(html_table_row_containing("<td>needle</td></tr>", "needle").is_err());
+        assert!(html_table_row_containing("<tr><td>needle</td>", "needle").is_err());
         assert!(extract_binary_release_deploy_path(html, "v2.0.0").is_err());
+        assert!(
+            extract_binary_release_deploy_path(
+                "<tbody><tr><td>v1.2.0</td><form action=\"/noop\"></form></tr></tbody>",
+                "v1.2.0"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -7273,12 +7379,15 @@ mod tests {
             42
         );
         assert!(extract_task_id_from_location("/apps/42").is_err());
+        assert!(extract_task_id_from_location("/tasks/not-number").is_err());
+        assert!(test_client().is_ok());
 
         let commands = vec![
             "docker compose config".to_owned(),
             "docker compose up -d".to_owned(),
             "docker compose ps".to_owned(),
         ];
+        assert!(command_order_contains(&commands, &[]));
         assert!(command_order_contains(
             &commands,
             &["docker compose config", "docker compose ps"]
@@ -7306,6 +7415,10 @@ mod tests {
                 ("docker compose ps", "/opt/app"),
                 ("docker compose config", "/opt/app"),
             ]
+        ));
+        assert!(!command_specs_contain_sequence(
+            &specs,
+            &[("docker compose config", "/srv/app")]
         ));
     }
 }

@@ -1781,6 +1781,289 @@ mod tests {
         assert_eq!(position.running_before, 0);
     }
 
+    #[tokio::test]
+    async fn task_lists_counts_and_queue_positions_apply_filters() {
+        let tasks = task_service().await;
+        let app_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO apps(app_key, name, app_type, deploy_mode, work_dir)
+            VALUES ('orders-api', 'Orders API', 'compose', 'compose', '/opt/orders')
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&tasks.db)
+        .await
+        .expect("create app");
+        let older_queued = tasks
+            .create_task(CreateTaskInput {
+                task_kind: "node.install.docker".to_owned(),
+                title: "Install Docker on node".to_owned(),
+                app_id: None,
+                release_id: None,
+                node_id: Some(1),
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect("create queued task");
+        let running = tasks
+            .create_task(CreateTaskInput {
+                task_kind: "node.install.compose".to_owned(),
+                title: "Install Compose on node".to_owned(),
+                app_id: None,
+                release_id: None,
+                node_id: Some(1),
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect("create running task");
+        assert!(
+            tasks
+                .mark_running(running, "install compose", "executing")
+                .await
+                .expect("mark running")
+        );
+        let current = tasks
+            .create_task(CreateTaskInput {
+                task_kind: "compose.up".to_owned(),
+                title: "Deploy Orders API".to_owned(),
+                app_id: Some(app_id),
+                release_id: None,
+                node_id: None,
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect("create current task");
+
+        let all = tasks.list_tasks().await.expect("list tasks");
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].id, current);
+        assert_eq!(all[0].app_name.as_deref(), Some("Orders API"));
+
+        let filtered = tasks
+            .list_tasks_filtered(TaskListFilter {
+                status: Some(" queued ".to_owned()),
+                phase: Some(" queued ".to_owned()),
+                app_id: Some(app_id),
+                task_kind: Some(" compose.up ".to_owned()),
+                query: Some(" orders ".to_owned()),
+            })
+            .await
+            .expect("filtered tasks");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, current);
+
+        let counts = tasks
+            .task_status_counts(TaskListFilter {
+                query: Some("install".to_owned()),
+                ..TaskListFilter::default()
+            })
+            .await
+            .expect("status counts");
+        assert!(
+            counts
+                .iter()
+                .any(|item| item.status == "queued" && item.count == 1)
+        );
+        assert!(
+            counts
+                .iter()
+                .any(|item| item.status == "running" && item.count == 1)
+        );
+
+        let position = tasks
+            .task_queue_position(current)
+            .await
+            .expect("queue position");
+        assert_eq!(position.queued_before, 1);
+        assert_eq!(position.running_before, 1);
+        assert!(tasks.task_queue_position(404).await.is_err());
+
+        let detail = tasks.task_detail(current).await.expect("task detail");
+        assert_eq!(detail.task_kind, "compose.up");
+        assert_eq!(detail.title, "Deploy Orders API");
+        assert!(tasks.task_detail(404).await.is_err());
+        assert_eq!(older_queued, all[2].id);
+    }
+
+    #[tokio::test]
+    async fn task_state_phase_and_step_error_paths_are_reported() {
+        let tasks = task_service().await;
+        let canceled_task = tasks
+            .create_task(CreateTaskInput {
+                task_kind: "compose.up".to_owned(),
+                title: "Canceled deploy".to_owned(),
+                app_id: None,
+                release_id: None,
+                node_id: None,
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect("create canceled task");
+        tasks
+            .cancel_queued(canceled_task, "admin")
+            .await
+            .expect("cancel task");
+        assert!(
+            !tasks
+                .mark_running(canceled_task, "deploy", "executing")
+                .await
+                .expect("canceled task returns false")
+        );
+
+        let finished_task = tasks
+            .create_task(CreateTaskInput {
+                task_kind: "compose.up".to_owned(),
+                title: "Finished deploy".to_owned(),
+                app_id: None,
+                release_id: None,
+                node_id: None,
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect("create finished task");
+        tasks
+            .finish_success(finished_task, "deploy", "done")
+            .await
+            .expect("finish task");
+        assert!(
+            tasks
+                .mark_running(finished_task, "deploy", "executing")
+                .await
+                .is_err()
+        );
+        tasks
+            .update_phase(finished_task, "cleanup")
+            .await
+            .expect("ignored phase update on non-running task");
+
+        let failed_task = tasks
+            .create_task(CreateTaskInput {
+                task_kind: "compose.up".to_owned(),
+                title: "Failed deploy".to_owned(),
+                app_id: None,
+                release_id: None,
+                node_id: None,
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect("create failed task");
+        tasks
+            .finish_with_compose_output(
+                failed_task,
+                &ComposeCommandOutput {
+                    command: "docker compose up".to_owned(),
+                    success: false,
+                    status_code: Some(2),
+                    output: String::new(),
+                },
+            )
+            .await
+            .expect("finish failed compose output");
+        let detail = tasks
+            .task_detail(failed_task)
+            .await
+            .expect("failed task detail");
+        assert_eq!(detail.status, "failed");
+        assert_eq!(detail.exit_code, Some(2));
+        assert!(!detail.summary.trim().is_empty());
+
+        let phase_task = tasks
+            .create_task(CreateTaskInput {
+                task_kind: "release.deploy".to_owned(),
+                title: "Phase task".to_owned(),
+                app_id: None,
+                release_id: None,
+                node_id: None,
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect("create phase task");
+        let phase_id = tasks
+            .start_phase(StartTaskPhaseInput {
+                task_id: phase_task,
+                phase_key: "pre_deploy",
+                title: "Pre deploy",
+            })
+            .await
+            .expect("start phase");
+        tasks
+            .finish_phase(phase_task, phase_id, "success", "")
+            .await
+            .expect("finish phase without summary");
+        assert!(
+            tasks
+                .finish_phase(phase_task, 404, "success", "missing")
+                .await
+                .is_err()
+        );
+        assert!(
+            tasks
+                .start_phase(StartTaskPhaseInput {
+                    task_id: phase_task,
+                    phase_key: "bad key",
+                    title: "Bad",
+                })
+                .await
+                .is_err()
+        );
+
+        let step_id = tasks
+            .start_step(StartTaskStepInput {
+                task_id: phase_task,
+                node_id: Some(1),
+                step_key: "deploy.run",
+                title: "Run deploy",
+                command: "docker compose up -d",
+            })
+            .await
+            .expect("start step without running phase");
+        tasks
+            .append_step_log(phase_task, step_id, "stdout", "line")
+            .await
+            .expect("append stdout");
+        tasks
+            .fail_step(phase_task, step_id, Some(1), "failed")
+            .await
+            .expect("fail step");
+        let skipped_step = tasks
+            .start_step(StartTaskStepInput {
+                task_id: phase_task,
+                node_id: None,
+                step_key: "deploy.skip",
+                title: "Skip deploy",
+                command: "",
+            })
+            .await
+            .expect("start skipped step");
+        tasks
+            .skip_step(phase_task, skipped_step, "")
+            .await
+            .expect("skip step");
+        assert!(
+            tasks
+                .finish_step(phase_task, 404, None, "missing")
+                .await
+                .is_err()
+        );
+        assert!(
+            tasks
+                .start_step(StartTaskStepInput {
+                    task_id: phase_task,
+                    node_id: None,
+                    step_key: "bad key",
+                    title: "Bad",
+                    command: "",
+                })
+                .await
+                .is_err()
+        );
+
+        let steps = tasks.task_steps(phase_task).await.expect("steps");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].status, "failed");
+        assert_eq!(steps[1].status, "skipped");
+    }
+
     #[test]
     fn task_filter_normalization_trims_valid_values_and_rejects_unknowns() {
         let normalized = normalize_task_filter(TaskListFilter {

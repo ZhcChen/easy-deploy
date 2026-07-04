@@ -306,6 +306,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_ignores_unknown_setting_keys() {
+        let service = platform_service().await;
+        sqlx::query(
+            r#"
+            INSERT INTO platform_settings(setting_key, setting_value, updated_by)
+            VALUES ('unknown_setting', 'ignored', 'test')
+            "#,
+        )
+        .execute(&service.db)
+        .await
+        .expect("insert unknown setting");
+
+        let config = service.config().await.expect("load config");
+        assert_eq!(config, PlatformConfig::default());
+    }
+
+    #[test]
+    fn platform_config_error_wraps_sqlx_errors() {
+        let err = PlatformConfigError::from(sqlx::Error::RowNotFound);
+        assert!(matches!(err, PlatformConfigError::Internal(_)));
+        assert!(!err.message().trim().is_empty());
+    }
+
+    #[tokio::test]
     async fn service_rejects_invalid_updates_before_persisting() {
         let service = platform_service().await;
 

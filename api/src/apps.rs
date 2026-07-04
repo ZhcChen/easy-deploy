@@ -12838,6 +12838,367 @@ services:
         assert!(!format_runtime_summary(0, 0, 0, 0, 0).trim().is_empty());
     }
 
+    #[test]
+    fn app_error_and_strategy_helpers_cover_display_and_labels() {
+        let invalid = AppError::InvalidInput("bad input".to_owned());
+        assert_eq!(invalid.message(), "bad input");
+        assert_eq!(invalid.to_string(), "bad input");
+        assert_eq!(
+            AppError::from(RuntimeFsError::InvalidInput("runtime input".to_owned())).message(),
+            "runtime input"
+        );
+        assert_eq!(
+            AppError::from(RuntimeFsError::Io("runtime io".to_owned())).message(),
+            "runtime io"
+        );
+        assert_eq!(
+            AppError::from(DeployError::InvalidInput("deploy input".to_owned())).message(),
+            "deploy input"
+        );
+        assert_eq!(
+            AppError::from(DeployError::Command("deploy command".to_owned())).message(),
+            "deploy command"
+        );
+
+        assert!(DeployStrategy::RollingStopOnFailure.should_stop_after_failure());
+        assert!(!DeployStrategy::RollingContinue.should_stop_after_failure());
+        assert_eq!(DeployStrategy::RollingContinue.as_str(), "rolling_continue");
+        assert!(
+            !DeployStrategy::RollingStopOnFailure
+                .label()
+                .trim()
+                .is_empty()
+        );
+        assert!(!DeployStrategy::RollingContinue.label().trim().is_empty());
+        assert_ne!(
+            release_publish_mode_label(true),
+            release_publish_mode_label(false)
+        );
+    }
+
+    #[test]
+    fn task_action_helpers_cover_remaining_variants() {
+        assert_eq!(ComposeTaskAction::Down.task_kind(), "compose.down");
+        assert_eq!(ComposeTaskAction::Restart.task_kind(), "compose.restart");
+        assert_eq!(
+            ComposeTaskAction::Restart.deploy_action(),
+            "compose_restart"
+        );
+        assert!(!ComposeTaskAction::Down.title_prefix().trim().is_empty());
+        assert!(!ComposeTaskAction::Restart.title_prefix().trim().is_empty());
+        assert!(!ComposeTaskAction::Down.label().trim().is_empty());
+        assert!(!ComposeTaskAction::Restart.label().trim().is_empty());
+        assert_eq!(
+            compose_action_command_label(ComposeTaskAction::Down),
+            "docker compose down"
+        );
+        assert_eq!(
+            ComposeTaskAction::Restart.runtime_status(true, "completed"),
+            "healthy"
+        );
+
+        assert_eq!(BinaryTaskAction::Stop.task_kind(), "binary.stop");
+        assert_eq!(BinaryTaskAction::Restart.deploy_action(), "binary_restart");
+        assert!(!BinaryTaskAction::Restart.title_prefix().trim().is_empty());
+        assert!(!BinaryTaskAction::Stop.title_prefix().trim().is_empty());
+        assert!(!BinaryTaskAction::Restart.label().trim().is_empty());
+        assert!(!BinaryTaskAction::Stop.label().trim().is_empty());
+        assert!(!BinaryTaskAction::Stop.runs_health_check());
+        assert_eq!(
+            BinaryTaskAction::Restart.runtime_status(true, "completed"),
+            "healthy"
+        );
+        assert_eq!(
+            binary_action_command_label(BinaryTaskAction::Restart, "worker.service"),
+            "systemctl restart worker.service"
+        );
+    }
+
+    #[test]
+    fn binary_normalizers_cover_path_domain_and_slot_edges() {
+        assert!(normalize_key(" ").is_err());
+        assert_eq!(
+            default_proxy_config_path("nginx", "orders-api"),
+            "/etc/nginx/conf.d/orders-api.conf"
+        );
+        assert_eq!(
+            default_proxy_config_path("caddy", "orders-api"),
+            "/etc/caddy/Caddyfile.d/orders-api.caddy"
+        );
+        assert!(normalize_proxy_config_path("relative.conf").is_err());
+        assert!(normalize_proxy_config_path("/etc//bad.conf").is_err());
+        assert!(normalize_proxy_config_path("/etc/../bad.conf").is_err());
+        assert!(normalize_proxy_config_path("/etc/caddy/bad file.conf").is_err());
+        assert_eq!(
+            normalize_proxy_config_path("/etc/caddy/site.conf").expect("proxy path"),
+            "/etc/caddy/site.conf"
+        );
+
+        assert!(is_valid_proxy_domain("localhost"));
+        assert!(is_valid_proxy_domain("127.0.0.1"));
+        assert!(is_valid_proxy_domain("api.example.com"));
+        assert!(!is_valid_proxy_domain(".bad"));
+        assert!(!is_valid_proxy_domain("bad."));
+        assert!(!is_valid_proxy_domain("-bad.example.com"));
+        assert!(!is_valid_proxy_domain("bad-.example.com"));
+        assert!(!is_valid_proxy_domain("bad_label.example.com"));
+
+        assert_eq!(
+            normalize_binary_release_strategy("blue_green").expect("blue green"),
+            "blue_green"
+        );
+        assert!(normalize_binary_release_strategy("rolling").is_err());
+        assert_eq!(normalize_binary_slot("green").expect("green slot"), "green");
+        assert!(normalize_binary_slot("red").is_err());
+        assert_eq!(
+            normalize_binary_port(65535, "port").expect("max port"),
+            65535
+        );
+        assert!(normalize_binary_port(-1, "port").is_err());
+        assert!(normalize_binary_port(65536, "port").is_err());
+        assert_eq!(
+            normalize_unit_name("worker@green.service", "fallback").expect("unit"),
+            "worker@green.service"
+        );
+        assert!(normalize_unit_name("worker", "fallback").is_err());
+        assert!(normalize_unit_name("bad worker.service", "fallback").is_err());
+
+        let default_config = default_binary_config_for_app("orders-api", "/opt/orders-api");
+        assert_eq!(default_config.service_name, "orders-api");
+        assert_eq!(default_config.working_dir, "/opt/orders-api");
+        assert_eq!(default_config.unit_name, "easy-deploy-orders-api.service");
+        assert_eq!(
+            required_text(" value ", "required").expect("required"),
+            "value"
+        );
+        assert!(required_text(" ", "required").is_err());
+    }
+
+    #[test]
+    fn release_package_helpers_cover_more_edge_cases() {
+        let parsed = parse_release_package_name(r"C:\tmp\Orders_API_version_V1.2.3.zip")
+            .expect("parse release package");
+        assert_eq!(parsed.service_key, "orders_api");
+        assert_eq!(parsed.release_version, "v1.2.3");
+        assert_eq!(parsed.version_code, 1_002_003);
+
+        let matched = parse_release_package_name_for_service(
+            "orders-api_version_1_2_3.tgz",
+            " Orders-API ",
+            Some("1.2.3"),
+        )
+        .expect("matching service");
+        assert_eq!(matched.release_version, "v1.2.3");
+        assert_eq!(
+            parse_release_package_name_for_service("bad_version_1_2_3.tgz", "orders-api", None)
+                .expect_err("service mismatch")
+                .code(),
+            "PACKAGE_SERVICE_KEY_MISMATCH"
+        );
+        assert_eq!(
+            parse_release_package_name_for_service(
+                "orders-api_version_1_2_3.tgz",
+                "orders-api",
+                Some("1.2.4"),
+            )
+            .expect_err("version mismatch")
+            .code(),
+            "PACKAGE_VERSION_CONFLICT"
+        );
+
+        assert!(parse_release_package_name("bad name_version_1_2_3.tar.gz").is_err());
+        assert!(parse_release_package_name("orders-api_version_1_2.tar.gz").is_err());
+        assert!(parse_release_package_name("orders-api.tar.gz").is_err());
+        assert_eq!(strip_binary_package_extension("bundle.zip"), "bundle");
+        assert_eq!(strip_binary_package_extension("bundle.bin"), "bundle.bin");
+        assert_eq!(
+            normalize_package_version("01_002_0003").as_deref(),
+            Some("v01.002.0003")
+        );
+        assert_eq!(normalize_package_version("1.2").as_deref(), None);
+        assert_eq!(version_code_from_release("v0.0.1"), Some(1));
+        assert_eq!(version_code_from_release("v1.2.3.4"), None);
+        assert_eq!(
+            parse_binary_package_name("worker_version_2_0_1.jar")
+                .expect("binary package")
+                .version_code,
+            2_000_001
+        );
+    }
+
+    #[test]
+    fn metadata_snapshot_and_archive_helpers_cover_fallbacks() {
+        let metadata = render_artifact_metadata(ArtifactMetadataInput {
+            source: "upload",
+            source_detail: "",
+            unit_name: r#"worker\"unit.service"#,
+            uploaded_path: "/tmp/worker",
+            original_file_name: "worker_version_1_0_0.jar",
+            entry_file: "worker.jar",
+            sha256: "hash",
+            size_bytes: 0,
+            config_snapshot_id: None,
+            config_revision_no: None,
+        });
+        assert_eq!(artifact_metadata_value(&metadata, "size_bytes"), "0");
+        assert_eq!(
+            artifact_metadata_value(r#"{"ok":true,"items":[1]}"#, "ok"),
+            "true"
+        );
+        assert_eq!(artifact_metadata_value(r#"{"items":[1]}"#, "items"), "");
+        assert_eq!(artifact_metadata_value("{", "source"), "");
+        assert_eq!(
+            release_metadata_snapshot_id(r#"{"config_snapshot_id":"9"}"#),
+            None
+        );
+        let empty_snapshot =
+            release_metadata_with_snapshot("", 7, None).expect("empty metadata snapshot");
+        assert_eq!(
+            artifact_metadata_value(&empty_snapshot, "config_snapshot_id"),
+            "7"
+        );
+
+        let deploy_scripts = DeployScriptSet {
+            pre_deploy: "pre".to_owned(),
+            deploy: "deploy".to_owned(),
+            post_deploy: String::new(),
+            switch_traffic: String::new(),
+            cleanup: String::new(),
+        };
+        let binary = binary_config_item("v1.0.0", "/opt/app/releases/v1.0.0/worker");
+        let runtime_metadata = runtime_snapshot_metadata(
+            "deploy",
+            "/var/lib/easy-deploy/apps/worker",
+            Some("v1.0.0"),
+            Some(&deploy_scripts),
+            Some(&binary),
+        );
+        let runtime_value =
+            serde_json::from_str::<JsonValue>(&runtime_metadata).expect("runtime metadata json");
+        assert_eq!(runtime_value["source"], "deploy");
+        assert_eq!(runtime_value["version"], "v1.0.0");
+        assert_eq!(runtime_value["deploy_scripts"]["pre_deploy"], "pre");
+        assert_eq!(runtime_value["binary"]["artifact_version"], "v1.0.0");
+
+        let app = app_detail_item("orders-api", "/srv/orders-api");
+        let current = BinaryConfigItem::default();
+        let snapshot = app_config_snapshot_item(
+            "",
+            r#"{"binary":{"artifact_version":"v2.0.0","artifact_path":"/pkg/orders","proxy_enabled":true}}"#,
+            "KEY=value",
+        );
+        assert_eq!(snapshot_artifact_version(&snapshot), "v2.0.0");
+        let restored = binary_config_from_snapshot(&app, &snapshot, &current, None);
+        assert_eq!(restored.service_name, "orders-api");
+        assert_eq!(restored.working_dir, "/srv/orders-api");
+        assert_eq!(restored.service_user, "deploy");
+        assert_eq!(restored.unit_name, "easy-deploy-orders-api.service");
+        assert_eq!(restored.release_strategy, "restart");
+        assert_eq!(restored.active_slot, "blue");
+        assert_eq!(restored.artifact_version, "v2.0.0");
+        assert_eq!(restored.artifact_path, "/pkg/orders");
+        assert_eq!(restored.proxy_enabled, 1);
+        assert_eq!(restored.env_content, "KEY=value\n");
+
+        let direct_snapshot = app_config_snapshot_item(" v3.0.0 ", "{}", "");
+        assert_eq!(snapshot_artifact_version(&direct_snapshot), "v3.0.0");
+        let artifact = uploaded_binary_artifact(9, "v9.0.0");
+        let artifact_restored =
+            binary_config_from_snapshot(&app, &snapshot, &current, Some(&artifact));
+        assert_eq!(artifact_restored.artifact_version, "v9.0.0");
+
+        assert_eq!(
+            sanitize_archive_path(Path::new("bin/server")).expect("archive path"),
+            PathBuf::from("bin").join("server")
+        );
+        assert!(sanitize_archive_path(Path::new("/abs/server")).is_err());
+        assert!(sanitize_archive_path(Path::new("")).is_err());
+    }
+
+    #[test]
+    fn text_compose_and_cleanup_helpers_cover_edges() {
+        let root = tempdir().expect("runtime root");
+        assert_eq!(runtime_service_count(root.path()), 0);
+        fs::write(
+            root.path().join("compose.yaml"),
+            "services:\n  api:\n    image: nginx\n  worker:\n    image: busybox\n",
+        )
+        .expect("write compose");
+        assert_eq!(runtime_service_count(root.path()), 2);
+
+        let release_root = root.path().join("releases");
+        fs::create_dir_all(release_root.join("v0.1.0")).expect("create release");
+        cleanup_pruned_binary_release_dirs(
+            root.path(),
+            &["v0.1.0".to_owned(), "missing".to_owned()],
+        )
+        .expect("cleanup pruned releases");
+        assert!(!release_root.join("v0.1.0").exists());
+
+        let compose = default_compose_content("orders-api");
+        assert!(compose.contains("services:"));
+        assert!(compose.contains("orders-api"));
+        assert_eq!(normalize_env_content(" KEY=value "), "KEY=value\n");
+        assert_eq!(normalize_env_content(""), "");
+        assert_eq!(
+            strip_top_level_compose_version("version: '3.8'\nservices:\n  api:\n    image: nginx"),
+            "services:\n  api:\n    image: nginx"
+        );
+        assert!(is_compose_version_line("version: '3.8'"));
+        assert!(!is_compose_version_line("version:"));
+        assert!(!is_compose_version_line("services:"));
+        assert_eq!(
+            strip_common_error_prefix("Error response from daemon: denied"),
+            "denied"
+        );
+        assert_eq!(
+            strip_common_error_prefix("error during connect: refused"),
+            "refused"
+        );
+        assert_eq!(ensure_trailing_newline("KEY=value"), "KEY=value\n");
+        assert_eq!(ensure_trailing_newline("KEY=value\n"), "KEY=value\n");
+        assert_eq!(ensure_trailing_newline(""), "");
+        assert_eq!(json_escape(r#"a\b"c"#), r#"a\\b\"c"#);
+
+        let fallback = friendly_command_error("time=\"2026\" level=warning\n", "fallback");
+        assert_eq!(fallback, "fallback");
+        let friendly = friendly_command_error("ERROR: boom\nError: nope\nplain", "fallback");
+        assert!(friendly.contains("boom"));
+        assert!(friendly.contains("nope"));
+        assert!(friendly.contains("plain"));
+        assert!(!friendly.contains("ERROR:"));
+        assert_eq!(parse_port(" 8080 "), Some(8080));
+        assert_eq!(parse_port("0"), None);
+        assert_eq!(to_port(65535), Some(65535));
+        assert_eq!(to_port(65536), None);
+        assert_eq!(join_ports(&[443, 8080]), "443, 8080");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GiB");
+        assert!(!summarize_inline_value("").trim().is_empty());
+        assert!(
+            !summarize_config_content("services:\n  api:")
+                .trim()
+                .is_empty()
+        );
+        assert!(diff_preview(&"line\n".repeat(20)).ends_with("..."));
+    }
+
+    #[test]
+    fn target_node_ssh_target_normalizes_identity_and_rejects_bad_port() {
+        let mut node = target_node(1, "node-a");
+        node.credential_private_key_path = Some(" C:/keys/id_rsa ".to_owned());
+        let target = node.ssh_target().expect("ssh target");
+        assert_eq!(target.address(), "127.0.0.1");
+        assert_eq!(target.port(), 22);
+        assert_eq!(
+            target.identity_file().map(PathBuf::as_path),
+            Some(Path::new("C:/keys/id_rsa"))
+        );
+
+        node.ssh_port = 0;
+        assert!(node.ssh_target().is_err());
+    }
+
     fn uploaded_binary_artifact(id: i64, version: &str) -> BinaryArtifactItem {
         binary_artifact(id, version, r#"{"source":"upload"}"#)
     }

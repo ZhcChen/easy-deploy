@@ -651,6 +651,46 @@ mod tests {
             .await
             .expect_err("bad status should be rejected");
         assert!(matches!(bad_status, NodeCredentialError::InvalidInput(_)));
+
+        let missing_credential = service
+            .set_status(404, "active")
+            .await
+            .expect_err("missing credential should be rejected");
+        assert!(matches!(
+            missing_credential,
+            NodeCredentialError::InvalidInput(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn credential_error_and_path_helpers_cover_edges() {
+        let (service, _db, _data_dir) = credential_service().await;
+
+        let conflict = NodeCredentialError::Conflict("exists".to_owned());
+        assert_eq!(conflict.message(), "exists");
+        assert_eq!(conflict.to_string(), "exists");
+        let internal = NodeCredentialError::from(sqlx::Error::RowNotFound);
+        assert!(matches!(internal, NodeCredentialError::Internal(_)));
+        assert!(!internal.message().trim().is_empty());
+
+        let credential_dir = service
+            .credential_dir("cred-abc_123")
+            .expect("valid credential dir");
+        assert!(credential_dir.ends_with(Path::new("credentials").join("cred-abc_123")));
+        assert!(service.credential_dir("bad key").is_err());
+        let generated = generated_credential_key();
+        assert!(generated.starts_with("cred-"));
+        validate_generated_key(&generated).expect("generated key is valid");
+
+        assert!(public_key_fingerprint("not-a-public-key").starts_with("SHA256:"));
+        validate_public_key("ecdsa-sha2-nistp256 YWJj comment").expect("ecdsa key");
+        assert!(validate_public_key("ssh-ed25519").is_err());
+        assert!(
+            normalize_private_key(
+                "-----BEGIN EC PRIVATE KEY-----\nfake\n-----END EC PRIVATE KEY-----"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
