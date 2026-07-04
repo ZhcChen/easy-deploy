@@ -12032,6 +12032,430 @@ services:
         );
     }
 
+    #[test]
+    fn service_runtime_overview_prioritizes_deploying_and_latest_message() {
+        let empty = service_runtime_overview(&[]);
+        assert_eq!(empty.status, "unknown");
+        assert!(empty.active_version.is_empty());
+        assert!(!empty.summary.trim().is_empty());
+
+        let states = vec![
+            runtime_state(
+                1,
+                "healthy",
+                "v1.2.0",
+                "ready",
+                Some("2026-06-05T00:00:00Z"),
+                "2026-06-01T00:00:00Z",
+            ),
+            runtime_state(
+                2,
+                "deploying",
+                "v1.2.0",
+                "switching",
+                None,
+                "2026-06-02T00:00:00Z",
+            ),
+            runtime_state(3, "unknown", "", "", None, "2026-06-03T00:00:00Z"),
+        ];
+
+        let overview = service_runtime_overview(&states);
+
+        assert_eq!(overview.status, "deploying");
+        assert_eq!(overview.active_version, "v1.2.0");
+        assert_eq!(overview.latest_message, "ready");
+        assert_eq!(overview.latest_checked_at, "2026-06-05T00:00:00Z");
+        assert!(overview.summary.contains('1'));
+    }
+
+    #[test]
+    fn service_target_node_item_uses_runtime_state_or_defaults() {
+        let node = target_node(7, "node-a");
+
+        let default_item = service_target_node_item(&node, &[]);
+        assert_eq!(default_item.id, 7);
+        assert_eq!(default_item.node_key, "node-a");
+        assert_eq!(default_item.runtime_status, "unknown");
+        assert!(default_item.active_version.is_empty());
+        assert_eq!(default_item.service_count, 0);
+        assert_eq!(default_item.last_task_id, None);
+
+        let states = [runtime_state(
+            7,
+            "healthy",
+            "v1.4.0",
+            "all good",
+            Some("2026-06-05T00:00:00Z"),
+            "2026-06-04T00:00:00Z",
+        )];
+        let item = service_target_node_item(&node, &states);
+
+        assert_eq!(item.runtime_status, "healthy");
+        assert_eq!(item.active_version, "v1.4.0");
+        assert_eq!(item.service_count, 2);
+        assert_eq!(item.message, "all good");
+        assert_eq!(item.last_task_id, Some(700));
+        assert_eq!(item.last_task_status.as_deref(), Some("completed"));
+        assert_eq!(item.last_task_kind.as_deref(), Some("compose.up"));
+        assert_eq!(item.last_deploy_at.as_deref(), Some("2026-06-05T00:00:00Z"));
+        assert_eq!(item.updated_at, "2026-06-04T00:00:00Z");
+    }
+
+    #[test]
+    fn select_service_log_node_uses_first_or_requested_node() {
+        let nodes = [target_node(1, "node-a"), target_node(2, "node-b")];
+
+        assert_eq!(
+            select_service_log_node(&nodes, None, "empty")
+                .expect("first node")
+                .id,
+            1
+        );
+        assert_eq!(
+            select_service_log_node(&nodes, Some(2), "empty")
+                .expect("requested node")
+                .node_key,
+            "node-b"
+        );
+        assert!(select_service_log_node(&nodes, Some(3), "empty").is_err());
+        assert!(select_service_log_node(&[], None, "empty").is_err());
+    }
+
+    #[test]
+    fn deploy_diff_reports_no_baseline_unchanged_and_binary_changes() {
+        let mut app = app_detail_item("worker-bin", "/opt/app");
+        let baseline_binary = binary_config_item("v1.0.0", "/opt/app/releases/v1.0.0/app");
+        let baseline = app_config_snapshot_item(
+            "v1.0.0",
+            &runtime_snapshot_metadata(
+                "manual",
+                "/opt/app",
+                Some("v1.0.0"),
+                Some(&DeployScriptSet::default()),
+                Some(&baseline_binary),
+            ),
+            "RUST_LOG=info\n",
+        );
+
+        let no_baseline = build_deploy_diff(
+            &app,
+            "services:\n  worker:\n    image: nginx\n",
+            "RUST_LOG=info\n",
+            &baseline_binary,
+            None,
+        );
+        assert_eq!(no_baseline.status, AppDeployDiffStatus::NoBaseline);
+        assert!(no_baseline.rows.is_empty());
+
+        let unchanged = build_deploy_diff(
+            &app,
+            &baseline.compose_content,
+            &baseline.env_content,
+            &baseline_binary,
+            Some(&baseline),
+        );
+        assert_eq!(unchanged.status, AppDeployDiffStatus::Unchanged);
+        assert!(unchanged.rows.iter().all(|row| !row.changed));
+
+        let current_binary = binary_config_item("v1.2.0", "/opt/app/releases/v1.2.0/app");
+        let changed = build_deploy_diff(
+            &app,
+            "services:\n  worker:\n    image: redis\n",
+            "RUST_LOG=debug\n",
+            &current_binary,
+            Some(&baseline),
+        );
+
+        assert_eq!(changed.baseline_snapshot_id, Some(1));
+        assert_eq!(changed.status, AppDeployDiffStatus::Changed);
+        assert!(changed.rows.len() > 2);
+        assert!(
+            changed
+                .rows
+                .iter()
+                .any(|row| row.label == "Compose" && row.changed)
+        );
+        assert!(
+            changed
+                .rows
+                .iter()
+                .any(|row| row.current_summary.contains("v1.2.0"))
+        );
+
+        app.app_type = "compose".to_owned();
+        let compose_only = build_deploy_diff(
+            &app,
+            "services:\n  worker:\n    image: redis\n",
+            "RUST_LOG=debug\n",
+            &current_binary,
+            Some(&baseline),
+        );
+        assert_eq!(compose_only.rows.len(), 2);
+    }
+
+    #[test]
+    fn normalize_binary_proxy_config_defaults_and_validates_inputs() {
+        let disabled = normalize_binary_proxy_config(
+            false,
+            "nginx",
+            "not checked",
+            "relative/path",
+            "restart",
+            "app",
+        )
+        .expect("disabled proxy");
+        assert_eq!(
+            disabled,
+            (
+                0,
+                "nginx".to_owned(),
+                "not checked".to_owned(),
+                "relative/path".to_owned()
+            )
+        );
+
+        let enabled = normalize_binary_proxy_config(
+            true,
+            "caddy",
+            "api.example.com",
+            "",
+            "blue_green",
+            "orders-api",
+        )
+        .expect("enabled caddy proxy");
+        assert_eq!(enabled.0, 1);
+        assert_eq!(enabled.1, "caddy");
+        assert_eq!(enabled.2, "api.example.com");
+        assert_eq!(enabled.3, "/etc/caddy/Caddyfile.d/orders-api.caddy");
+
+        let windows_path = normalize_binary_proxy_config(
+            true,
+            "nginx",
+            "127.0.0.1",
+            "C:/nginx/conf.d/app.conf",
+            "blue_green",
+            "orders-api",
+        )
+        .expect("windows absolute path");
+        assert_eq!(windows_path.3, "C:/nginx/conf.d/app.conf");
+
+        assert!(
+            normalize_binary_proxy_config(true, "caddy", "api.example.com", "", "restart", "app")
+                .is_err()
+        );
+        assert!(
+            normalize_binary_proxy_config(
+                true,
+                "haproxy",
+                "api.example.com",
+                "",
+                "blue_green",
+                "app"
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_binary_proxy_config(
+                true,
+                "caddy",
+                "-bad.example.com",
+                "",
+                "blue_green",
+                "app"
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_binary_proxy_config(
+                true,
+                "caddy",
+                "api.example.com",
+                "../Caddyfile",
+                "blue_green",
+                "app",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn normalize_binary_config_applies_defaults_and_rejects_bad_user() {
+        let config = normalize_binary_config(NormalizeBinaryConfigInput {
+            app_key: "orders-api",
+            work_dir: "/opt/apps/orders-api",
+            artifact_version: " v1.2.3 ",
+            artifact_path: " /tmp/orders-api ",
+            exec_args: " --port 8080 ",
+            service_user: "",
+            unit_name: "",
+            release_strategy: "",
+            active_slot: "",
+            base_port: 0,
+            standby_port: 18080,
+            proxy_enabled: false,
+            proxy_kind: "",
+            proxy_domain: "",
+            proxy_config_path: "",
+            env_content: "RUST_LOG=info",
+        })
+        .expect("normalize binary config");
+
+        assert_eq!(config.service_name, "orders-api");
+        assert_eq!(config.service_user, "deploy");
+        assert_eq!(config.unit_name, "easy-deploy-orders-api.service");
+        assert_eq!(config.release_strategy, "restart");
+        assert_eq!(config.active_slot, "blue");
+        assert_eq!(config.base_port, 0);
+        assert_eq!(config.proxy_enabled, 0);
+        assert_eq!(config.proxy_kind, "none");
+        assert_eq!(config.env_content, "RUST_LOG=info\n");
+
+        assert!(
+            normalize_binary_config(NormalizeBinaryConfigInput {
+                app_key: "orders-api",
+                work_dir: "/opt/apps/orders-api",
+                artifact_version: "",
+                artifact_path: "",
+                exec_args: "",
+                service_user: "bad user",
+                unit_name: "",
+                release_strategy: "",
+                active_slot: "",
+                base_port: 0,
+                standby_port: 0,
+                proxy_enabled: false,
+                proxy_kind: "",
+                proxy_domain: "",
+                proxy_config_path: "",
+                env_content: "",
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn artifact_metadata_and_entry_helpers_handle_boundaries() {
+        let metadata = render_artifact_metadata(ArtifactMetadataInput {
+            source: "openapi",
+            source_detail: "ai-agent",
+            unit_name: "orders-api.service",
+            uploaded_path: "/var/lib/easy-deploy/artifacts/orders-api",
+            original_file_name: "orders-api_version_1_2_3.tar.gz",
+            entry_file: "bin/server",
+            sha256: "abc123",
+            size_bytes: 123,
+            config_snapshot_id: Some(42),
+            config_revision_no: Some(7),
+        });
+
+        assert_eq!(artifact_metadata_value(&metadata, "source"), "openapi");
+        assert_eq!(artifact_metadata_value(&metadata, "size_bytes"), "123");
+        assert_eq!(release_metadata_snapshot_id(&metadata), Some(42));
+        let with_snapshot = release_metadata_with_snapshot(r#"{"source":"upload"}"#, 9, Some(3))
+            .expect("attach snapshot");
+        assert_eq!(artifact_metadata_value(&with_snapshot, "source"), "upload");
+        assert_eq!(
+            artifact_metadata_value(&with_snapshot, "config_snapshot_id"),
+            "9"
+        );
+        assert_eq!(
+            artifact_metadata_value(&with_snapshot, "config_revision_no"),
+            "3"
+        );
+        let repaired_array =
+            release_metadata_with_snapshot("[]", 10, None).expect("repair non-object metadata");
+        assert_eq!(
+            artifact_metadata_value(&repaired_array, "config_snapshot_id"),
+            "10"
+        );
+        assert!(release_metadata_with_snapshot("{", 1, None).is_err());
+
+        assert_eq!(upload_source("  "), "upload");
+        assert_eq!(artifact_channel_from_source("web"), "web");
+        assert_eq!(artifact_channel_from_source("ai-agent"), "openapi");
+        assert_eq!(artifact_kind_from_file_name("bundle.tgz"), "tar_gz");
+        assert_eq!(artifact_kind_from_file_name("server.jar"), "binary");
+        assert_eq!(
+            normalize_entry_file("", "server.jar", "binary").expect("default binary entry"),
+            "server.jar"
+        );
+        assert_eq!(
+            normalize_entry_file("bin/server", "bundle.tgz", "tar_gz").expect("explicit tar entry"),
+            "bin/server"
+        );
+        assert!(normalize_entry_file("", "bundle.tgz", "tar_gz").is_err());
+        assert!(normalize_entry_file("../server", "bundle.tgz", "tar_gz").is_err());
+        assert_eq!(
+            sanitize_archive_path(Path::new("./bin/server")).expect("safe archive path"),
+            PathBuf::from("bin").join("server")
+        );
+        assert!(sanitize_archive_path(Path::new("../server")).is_err());
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn command_output_helpers_order_failures_and_prepend_context() {
+        let success = ComposeCommandOutput {
+            command: "docker compose config".to_owned(),
+            success: true,
+            status_code: Some(0),
+            output: "valid".to_owned(),
+        };
+        let failed = ComposeCommandOutput {
+            command: "docker compose up".to_owned(),
+            success: false,
+            status_code: Some(17),
+            output: "boom".to_owned(),
+        };
+
+        let merged = merge_command_outputs(
+            vec![success.clone(), failed.clone()],
+            false,
+            "fallback command",
+        );
+
+        assert_eq!(merged.command, "docker compose up");
+        assert_eq!(merged.status_code, Some(17));
+        assert!(merged.output.starts_with("$ docker compose up\nboom"));
+        assert!(merged.output.contains("$ docker compose config\nvalid"));
+
+        let contextual = prepend_failure_context(merged, "preflight failed");
+        assert!(contextual.output.starts_with("preflight failed\n"));
+        let unchanged = prepend_failure_context(success, "ignored");
+        assert_eq!(unchanged.output, "valid");
+        let fallback = merge_command_outputs(Vec::new(), true, "fallback command");
+        assert_eq!(fallback.command, "fallback command");
+        assert_eq!(fallback.status_code, Some(0));
+    }
+
+    #[test]
+    fn compose_runtime_helpers_count_paths_and_dedupe_values() {
+        assert_eq!(
+            count_compose_running_lines(
+                "NAME IMAGE STATUS\napi nginx running\ntime=\"2026\" level=warning\n---\nworker busybox running\n"
+            ),
+            2
+        );
+        assert_eq!(
+            target_work_dir_path(r"C:\apps\", "orders/current"),
+            "C:/apps/orders/current"
+        );
+        assert_eq!(target_work_dir_path("", "orders/current"), "orders/current");
+        assert_eq!(dedupe_ids(&[3, 1, 3, 2, 1]), vec![3, 1, 2]);
+        assert_eq!(
+            dedupe_strings(&[
+                " api ".to_owned(),
+                String::new(),
+                "api".to_owned(),
+                "worker".to_owned(),
+            ]),
+            vec!["api".to_owned(), "worker".to_owned()]
+        );
+    }
+
     fn uploaded_binary_artifact(id: i64, version: &str) -> BinaryArtifactItem {
         binary_artifact(id, version, r#"{"source":"upload"}"#)
     }
@@ -12138,6 +12562,47 @@ services:
             proxy_config_path: String::new(),
             deploy_strategy: DeployStrategy::RollingStopOnFailure,
             action: BinaryTaskAction::Restart,
+        }
+    }
+
+    fn runtime_state(
+        node_id: i64,
+        runtime_status: &str,
+        active_version: &str,
+        message: &str,
+        last_deploy_at: Option<&str>,
+        updated_at: &str,
+    ) -> AppRuntimeStateItem {
+        AppRuntimeStateItem {
+            node_id,
+            node_name: format!("node-{node_id}"),
+            node_key: format!("node-{node_id}"),
+            runtime_status: runtime_status.to_owned(),
+            active_version: active_version.to_owned(),
+            service_count: 2,
+            message: message.to_owned(),
+            last_task_id: Some(node_id * 100),
+            last_task_status: Some("completed".to_owned()),
+            last_task_kind: Some("compose.up".to_owned()),
+            last_deploy_at: last_deploy_at.map(str::to_owned),
+            updated_at: updated_at.to_owned(),
+        }
+    }
+
+    fn target_node(id: i64, node_key: &str) -> AppTargetNode {
+        AppTargetNode {
+            id,
+            node_key: node_key.to_owned(),
+            name: format!("Node {id}"),
+            node_type: "local".to_owned(),
+            status: "active".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            ssh_port: 22,
+            ssh_user: "root".to_owned(),
+            credential_private_key_path: None,
+            work_dir: "/opt/easy-deploy/apps".to_owned(),
+            caddy_available: 1,
+            nginx_available: 0,
         }
     }
 }

@@ -577,6 +577,141 @@ struct MigrationChange {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn load_applied_migrations_handles_missing_and_existing_table() {
+        let db = SqlitePool::connect_with(
+            "sqlite::memory:"
+                .parse::<SqliteConnectOptions>()
+                .expect("valid in-memory sqlite url"),
+        )
+        .await
+        .expect("connect sqlite");
+
+        assert!(
+            load_applied_migrations(&db)
+                .await
+                .expect("load without table")
+                .is_empty()
+        );
+
+        sqlx::query(
+            r#"
+            CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .expect("create migrations table");
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(42_i64)
+        .bind("add_release_queue")
+        .bind(true)
+        .bind(vec![1_u8, 2, 3])
+        .execute(&db)
+        .await
+        .expect("insert migration row");
+
+        let rows = load_applied_migrations(&db)
+            .await
+            .expect("load applied migrations");
+        let row = rows.get(&42).expect("applied row");
+
+        assert_eq!(row.description, "add_release_queue");
+        assert!(row.success);
+        assert_eq!(row.checksum, vec![1_u8, 2, 3]);
+    }
+
+    #[test]
+    fn print_status_includes_summary_and_missing_rows() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.migration_type.is_up_migration())
+            .expect("at least one migration");
+        let mut applied = BTreeMap::new();
+        applied.insert(
+            migration.version,
+            AppliedRow {
+                description: migration.description.to_string(),
+                success: true,
+                checksum: migration.checksum.as_ref().to_vec(),
+            },
+        );
+        applied.insert(
+            999_999,
+            AppliedRow {
+                description: "manual_hotfix".to_owned(),
+                success: true,
+                checksum: vec![9],
+            },
+        );
+        let mut output = Vec::new();
+
+        print_status("sqlite::memory:", &applied, &mut output).expect("print status");
+        let text = String::from_utf8(output).expect("status utf8");
+
+        assert!(text.contains("migration directory: api/migrations"));
+        assert!(text.contains("database: sqlite::memory:"));
+        assert!(text.contains("summary:"));
+        assert!(text.contains("applied=1"));
+        assert!(text.contains("missing=1"));
+        assert!(text.contains("999999"));
+        assert!(text.contains("manual_hotfix"));
+    }
+
+    #[test]
+    fn status_row_detects_pending_dirty_changed_and_applied() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.migration_type.is_up_migration())
+            .expect("at least one migration");
+
+        assert_eq!(status_row_for_migration(migration, None).state, "pending");
+        assert_eq!(
+            status_row_for_migration(
+                migration,
+                Some(&AppliedRow {
+                    description: migration.description.to_string(),
+                    success: false,
+                    checksum: migration.checksum.as_ref().to_vec(),
+                }),
+            )
+            .state,
+            "dirty"
+        );
+        assert_eq!(
+            status_row_for_migration(
+                migration,
+                Some(&AppliedRow {
+                    description: migration.description.to_string(),
+                    success: true,
+                    checksum: vec![0],
+                }),
+            )
+            .state,
+            "changed"
+        );
+        assert_eq!(
+            status_row_for_migration(
+                migration,
+                Some(&AppliedRow {
+                    description: migration.description.to_string(),
+                    success: true,
+                    checksum: migration.checksum.as_ref().to_vec(),
+                }),
+            )
+            .state,
+            "applied"
+        );
+    }
 
     #[test]
     fn normalizes_migration_name() {
@@ -596,11 +731,33 @@ mod tests {
     }
 
     #[test]
+    fn validates_migration_description_boundaries() {
+        assert!(is_valid_migration_description("add_release_queue"));
+        assert!(is_valid_migration_description("v2_index"));
+        assert!(!is_valid_migration_description(""));
+        assert!(!is_valid_migration_description("_leading"));
+        assert!(!is_valid_migration_description("trailing_"));
+        assert!(!is_valid_migration_description("double__underscore"));
+        assert!(!is_valid_migration_description("UpperCase"));
+        assert!(!is_valid_migration_description("contains-dash"));
+    }
+
+    #[test]
     fn creates_next_numbered_file_name() {
         let names = ["0001_init.sql", "0028_api_tokens.sql", "README.md"];
         assert_eq!(
             next_versioned_file_name(names.iter().copied(), "add_audit_index").unwrap(),
             "0029_add_audit_index.sql"
+        );
+    }
+
+    #[test]
+    fn next_versioned_file_name_preserves_wider_version_width() {
+        let names = ["000001_init.sql", "000010_add_users.sql", "notes.txt"];
+
+        assert_eq!(
+            next_versioned_file_name(names.iter().copied(), "add_audit_index").unwrap(),
+            "000011_add_audit_index.sql"
         );
     }
 
@@ -611,7 +768,22 @@ mod tests {
             Some((42, 4))
         );
         assert_eq!(parse_migration_version("README.md").unwrap(), None);
+        assert_eq!(parse_migration_version("0042_add_table.txt").unwrap(), None);
+        assert_eq!(parse_migration_version("0042").unwrap(), None);
         assert!(parse_migration_version("abcd_bad.sql").is_err());
+    }
+
+    #[test]
+    fn read_migration_file_names_lists_directory_entries() {
+        let dir = tempdir().expect("create temp dir");
+        fs::write(dir.path().join("0001_init.sql"), "-- init\n").expect("write migration");
+        fs::write(dir.path().join(".keep"), "").expect("write keep file");
+
+        let mut names = read_migration_file_names(dir.path()).expect("read migration file names");
+        names.sort();
+
+        assert_eq!(names, vec![".keep".to_owned(), "0001_init.sql".to_owned()]);
+        assert!(read_migration_file_names(&dir.path().join("missing")).is_err());
     }
 
     #[test]
@@ -718,6 +890,28 @@ mod tests {
     }
 
     #[test]
+    fn guard_rejects_copy_and_unknown_status_inside_migrations() {
+        let changes = vec![
+            MigrationChange {
+                status: "C100".to_string(),
+                path: "api/migrations/0002_copy.sql".to_string(),
+                old_path: "api/migrations/0001_init.sql".to_string(),
+            },
+            MigrationChange {
+                status: "T".to_string(),
+                path: "api/migrations/0001_init.sql".to_string(),
+                old_path: String::new(),
+            },
+        ];
+
+        let err = validate_changes(&changes, "api/migrations").unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("got C100"));
+        assert!(message.contains("got T"));
+    }
+
+    #[test]
     fn guard_ignores_changes_outside_migrations_and_keep_file() {
         let changes = vec![
             MigrationChange {
@@ -746,6 +940,10 @@ mod tests {
             &[r"api\migrations\0001_init.sql"],
             "api/migrations"
         ));
+        assert!(touches_migrations_dir(
+            &["/api/migrations"],
+            "api/migrations"
+        ));
         assert!(!touches_migrations_dir(
             &["api/src/migrations.rs"],
             "api/migrations"
@@ -758,5 +956,25 @@ mod tests {
             append_untracked_as_adds(vec!["api/migrations/0029_add_table.sql".to_string()]),
             vec!["A\tapi/migrations/0029_add_table.sql".to_string()]
         );
+        assert_eq!(
+            append_untracked_as_adds(vec![
+                " ".to_string(),
+                " api/migrations/0030_add_node.sql ".to_string()
+            ]),
+            vec!["A\tapi/migrations/0030_add_node.sql".to_string()]
+        );
+    }
+
+    #[test]
+    fn repo_relative_path_uses_slashes_and_rejects_external_path() {
+        let root = tempdir().expect("create repo root");
+        let migration_path = root.path().join("api").join("migrations");
+        let other = tempdir().expect("create other dir");
+
+        assert_eq!(
+            to_repo_relative_slash_path(root.path(), &migration_path).expect("relative path"),
+            "api/migrations"
+        );
+        assert!(to_repo_relative_slash_path(root.path(), other.path()).is_err());
     }
 }
