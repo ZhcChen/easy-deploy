@@ -1208,4 +1208,211 @@ mod tests {
                 .contains("release_file: \"releases/v1.2.3/release.yaml\"")
         );
     }
+
+    #[tokio::test]
+    async fn save_release_package_file_sanitizes_name_and_rejects_invalid_input() {
+        let data_dir = tempdir().expect("create temp data dir");
+        let runtime = RuntimeFs::new(data_dir.path());
+
+        let artifact_path = runtime
+            .save_release_package_file(
+                "orders-api-prod",
+                "v1.2.3",
+                "../orders-api+prod@1.tar.gz",
+                b"package-bytes",
+            )
+            .await
+            .expect("save package");
+
+        assert_eq!(
+            artifact_path,
+            data_dir
+                .path()
+                .join("apps")
+                .join("orders-api-prod")
+                .join(RELEASES_DIR_NAME)
+                .join("v1.2.3")
+                .join("orders-api+prod@1.tar.gz")
+        );
+        assert_eq!(
+            fs::read(&artifact_path).await.expect("read package"),
+            b"package-bytes"
+        );
+        assert!(
+            runtime
+                .save_release_package_file("bad key", "v1.2.3", "pkg.tar.gz", b"")
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .save_release_package_file("orders-api", "../v1", "pkg.tar.gz", b"")
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .save_release_package_file("orders-api", "v1.2.3", "bad name.tar.gz", b"")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn save_app_runtime_files_removes_empty_optional_files() {
+        let data_dir = tempdir().expect("create temp data dir");
+        let runtime = RuntimeFs::new(data_dir.path());
+        let scripts = DeployScriptSet {
+            deploy: "docker compose up -d".to_owned(),
+            ..DeployScriptSet::default()
+        };
+
+        runtime
+            .save_app_runtime_files_with_scripts(
+                "orders-api",
+                "services: {}\n",
+                "RUST_LOG=info\n",
+                "app_key: \"orders-api\"\n",
+                &scripts,
+            )
+            .await
+            .expect("save runtime files");
+        runtime
+            .save_app_runtime_files("orders-api", "", "", "app_key: \"orders-api\"\n")
+            .await
+            .expect("save empty optional files");
+
+        let loaded = runtime
+            .load_app_config("orders-api")
+            .await
+            .expect("load runtime files");
+        assert_eq!(loaded.compose_content, "");
+        assert_eq!(loaded.env_content, "");
+        assert_eq!(loaded.deploy_scripts, DeployScriptSet::default());
+        assert!(!loaded.root_dir.join(COMPOSE_FILE_NAME).exists());
+        assert!(
+            !loaded
+                .root_dir
+                .join(META_DIR_NAME)
+                .join(SCRIPTS_DIR_NAME)
+                .join(DEPLOY_STAGE_SCRIPT_FILE_NAME)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn save_binary_runtime_files_renders_and_loads_all_runtime_files() {
+        let data_dir = tempdir().expect("create temp data dir");
+        let runtime = RuntimeFs::new(data_dir.path());
+
+        let result = runtime
+            .save_binary_runtime_files(binary_runtime_config())
+            .await
+            .expect("save binary runtime");
+        let files = result.files;
+
+        assert!(files.unit_path.is_file());
+        assert!(files.env_path.is_file());
+        assert!(files.blue_unit_path.is_file());
+        assert!(files.green_unit_path.is_file());
+        assert!(
+            files
+                .unit_content
+                .contains("ExecStart=/opt/worker/bin/server --port 8080")
+        );
+        assert!(files.blue_unit_content.contains("Environment=PORT=8080"));
+        assert!(
+            files
+                .blue_unit_content
+                .contains("ExecStart=/opt/worker/bin/server --port ${PORT}")
+        );
+        assert!(files.green_unit_content.contains("Environment=PORT=18080"));
+        assert!(
+            files
+                .release_content
+                .contains("artifact_version: \"v1.2.3\"")
+        );
+        assert!(
+            files
+                .current_content
+                .contains("artifact_version: \"v1.2.3\"")
+        );
+
+        let loaded = runtime
+            .load_binary_runtime_files("worker-bin", "easy-deploy-worker-bin.service", "v1.2.3")
+            .await
+            .expect("load binary runtime");
+        assert_eq!(loaded.unit_content, files.unit_content);
+        assert_eq!(loaded.env_content, "RUST_LOG=info\n");
+        assert_eq!(loaded.release_content, files.release_content);
+
+        let empty = runtime
+            .load_binary_runtime_files("worker-bin", "", "v1.2.3")
+            .await
+            .expect("empty binary runtime");
+        assert_eq!(empty.unit_content, "");
+        assert_eq!(empty.release_content, "");
+    }
+
+    #[test]
+    fn validators_and_path_helpers_cover_boundaries() {
+        assert!(validate_key("orders-api_1").is_ok());
+        assert!(validate_key("").is_err());
+        assert!(validate_key("orders api").is_err());
+        assert!(validate_release_id("v1.2.3").is_ok());
+        assert!(validate_release_id("../v1").is_err());
+        assert!(validate_unit_file_name("easy-deploy-worker@blue.service").is_ok());
+        assert!(validate_unit_file_name("worker.timer").is_err());
+        assert_eq!(
+            sanitize_file_name("../orders+prod@1.tar.gz").expect("sanitize"),
+            "orders+prod@1.tar.gz"
+        );
+        assert!(sanitize_file_name("bad name.tar.gz").is_err());
+
+        assert_eq!(
+            script_metadata_path(PRE_DEPLOY_SCRIPT_FILE_NAME),
+            ".easy-deploy/scripts/pre_deploy.sh"
+        );
+        assert_eq!(script_metadata_path("unknown.sh"), "");
+        assert_eq!(
+            target_path(r"C:\apps\worker\", ".easy-deploy/systemd/worker.service"),
+            "C:/apps/worker/.easy-deploy/systemd/worker.service"
+        );
+        assert_eq!(target_path("", "relative/file"), "relative/file");
+        assert_eq!(ensure_trailing_newline(""), "");
+        assert_eq!(ensure_trailing_newline("KEY=value"), "KEY=value\n");
+        assert_eq!(ensure_trailing_newline("KEY=value\n"), "KEY=value\n");
+
+        let (path, args) = slot_exec_start(
+            "/opt/worker/bin/server-8080",
+            "-p 8080 --metrics-port=19090",
+            8080,
+        );
+        assert_eq!(path, "/opt/worker/bin/server-${PORT}");
+        assert_eq!(args, "-p ${PORT} --metrics-port=19090");
+    }
+
+    fn binary_runtime_config() -> BinaryRuntimeConfig {
+        BinaryRuntimeConfig {
+            app_key: "worker-bin".to_owned(),
+            app_id: 7,
+            name: "Worker".to_owned(),
+            service_name: "worker-bin".to_owned(),
+            artifact_version: "v1.2.3".to_owned(),
+            artifact_path: "/opt/worker/bin/server".to_owned(),
+            exec_args: "--port 8080".to_owned(),
+            working_dir: "/opt/worker".to_owned(),
+            service_user: "deploy".to_owned(),
+            unit_name: "easy-deploy-worker-bin.service".to_owned(),
+            release_strategy: "blue_green".to_owned(),
+            active_slot: "blue".to_owned(),
+            base_port: 8080,
+            standby_port: 18080,
+            proxy_enabled: true,
+            proxy_kind: "caddy".to_owned(),
+            proxy_domain: "worker.example.com".to_owned(),
+            proxy_config_path: "/etc/caddy/Caddyfile.d/worker-bin.caddy".to_owned(),
+            env_content: "RUST_LOG=info".to_owned(),
+        }
+    }
 }

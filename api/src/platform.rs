@@ -259,7 +259,72 @@ fn normalize_app_key_segment(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use sqlx::sqlite::SqliteConnectOptions;
+
     use super::*;
+
+    async fn platform_service() -> PlatformConfigService {
+        let db = sqlx::SqlitePool::connect_with(
+            "sqlite::memory:"
+                .parse::<SqliteConnectOptions>()
+                .expect("valid in-memory sqlite url")
+                .foreign_keys(true),
+        )
+        .await
+        .expect("connect in-memory sqlite");
+        sqlx::migrate!("./migrations")
+            .run(&db)
+            .await
+            .expect("run migrations");
+        PlatformConfigService::new(db)
+    }
+
+    #[tokio::test]
+    async fn service_reads_defaults_and_persists_updates() {
+        let service = platform_service().await;
+
+        let defaults = service.config().await.expect("default config");
+        assert_eq!(defaults, PlatformConfig::default());
+
+        let updated = service
+            .update_config(
+                UpdatePlatformConfigInput {
+                    default_app_work_dir: r" \srv\apps\{app_key}\ ".to_owned(),
+                    default_node_work_dir: r" .\nodes\ ".to_owned(),
+                    uploaded_binary_releases_to_keep: 6,
+                },
+                "admin",
+            )
+            .await
+            .expect("update config");
+        assert_eq!(updated.default_app_work_dir, "/srv/apps/{app_key}");
+        assert_eq!(updated.default_node_work_dir, "./nodes");
+        assert_eq!(updated.uploaded_binary_releases_to_keep, 6);
+
+        let loaded = service.config().await.expect("load updated config");
+        assert_eq!(loaded, updated);
+    }
+
+    #[tokio::test]
+    async fn service_rejects_invalid_updates_before_persisting() {
+        let service = platform_service().await;
+
+        let err = service
+            .update_config(
+                UpdatePlatformConfigInput {
+                    default_app_work_dir: "/srv/apps".to_owned(),
+                    default_node_work_dir: "/srv/nodes".to_owned(),
+                    uploaded_binary_releases_to_keep: 4,
+                },
+                "admin",
+            )
+            .await
+            .expect_err("missing app key placeholder");
+
+        assert!(matches!(err, PlatformConfigError::InvalidInput(_)));
+        assert!(!err.message().is_empty());
+        assert!(!err.to_string().is_empty());
+    }
 
     #[test]
     fn app_work_dir_template_requires_app_key_placeholder() {
@@ -284,7 +349,28 @@ mod tests {
     #[test]
     fn releases_to_keep_has_practical_bounds() {
         assert_eq!(normalize_releases_to_keep("4").expect("valid value"), 4);
+        assert!(normalize_releases_to_keep("many").is_err());
         assert!(normalize_releases_to_keep("0").is_err());
         assert!(normalize_releases_to_keep("31").is_err());
+    }
+
+    #[test]
+    fn work_dir_and_app_key_normalizers_cover_defaults_and_errors() {
+        assert_eq!(
+            normalize_work_dir("", "/opt/easy-deploy/apps", "path").expect("fallback"),
+            "/opt/easy-deploy/apps"
+        );
+        assert_eq!(
+            normalize_work_dir(r".\runtime\", "/fallback", "path").expect("relative path"),
+            "./runtime"
+        );
+        assert!(normalize_work_dir("relative", "/fallback", "path").is_err());
+        assert!(normalize_work_dir("/srv/apps\nbad", "/fallback", "path").is_err());
+
+        assert_eq!(
+            normalize_app_key_segment(" Orders API ++ Prod "),
+            "orders-api-prod"
+        );
+        assert_eq!(normalize_app_key_segment("###"), "app");
     }
 }

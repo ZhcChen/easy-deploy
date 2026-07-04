@@ -7199,3 +7199,113 @@ fn command_specs_contain_sequence(specs: &[(String, String)], expected: &[(&str,
     }
     cursor == expected.len()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_managed_known_hosts_ssh_and_scp_commands() {
+        assert_eq!(normalized_managed_known_hosts_command("docker ps"), None);
+        assert_eq!(
+            normalized_managed_known_hosts_command(
+                r"ssh -p 22 -o UserKnownHostsFile=.easy-deploy\ssh\known_hosts -o StrictHostKeyChecking=yes root@example.com uptime"
+            )
+            .as_deref(),
+            Some("ssh -p 22 root@example.com uptime")
+        );
+        assert_eq!(
+            normalized_managed_known_hosts_command(
+                "scp -P 22 -o UserKnownHostsFile=.easy-deploy/ssh/known_hosts -o StrictHostKeyChecking=yes ./app root@example.com:/opt/app"
+            )
+            .as_deref(),
+            Some("scp -P 22 ./app root@example.com:/opt/app")
+        );
+    }
+
+    #[test]
+    fn extracts_hidden_values_and_reports_missing_parts() {
+        let html = r#"
+            <form>
+              <input type="hidden" name="csrf_token" value="csrf-123">
+              <input type="hidden" name="role_id" value="42">
+            </form>
+        "#;
+
+        assert_eq!(extract_csrf_token(html).expect("csrf token"), "csrf-123");
+        assert_eq!(
+            extract_hidden_value(html, "role_id").expect("role id"),
+            "42"
+        );
+        assert!(extract_hidden_value(html, "missing").is_err());
+        assert!(ensure_contains_all(html, &["csrf-123", "role_id"], "form").is_ok());
+        assert!(ensure_contains_all(html, &["not-present"], "form").is_err());
+    }
+
+    #[test]
+    fn extracts_table_body_rows_and_release_deploy_actions() {
+        let html = r#"
+            <table>
+              <tbody>
+                <tr><td>v1.0.0</td><td><form action="/apps/1/binary/releases/11/deploy"><button>deploy</button></form></td></tr>
+                <tr><td>v1.1.0</td><td><form action="/noop"></form><form action="/apps/1/binary/releases/12/deploy?source=test"><button>deploy</button></form></td></tr>
+              </tbody>
+            </table>
+        "#;
+
+        let body = html_table_body(html).expect("table body");
+        assert!(body.contains("v1.0.0"));
+        let row = html_table_row_containing(html, "v1.1.0").expect("row");
+        assert!(row.contains("/apps/1/binary/releases/12/deploy"));
+        assert_eq!(
+            extract_binary_release_deploy_path(html, "v1.1.0").expect("deploy path"),
+            "/apps/1/binary/releases/12/deploy?source=test"
+        );
+        assert!(html_table_body("<table></table>").is_err());
+        assert!(html_table_row_containing(html, "v2.0.0").is_err());
+        assert!(extract_binary_release_deploy_path(html, "v2.0.0").is_err());
+    }
+
+    #[test]
+    fn extracts_task_ids_and_checks_command_sequences() {
+        assert_eq!(
+            extract_task_id_from_location("/tasks/42?tab=logs").expect("task id"),
+            42
+        );
+        assert!(extract_task_id_from_location("/apps/42").is_err());
+
+        let commands = vec![
+            "docker compose config".to_owned(),
+            "docker compose up -d".to_owned(),
+            "docker compose ps".to_owned(),
+        ];
+        assert!(command_order_contains(
+            &commands,
+            &["docker compose config", "docker compose ps"]
+        ));
+        assert!(!command_order_contains(
+            &commands,
+            &["docker compose ps", "docker compose config"]
+        ));
+
+        let specs = vec![
+            ("docker compose config".to_owned(), "/opt/app".to_owned()),
+            ("docker compose up -d".to_owned(), "/opt/app".to_owned()),
+            ("docker compose ps".to_owned(), "/opt/app".to_owned()),
+        ];
+        assert!(command_specs_contain_sequence(
+            &specs,
+            &[
+                ("docker compose config", "/opt/app"),
+                ("docker compose ps", "/opt/app"),
+            ]
+        ));
+        assert!(!command_specs_contain_sequence(
+            &specs,
+            &[
+                ("docker compose ps", "/opt/app"),
+                ("docker compose config", "/opt/app"),
+            ]
+        ));
+    }
+}

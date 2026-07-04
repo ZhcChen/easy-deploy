@@ -12456,6 +12456,388 @@ services:
         );
     }
 
+    #[test]
+    fn top_level_normalizers_accept_defaults_and_reject_invalid_values() {
+        assert_eq!(
+            normalize_deploy_strategy("").expect("default deploy strategy"),
+            "rolling_stop_on_failure"
+        );
+        assert_eq!(
+            normalize_deploy_strategy("rolling_continue").expect("explicit deploy strategy"),
+            "rolling_continue"
+        );
+        assert!(normalize_deploy_strategy("parallel").is_err());
+        assert_eq!(
+            parse_deploy_strategy("rolling_continue"),
+            DeployStrategy::RollingContinue
+        );
+        assert_eq!(
+            parse_deploy_strategy("bad"),
+            DeployStrategy::RollingStopOnFailure
+        );
+
+        assert_eq!(
+            normalize_release_source("").expect("default release source"),
+            "package_upload"
+        );
+        assert_eq!(
+            normalize_release_source("manual").expect("manual release source"),
+            "manual"
+        );
+        assert!(normalize_release_source("git_tag").is_err());
+        assert_eq!(release_status_after_upload(true), "queued");
+        assert_eq!(release_status_after_upload(false), "received");
+
+        assert_eq!(
+            normalize_key(" Orders_API ").expect("normalize key"),
+            "orders_api"
+        );
+        assert!(normalize_key("orders api").is_err());
+        assert_eq!(
+            normalize_app_type("compose").expect("compose type"),
+            "compose"
+        );
+        assert!(normalize_app_type("systemd").is_err());
+        assert_eq!(
+            normalize_app_environment("").expect("default environment"),
+            "test"
+        );
+        assert_eq!(
+            normalize_app_environment("prod").expect("production alias"),
+            "production"
+        );
+        assert!(normalize_app_environment("staging").is_err());
+        assert_eq!(
+            normalize_release_id("v1.2.3").expect("release id"),
+            "v1.2.3"
+        );
+        assert!(normalize_release_id("../v1").is_err());
+    }
+
+    #[test]
+    fn published_at_normalization_accepts_utc_and_local_times() {
+        assert_eq!(normalize_published_at("").expect("empty time"), None);
+        assert_eq!(
+            normalize_published_at("2026-06-23T10:00:00+08:00")
+                .expect("rfc3339 time")
+                .as_deref(),
+            Some("2026-06-23T02:00:00Z")
+        );
+        assert_eq!(
+            normalize_published_at("2026-06-23T10:00")
+                .expect("local datetime")
+                .as_deref(),
+            Some("2026-06-23T02:00:00Z")
+        );
+        assert_eq!(
+            normalize_published_at("release-window-2026")
+                .expect("safe custom value")
+                .as_deref(),
+            Some("release-window-2026")
+        );
+        assert!(normalize_published_at("bad value with spaces").is_err());
+    }
+
+    #[test]
+    fn binary_path_and_proxy_helpers_render_expected_values() {
+        let root = tempdir().expect("runtime root");
+        let unit_path = binary_systemd_unit_path(root.path(), "worker.service");
+        assert_eq!(
+            unit_path,
+            root.path()
+                .join(META_DIR_NAME)
+                .join(SYSTEMD_DIR_NAME)
+                .join("worker.service")
+        );
+        assert_eq!(
+            remote_binary_systemd_unit_path("/opt/apps/worker/", "worker.service")
+                .expect("remote unit path"),
+            "/opt/apps/worker/.easy-deploy/systemd/worker.service"
+        );
+        assert!(remote_binary_systemd_unit_path("relative", "worker.service").is_err());
+        assert_eq!(
+            binary_command_work_dir("relative", root.path()),
+            root.path().to_path_buf()
+        );
+        assert_eq!(
+            binary_command_work_dir(
+                root.path().to_string_lossy().as_ref(),
+                Path::new("fallback")
+            ),
+            root.path().to_path_buf()
+        );
+
+        let mut job = binary_task_job();
+        job.proxy_kind = "caddy".to_owned();
+        job.proxy_domain = "worker.example.com".to_owned();
+        job.proxy_config_path = String::new();
+        assert_eq!(
+            binary_proxy_config_path(&job).expect("default proxy path"),
+            "/etc/caddy/Caddyfile.d/worker-bin.caddy"
+        );
+        assert_eq!(
+            proxy_config_file_name(&job).expect("caddy file name"),
+            "worker-bin.caddy"
+        );
+        let caddy = render_binary_proxy_config(&job).expect("caddy config");
+        assert!(caddy.contains("worker.example.com"));
+        assert!(caddy.contains("127.0.0.1:18080"));
+
+        job.proxy_kind = "nginx".to_owned();
+        job.proxy_config_path = "/etc/nginx/conf.d/worker.conf".to_owned();
+        assert_eq!(
+            binary_proxy_config_path(&job).expect("custom proxy path"),
+            "/etc/nginx/conf.d/worker.conf"
+        );
+        assert_eq!(
+            proxy_config_file_name(&job).expect("nginx file name"),
+            "worker-bin.conf"
+        );
+        let nginx = render_binary_proxy_config(&job).expect("nginx config");
+        assert!(nginx.contains("server_name worker.example.com"));
+        assert!(nginx.contains("proxy_pass http://127.0.0.1:18080"));
+
+        assert_eq!(
+            remote_parent_path("/etc/nginx/conf.d/worker.conf").unwrap(),
+            "/etc/nginx/conf.d"
+        );
+        assert!(remote_parent_path("worker.conf").is_err());
+        assert_eq!(proxy_systemd_service_name("nginx"), "nginx.service");
+        assert_eq!(proxy_systemd_service_name("caddy"), "caddy.service");
+        assert_eq!(binary_proxy_kind_label("nginx"), "Nginx");
+        assert_eq!(binary_proxy_kind_label("caddy"), "Caddy");
+
+        job.proxy_kind = "none".to_owned();
+        assert!(render_binary_proxy_config(&job).is_err());
+        assert!(proxy_config_file_name(&job).is_err());
+    }
+
+    #[test]
+    fn remote_copy_and_node_work_dir_helpers_normalize_paths() {
+        let root = tempdir().expect("copy root");
+        let source = root.path().join("runtime");
+        fs::create_dir_all(source.join("nested")).expect("create source dirs");
+        fs::write(source.join("app.yaml"), "app").expect("write app file");
+        fs::write(source.join("nested").join("release.yaml"), "release").expect("write release");
+
+        let files =
+            collect_remote_copy_files(&source, "/opt/apps/worker").expect("collect copy files");
+        let remote_paths = files
+            .iter()
+            .map(|file| file.remote_path.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(remote_paths.contains(&"/opt/apps/worker/app.yaml"));
+        assert!(remote_paths.contains(&"/opt/apps/worker/nested/release.yaml"));
+        assert_eq!(
+            remote_parent_dirs(&files, "/opt/apps/worker"),
+            vec![
+                "/opt/apps/worker".to_owned(),
+                "/opt/apps/worker/nested".to_owned()
+            ]
+        );
+        assert!(collect_remote_copy_files(&source.join("missing"), "/opt/apps/worker").is_err());
+        assert_eq!(
+            normalize_remote_target_root(r"\opt\apps\worker\").expect("normalize remote root"),
+            "/opt/apps/worker"
+        );
+        assert!(normalize_remote_target_root("/opt//apps").is_err());
+        assert_eq!(remote_join("/opt/apps/", "/worker"), "/opt/apps/worker");
+
+        let mut job = binary_task_job();
+        let node = target_node(1, "node-a");
+        job.deploy_work_dir = String::new();
+        assert_eq!(
+            binary_node_deploy_work_dir(&job, &node),
+            "/opt/easy-deploy/apps/worker-bin"
+        );
+        job.deploy_work_dir = "/srv/worker".to_owned();
+        assert_eq!(binary_node_deploy_work_dir(&job, &node), "/srv/worker");
+
+        let mut app = app_detail_item("orders-api", "");
+        assert_eq!(
+            binary_node_deploy_work_dir_for_app(&app, &node),
+            "/opt/easy-deploy/apps/orders-api"
+        );
+        app.work_dir = "/srv/orders".to_owned();
+        assert_eq!(
+            binary_node_deploy_work_dir_for_app(&app, &node),
+            "/srv/orders"
+        );
+    }
+
+    #[test]
+    fn runtime_metadata_and_config_helpers_round_trip_binary_fields() {
+        let mut app = app_detail_item("worker-bin", "/opt/app");
+        app.description = r#"needs "quotes" and \slashes"#.to_owned();
+        let config = binary_config_item("v2.0.0", "/opt/app/releases/v2.0.0/app");
+        let metadata = render_runtime_metadata(
+            &app,
+            vec![TargetNodeMetadata {
+                node_key: "node-a".to_owned(),
+                name: r#"Node "A""#.to_owned(),
+            }],
+            "/var/lib/easy-deploy/apps/worker-bin",
+            Some(&config),
+        );
+
+        assert!(metadata.contains(r#"app_key: "worker-bin""#));
+        assert!(metadata.contains(r#"description: "needs \"quotes\" and \\slashes""#));
+        assert!(metadata.contains(r#"node_key: "node-a""#));
+        assert!(metadata.contains(r#"name: "Node \"A\"""#));
+        assert!(metadata.contains(r#"artifact_version: "v2.0.0""#));
+        assert!(
+            metadata.contains(r#"env_file: ".easy-deploy/systemd/easy-deploy-worker-bin.env""#)
+        );
+
+        let runtime_metadata = to_binary_runtime_metadata(&config);
+        assert_eq!(runtime_metadata.service_name, "worker-bin");
+        assert!(runtime_metadata.proxy_enabled);
+        let runtime_config = to_binary_runtime_config(9, "worker-bin", "Worker", &config);
+        assert_eq!(runtime_config.app_id, 9);
+        assert_eq!(runtime_config.name, "Worker");
+        assert_eq!(runtime_config.env_content, "RUST_LOG=info\n");
+
+        assert_eq!(binary_unit_env_file_name("worker.service"), "worker.env");
+        assert_eq!(binary_unit_env_file_name("worker"), "worker.env");
+        assert_eq!(
+            binary_blue_green_unit_name("worker.service", "green"),
+            "worker-green.service"
+        );
+
+        let restored = binary_config_from_metadata(&metadata);
+        assert_eq!(restored.artifact_version, "v2.0.0");
+        assert_eq!(restored.unit_name, "easy-deploy-worker-bin.service");
+        assert_eq!(restored.base_port, 8080);
+        assert_eq!(restored.proxy_enabled, 1);
+        assert_eq!(binary_config_from_metadata("not yaml").unit_name, "");
+    }
+
+    #[test]
+    fn deploy_script_snapshot_and_runtime_dir_helpers_load_scripts() {
+        let scripts = deploy_scripts_from_snapshot_metadata(
+            r#"{"deploy_scripts":{"pre_deploy":"pre","deploy":"deploy","post_deploy":"post","switch_traffic":"switch","cleanup":"clean"}}"#,
+        );
+        assert_eq!(scripts.pre_deploy, "pre");
+        assert_eq!(scripts.deploy, "deploy");
+        assert_eq!(scripts.post_deploy, "post");
+        assert_eq!(scripts.switch_traffic, "switch");
+        assert_eq!(scripts.cleanup, "clean");
+        assert_eq!(
+            deploy_scripts_from_snapshot_metadata("{}"),
+            DeployScriptSet::default()
+        );
+
+        let root = tempdir().expect("script root");
+        let scripts_dir = root.path().join(META_DIR_NAME).join("scripts");
+        fs::create_dir_all(&scripts_dir).expect("create scripts dir");
+        fs::write(scripts_dir.join("pre_deploy.sh"), "pre").expect("write pre");
+        fs::write(scripts_dir.join("deploy.sh"), "deploy").expect("write deploy");
+        fs::write(scripts_dir.join("post_deploy.sh"), "post").expect("write post");
+        fs::write(scripts_dir.join("switch_traffic.sh"), "switch").expect("write switch");
+        fs::write(scripts_dir.join("cleanup.sh"), "clean").expect("write cleanup");
+
+        let loaded = deploy_scripts_from_runtime_dir(root.path());
+        assert_eq!(loaded.pre_deploy, "pre");
+        assert_eq!(loaded.deploy, "deploy");
+        assert_eq!(loaded.post_deploy, "post");
+        assert_eq!(loaded.switch_traffic, "switch");
+        assert_eq!(loaded.cleanup, "clean");
+    }
+
+    #[test]
+    fn health_action_and_guard_helpers_cover_status_rules() {
+        let mut app = app_detail_item("worker-bin", "/opt/app");
+        assert!(ensure_app_enabled(&app).is_ok());
+        app.status = "disabled".to_owned();
+        assert!(ensure_app_enabled(&app).is_err());
+
+        assert!(ensure_has_enabled_targets(&[target_node(1, "node-a")]).is_ok());
+        assert!(ensure_has_enabled_targets(&[]).is_err());
+        assert!(!task_phase_label("queued").trim().is_empty());
+        assert!(!task_phase_label("missing").trim().is_empty());
+
+        assert_eq!(
+            ComposeTaskAction::from_task_kind("compose.restart"),
+            Some(ComposeTaskAction::Restart)
+        );
+        assert_eq!(ComposeTaskAction::from_task_kind("bad"), None);
+        assert_eq!(ComposeTaskAction::Up.task_kind(), "compose.up");
+        assert_eq!(ComposeTaskAction::Down.deploy_action(), "compose_down");
+        assert!(ComposeTaskAction::Restart.runs_health_check());
+        assert!(!ComposeTaskAction::Down.runs_health_check());
+        assert_eq!(
+            ComposeTaskAction::Down.runtime_status(true, "completed"),
+            "stopped"
+        );
+        assert_eq!(
+            ComposeTaskAction::Up.runtime_status(false, "failed"),
+            "unhealthy"
+        );
+        assert_eq!(
+            compose_action_command_label(ComposeTaskAction::Restart),
+            "docker compose restart"
+        );
+
+        assert_eq!(
+            BinaryTaskAction::from_task_kind("binary.restart"),
+            Some(BinaryTaskAction::Restart)
+        );
+        assert_eq!(BinaryTaskAction::from_task_kind("bad"), None);
+        assert_eq!(BinaryTaskAction::Restart.task_kind(), "binary.restart");
+        assert_eq!(BinaryTaskAction::Stop.deploy_action(), "binary_stop");
+        assert!(BinaryTaskAction::Restart.runs_health_check());
+        assert!(BinaryTaskAction::Restart.syncs_runtime_files());
+        assert!(!BinaryTaskAction::Stop.syncs_runtime_files());
+        assert_eq!(
+            BinaryTaskAction::Stop.runtime_status(true, "completed"),
+            "stopped"
+        );
+        assert_eq!(
+            BinaryTaskAction::Restart.runtime_status(false, "failed"),
+            "unhealthy"
+        );
+        assert_eq!(
+            binary_action_command_label(BinaryTaskAction::Stop, "worker.service"),
+            "systemctl stop worker.service"
+        );
+
+        let http = health_check_detail_text(
+            &HealthCheckConfig {
+                kind: HealthCheckKind::Http,
+                endpoint: "http://127.0.0.1:8080/healthz".to_owned(),
+                timeout_secs: 3,
+                expected_status: 204,
+            },
+            None,
+        );
+        assert!(http.contains("http://127.0.0.1:8080/healthz"));
+        assert!(http.contains("204"));
+
+        let mut binary = binary_config_item("v1.0.0", "/opt/app");
+        binary.active_slot = "green".to_owned();
+        let systemd = health_check_detail_text(
+            &HealthCheckConfig {
+                kind: HealthCheckKind::SystemdActive,
+                endpoint: "worker.service".to_owned(),
+                timeout_secs: 5,
+                expected_status: 200,
+            },
+            Some(&binary),
+        );
+        assert!(systemd.contains("easy-deploy-worker-bin-green.service"));
+        assert_eq!(display_health_endpoint("", "fallback"), "fallback");
+        assert_eq!(common_active_version(&[]), "");
+        let mixed_version = common_active_version(&[
+            runtime_state(1, "healthy", "v1.0.0", "", None, "2026-06-01T00:00:00Z"),
+            runtime_state(2, "healthy", "v1.1.0", "", None, "2026-06-01T00:00:00Z"),
+        ]);
+        assert!(!mixed_version.trim().is_empty());
+        assert_ne!(mixed_version, "v1.0.0");
+        assert_ne!(mixed_version, "v1.1.0");
+        assert!(!format_runtime_summary(0, 0, 0, 0, 0).trim().is_empty());
+    }
+
     fn uploaded_binary_artifact(id: i64, version: &str) -> BinaryArtifactItem {
         binary_artifact(id, version, r#"{"source":"upload"}"#)
     }

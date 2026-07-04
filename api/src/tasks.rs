@@ -1780,4 +1780,112 @@ mod tests {
         assert_eq!(position.queued_before, 0);
         assert_eq!(position.running_before, 0);
     }
+
+    #[test]
+    fn task_filter_normalization_trims_valid_values_and_rejects_unknowns() {
+        let normalized = normalize_task_filter(TaskListFilter {
+            status: Some(" running ".to_owned()),
+            phase: Some(" deploy ".to_owned()),
+            app_id: Some(9),
+            task_kind: Some(" release.deploy ".to_owned()),
+            query: Some("x".repeat(120)),
+        })
+        .expect("normalize filter");
+
+        assert_eq!(normalized.status.as_deref(), Some("running"));
+        assert_eq!(normalized.phase.as_deref(), Some("deploy"));
+        assert_eq!(normalized.app_id, Some(9));
+        assert_eq!(normalized.task_kind.as_deref(), Some("release.deploy"));
+        assert_eq!(normalized.query.as_deref().expect("query").len(), 80);
+
+        assert!(
+            normalize_task_filter(TaskListFilter {
+                status: Some("paused".to_owned()),
+                ..TaskListFilter::default()
+            })
+            .is_err()
+        );
+        assert!(
+            normalize_task_filter(TaskListFilter {
+                phase: Some("unknown".to_owned()),
+                ..TaskListFilter::default()
+            })
+            .is_err()
+        );
+        assert!(
+            normalize_task_filter(TaskListFilter {
+                task_kind: Some("compose.deploy".to_owned()),
+                ..TaskListFilter::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn task_status_phase_and_step_helpers_cover_boundaries() {
+        assert!(!active_task_status_label("queued").trim().is_empty());
+        assert!(!active_task_status_label("running").trim().is_empty());
+        assert!(!active_task_status_label("other").trim().is_empty());
+        assert_eq!(first_lines("\nalpha\n\nbeta\ngamma\n", 2), "alpha\nbeta");
+        assert!(!first_lines("\n\n", 2).is_empty());
+
+        for phase in [
+            "queued",
+            "preflight",
+            "preparing_files",
+            "executing",
+            "healthchecking",
+            "prepare",
+            "render",
+            "pre_deploy",
+            "deploy",
+            "post_deploy",
+            "switch_traffic",
+            "cleanup",
+            "finalize",
+            "completed",
+            "failed",
+            "canceled",
+        ] {
+            assert_eq!(normalize_task_phase(phase).expect("valid phase"), phase);
+            assert!(!task_phase_title(phase).trim().is_empty());
+        }
+        assert!(normalize_task_phase("missing").is_err());
+        assert!(!task_phase_title("missing").trim().is_empty());
+
+        for status in ["success", "failed", "skipped"] {
+            assert_eq!(
+                normalize_node_result_status(status).expect("node result status"),
+                status
+            );
+        }
+        assert!(normalize_node_result_status("running").is_err());
+
+        for status in ["pending", "running", "success", "failed", "skipped"] {
+            assert_eq!(normalize_step_status(status).expect("step status"), status);
+        }
+        assert!(normalize_step_status("canceled").is_err());
+
+        for stream in ["system", "stdout", "stderr", "combined"] {
+            assert_eq!(normalize_log_stream(stream).expect("log stream"), stream);
+        }
+        assert!(normalize_log_stream("debug").is_err());
+
+        assert_eq!(
+            normalize_step_key(" pre.deploy_1 ").expect("step key"),
+            "pre.deploy_1"
+        );
+        assert!(normalize_step_key("bad key").is_err());
+        assert_eq!(
+            required_step_text(" deploy ", "message").expect("required text"),
+            "deploy"
+        );
+        assert!(required_step_text(" ", "message").is_err());
+        assert_eq!(
+            normalize_optional_filter(Some(" value ".to_owned())).as_deref(),
+            Some("value")
+        );
+        assert_eq!(normalize_optional_filter(Some("   ".to_owned())), None);
+        assert_eq!(normalize_optional_filter(None), None);
+    }
 }
