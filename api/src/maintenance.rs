@@ -265,3 +265,221 @@ fn chrono_like_timestamp() -> String {
         .unwrap_or_default();
     seconds.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
+    use tempfile::{TempDir, tempdir};
+
+    use super::*;
+
+    async fn migrated_db() -> SqlitePool {
+        let db = SqlitePool::connect_with(
+            "sqlite::memory:"
+                .parse::<SqliteConnectOptions>()
+                .expect("valid in-memory sqlite url")
+                .foreign_keys(true),
+        )
+        .await
+        .expect("connect in-memory sqlite");
+        sqlx::migrate!("./migrations")
+            .run(&db)
+            .await
+            .expect("run migrations");
+        db
+    }
+
+    fn runtime_data_dir() -> TempDir {
+        let data_dir = tempdir().expect("create runtime data dir");
+        fs::create_dir_all(data_dir.path().join("apps")).expect("create apps dir");
+        fs::create_dir_all(data_dir.path().join("credentials")).expect("create credentials dir");
+        data_dir
+    }
+
+    async fn seed_business_data(db: &SqlitePool) -> i64 {
+        let credential_id = sqlx::query(
+            r#"
+            INSERT INTO node_credentials(
+                credential_key,
+                name,
+                public_key,
+                private_key_path,
+                fingerprint,
+                status
+            )
+            VALUES ('cred-test', 'test key', 'ssh-ed25519 AAAA', '/tmp/id_ed25519', 'SHA256:test', 'active')
+            "#,
+        )
+        .execute(db)
+        .await
+        .expect("insert credential")
+        .last_insert_rowid();
+        sqlx::query(
+            r#"
+            UPDATE nodes
+            SET credential_id = ?1,
+                status = 'online',
+                docker_status = 'ok',
+                last_check_at = '2026-06-01T00:00:00Z'
+            WHERE node_key = 'local'
+            "#,
+        )
+        .bind(credential_id)
+        .execute(db)
+        .await
+        .expect("bind local credential");
+        sqlx::query(
+            r#"
+            INSERT INTO nodes(
+                node_key,
+                name,
+                node_type,
+                address,
+                ssh_port,
+                ssh_user,
+                credential_id,
+                work_dir,
+                region,
+                labels,
+                status,
+                docker_status
+            )
+            VALUES ('remote-a', 'remote A', 'ssh', '10.0.0.2', 22, 'root', ?1, '/opt/apps', 'test', 'ssh', 'online', 'ok')
+            "#,
+        )
+        .bind(credential_id)
+        .execute(db)
+        .await
+        .expect("insert remote node");
+        sqlx::query(
+            r#"
+            INSERT INTO event_logs(event_type, level, target_type, target_id, title, summary, detail)
+            VALUES ('node.check', 'info', 'node', '2', 'probe', 'ok', 'detail')
+            "#,
+        )
+        .execute(db)
+        .await
+        .expect("insert event log");
+        credential_id
+    }
+
+    fn count_for(report: &CleanDemoDataReport, table: &str) -> i64 {
+        report
+            .table_counts
+            .iter()
+            .find(|item| item.table == table)
+            .map(|item| item.count)
+            .expect("table count")
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_business_rows_and_runtime_paths_without_deleting() {
+        let db = migrated_db().await;
+        let data_dir = runtime_data_dir();
+        seed_business_data(&db).await;
+
+        let report = clean_demo_data(
+            &db,
+            "sqlite://:memory:",
+            CleanDemoDataOptions {
+                dry_run: true,
+                backup: true,
+                data_dir: data_dir.path().to_path_buf(),
+            },
+        )
+        .await
+        .expect("dry run clean demo data");
+
+        assert_eq!(report.backup_path, None);
+        assert_eq!(count_for(&report, "event_logs"), 1);
+        assert_eq!(count_for(&report, "node_credentials"), 1);
+        assert_eq!(
+            count_for(&report, "nodes(non_local_or_bound_credentials)"),
+            2
+        );
+        assert_eq!(report.removed_paths.len(), 2);
+        assert!(data_dir.path().join("apps").exists());
+        assert!(data_dir.path().join("credentials").exists());
+
+        let remaining_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_logs")
+            .fetch_one(&db)
+            .await
+            .expect("count events");
+        assert_eq!(remaining_events, 1);
+    }
+
+    #[tokio::test]
+    async fn clean_demo_data_removes_business_rows_and_resets_local_node() {
+        let db = migrated_db().await;
+        let data_dir = runtime_data_dir();
+        seed_business_data(&db).await;
+
+        let report = clean_demo_data(
+            &db,
+            "sqlite://:memory:",
+            CleanDemoDataOptions {
+                dry_run: false,
+                backup: false,
+                data_dir: data_dir.path().to_path_buf(),
+            },
+        )
+        .await
+        .expect("clean demo data");
+
+        assert_eq!(report.backup_path, None);
+        assert_eq!(count_for(&report, "event_logs"), 1);
+        assert_eq!(count_for(&report, "node_credentials"), 1);
+        assert!(!data_dir.path().join("apps").exists());
+        assert!(!data_dir.path().join("credentials").exists());
+
+        let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_logs")
+            .fetch_one(&db)
+            .await
+            .expect("count events after clean");
+        let credential_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_credentials")
+            .fetch_one(&db)
+            .await
+            .expect("count credentials after clean");
+        let node_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes")
+            .fetch_one(&db)
+            .await
+            .expect("count nodes after clean");
+        let local = sqlx::query_as::<_, (Option<i64>, String, String, Option<String>)>(
+            "SELECT credential_id, status, docker_status, last_check_at FROM nodes WHERE node_key = 'local'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("read local node");
+
+        assert_eq!(event_count, 0);
+        assert_eq!(credential_count, 0);
+        assert_eq!(node_count, 1);
+        assert_eq!(local.0, None);
+        assert_eq!(local.1, "unknown");
+        assert_eq!(local.2, "unknown");
+        assert_eq!(local.3, None);
+    }
+
+    #[test]
+    fn backup_sqlite_database_copies_existing_database_file() {
+        let data_dir = tempdir().expect("create database dir");
+        let database_path = data_dir.path().join("easy-deploy.db");
+        fs::write(&database_path, "db-content").expect("write database file");
+
+        let backup_path =
+            backup_sqlite_database(&format!("sqlite://{}", database_path.to_string_lossy()))
+                .expect("backup database");
+
+        assert_ne!(backup_path, database_path.to_string_lossy());
+        assert_eq!(
+            fs::read_to_string(backup_path).expect("read backup"),
+            "db-content"
+        );
+    }
+
+    #[test]
+    fn sqlite_database_path_rejects_unsupported_urls() {
+        assert!(sqlite_database_path("postgres://localhost/easy_deploy").is_err());
+        assert!(sqlite_database_path("sqlite://:memory:").is_err());
+    }
+}

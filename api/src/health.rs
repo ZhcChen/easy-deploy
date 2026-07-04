@@ -319,7 +319,47 @@ fn output_summary(output: &str, fallback: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use tempfile::tempdir;
+
+    use crate::deploy::{CommandResult, CommandRunner, CommandSpec};
+
     use super::*;
+
+    struct StaticCommandRunner {
+        status_code: Option<i32>,
+        stdout: &'static str,
+        stderr: &'static str,
+    }
+
+    #[async_trait]
+    impl CommandRunner for StaticCommandRunner {
+        async fn run(&self, _spec: CommandSpec) -> Result<CommandResult, DeployError> {
+            Ok(CommandResult {
+                status_code: self.status_code,
+                stdout: self.stdout.to_owned(),
+                stderr: self.stderr.to_owned(),
+            })
+        }
+    }
+
+    fn executors(
+        status_code: Option<i32>,
+        stdout: &'static str,
+        stderr: &'static str,
+    ) -> (ComposeExecutor, SystemdExecutor) {
+        let runner = Arc::new(StaticCommandRunner {
+            status_code,
+            stdout,
+            stderr,
+        });
+        (
+            ComposeExecutor::new(runner.clone()),
+            SystemdExecutor::new(runner),
+        )
+    }
 
     #[test]
     fn normalize_tcp_config_accepts_host_port() {
@@ -328,6 +368,108 @@ mod tests {
 
         assert_eq!(config.kind, HealthCheckKind::Tcp);
         assert_eq!(config.endpoint, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn normalize_config_clamps_bounds_and_clears_unused_endpoints() {
+        let config =
+            normalize_health_config("none", " http://ignored ", 0, 700).expect("valid none config");
+
+        assert_eq!(config.kind, HealthCheckKind::None);
+        assert_eq!(config.endpoint, "");
+        assert_eq!(config.timeout_secs, 1);
+        assert_eq!(config.expected_status, 599);
+
+        let compose = normalize_health_config("compose_running", "ignored", 120, 99)
+            .expect("valid compose config");
+        assert_eq!(compose.endpoint, "");
+        assert_eq!(compose.timeout_secs, 60);
+        assert_eq!(compose.expected_status, 100);
+    }
+
+    #[test]
+    fn normalize_systemd_config_requires_unit_name() {
+        let err = normalize_health_config("systemd_active", " ", 5, 200)
+            .expect_err("empty unit should fail");
+
+        assert!(matches!(err, HealthError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn parse_tcp_endpoint_rejects_missing_or_invalid_port() {
+        assert!(parse_tcp_endpoint("localhost").is_err());
+        assert!(parse_tcp_endpoint("localhost:not-a-port").is_err());
+        assert_eq!(
+            parse_tcp_endpoint(" 127.0.0.1:8080 ").expect("valid tcp endpoint"),
+            "127.0.0.1:8080"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_health_check_none_succeeds_without_executors() {
+        let (compose, systemd) = executors(Some(1), "", "should not run");
+        let outcome = run_health_check(
+            &HealthCheckConfig::default(),
+            &compose,
+            &systemd,
+            tempdir().expect("work dir").path().to_path_buf(),
+        )
+        .await
+        .expect("run none health check");
+
+        assert!(outcome.healthy);
+    }
+
+    #[tokio::test]
+    async fn compose_running_check_requires_running_container_rows() {
+        let work_dir = tempdir().expect("work dir");
+        let config = HealthCheckConfig {
+            kind: HealthCheckKind::ComposeRunning,
+            ..Default::default()
+        };
+        let (compose, systemd) = executors(
+            Some(0),
+            "NAME      IMAGE          SERVICE\napp-1     nginx:alpine   app\n",
+            "",
+        );
+
+        let outcome = run_health_check(&config, &compose, &systemd, work_dir.path().to_path_buf())
+            .await
+            .expect("run compose health check");
+
+        assert!(outcome.healthy);
+
+        let (compose, systemd) = executors(Some(0), "NAME      IMAGE          SERVICE\n", "");
+        let outcome = run_health_check(&config, &compose, &systemd, work_dir.path().to_path_buf())
+            .await
+            .expect("run empty compose health check");
+
+        assert!(!outcome.healthy);
+    }
+
+    #[tokio::test]
+    async fn systemd_active_check_uses_is_active_output() {
+        let work_dir = tempdir().expect("work dir");
+        let config = HealthCheckConfig {
+            kind: HealthCheckKind::SystemdActive,
+            endpoint: "easy-deploy.service".to_owned(),
+            ..Default::default()
+        };
+        let (compose, systemd) = executors(Some(0), "active\n", "");
+
+        let outcome = run_health_check(&config, &compose, &systemd, work_dir.path().to_path_buf())
+            .await
+            .expect("run systemd health check");
+
+        assert!(outcome.healthy);
+
+        let (compose, systemd) = executors(Some(3), "inactive\n", "");
+        let outcome = run_health_check(&config, &compose, &systemd, work_dir.path().to_path_buf())
+            .await
+            .expect("run inactive systemd health check");
+
+        assert!(!outcome.healthy);
+        assert_eq!(outcome.message, "inactive");
     }
 
     #[test]

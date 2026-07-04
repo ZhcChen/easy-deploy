@@ -605,6 +605,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_migration_versions_from_numbered_sql_files() {
+        assert_eq!(
+            parse_migration_version("0042_release_queue_scheduled_status.sql").unwrap(),
+            Some((42, 4))
+        );
+        assert_eq!(parse_migration_version("README.md").unwrap(), None);
+        assert!(parse_migration_version("abcd_bad.sql").is_err());
+    }
+
+    #[test]
+    fn validates_migration_file_name_shape() {
+        assert!(is_valid_migration_file_name("0001_init.sql"));
+        assert!(is_valid_migration_file_name("202607040001_add_app.sql"));
+        assert!(!is_valid_migration_file_name("001_add_app.sql"));
+        assert!(!is_valid_migration_file_name("0001_AddApp.sql"));
+        assert!(!is_valid_migration_file_name("0001_add__app.sql"));
+        assert!(!is_valid_migration_file_name("0001_add_app.txt"));
+    }
+
+    #[test]
     fn parses_git_name_status_lines() {
         let changes = parse_name_status_lines(&[
             "A\tapi/migrations/0029_add_table.sql".to_string(),
@@ -627,6 +647,12 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parse_name_status_rejects_malformed_lines() {
+        assert!(parse_name_status_lines(&["M".to_string()]).is_err());
+        assert!(parse_name_status_lines(&["R100\tapi/migrations/0001_a.sql".to_string()]).is_err());
     }
 
     #[test]
@@ -662,6 +688,68 @@ mod tests {
 
         let err = validate_changes(&changes, "api/migrations").unwrap_err();
         assert!(err.to_string().contains("NNNN_snake_case.sql"));
+    }
+
+    #[test]
+    fn guard_rejects_delete_rename_and_non_sql_inside_migrations() {
+        let changes = vec![
+            MigrationChange {
+                status: "D".to_string(),
+                path: "api/migrations/0001_init.sql".to_string(),
+                old_path: String::new(),
+            },
+            MigrationChange {
+                status: "R100".to_string(),
+                path: "api/migrations/0001_bootstrap.sql".to_string(),
+                old_path: "api/migrations/0001_init.sql".to_string(),
+            },
+            MigrationChange {
+                status: "A".to_string(),
+                path: "api/migrations/readme.md".to_string(),
+                old_path: String::new(),
+            },
+        ];
+
+        let err = validate_changes(&changes, "api/migrations").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("cannot be deleted"));
+        assert!(message.contains("cannot be renamed"));
+        assert!(message.contains("only allows versioned SQL"));
+    }
+
+    #[test]
+    fn guard_ignores_changes_outside_migrations_and_keep_file() {
+        let changes = vec![
+            MigrationChange {
+                status: "M".to_string(),
+                path: "api/src/main.rs".to_string(),
+                old_path: String::new(),
+            },
+            MigrationChange {
+                status: "M".to_string(),
+                path: "api/migrations/.keep".to_string(),
+                old_path: String::new(),
+            },
+        ];
+
+        validate_changes(&changes, "api/migrations").unwrap();
+    }
+
+    #[test]
+    fn normalizes_paths_for_migration_dir_matching() {
+        assert_eq!(
+            slash_file_name(r"api\migrations\0001_init.sql"),
+            "0001_init.sql"
+        );
+        assert_eq!(normalize_slash_path(r"\api\migrations\"), "api/migrations");
+        assert!(touches_migrations_dir(
+            &[r"api\migrations\0001_init.sql"],
+            "api/migrations"
+        ));
+        assert!(!touches_migrations_dir(
+            &["api/src/migrations.rs"],
+            "api/migrations"
+        ));
     }
 
     #[test]

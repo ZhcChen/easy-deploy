@@ -109,7 +109,7 @@ fn readable_score(value: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::fix_mojibake;
+    use super::*;
 
     #[test]
     fn fixes_common_node_probe_mojibake() {
@@ -119,6 +119,28 @@ mod tests {
             fix_mojibake("SSH 鑺傜偣鎺㈡祴閫氳繃锛孌ocker 涓?Compose 鍙敤"),
             "SSH 节点探测通过，Docker 与 Compose 可用"
         );
+    }
+
+    #[test]
+    fn scores_and_replaces_known_mojibake_tokens() {
+        let (from, to) = KNOWN_MOJIBAKE_REPLACEMENTS[0];
+
+        assert!(looks_like_mojibake(from));
+        assert!(mojibake_score(from) > 0);
+        assert_eq!(replace_known_tokens(from), to);
+        assert_eq!(replace_known_tokens("plain text"), "plain text");
+        assert!(readable_score("Docker 26.1 / ok") > 0);
+        assert_eq!(readable_score("\n\t"), 0);
+    }
+
+    #[test]
+    fn only_accepts_candidate_when_it_reduces_bad_markers() {
+        let (from, to) = KNOWN_MOJIBAKE_REPLACEMENTS[0];
+
+        assert!(looks_better_after_fix(from, to));
+        assert!(!looks_better_after_fix(from, from));
+        assert!(!looks_better_after_fix(from, ""));
+        assert!(!looks_better_after_fix("plain", "plain"));
     }
 
     #[test]
