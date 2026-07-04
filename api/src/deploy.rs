@@ -1658,15 +1658,23 @@ mod tests {
     async fn tokio_command_runner_times_out_slow_commands() {
         let work_dir = tempdir().expect("temp dir");
         let runner = TokioCommandRunner::new(1);
-
-        let err = runner
-            .run(CommandSpec {
-                program: "powershell".to_owned(),
-                args: vec![
+        let (program, args) = if cfg!(windows) {
+            (
+                "powershell".to_owned(),
+                vec![
                     "-NoProfile".to_owned(),
                     "-Command".to_owned(),
                     "Start-Sleep -Seconds 5".to_owned(),
                 ],
+            )
+        } else {
+            ("sh".to_owned(), vec!["-c".to_owned(), "sleep 5".to_owned()])
+        };
+
+        let err = runner
+            .run(CommandSpec {
+                program,
+                args,
                 current_dir: work_dir.path().to_path_buf(),
             })
             .await

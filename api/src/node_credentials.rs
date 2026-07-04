@@ -522,3 +522,147 @@ fn validate_generated_key(value: &str) -> Result<(), NodeCredentialError> {
 fn io_error(action: &str, path: &Path, err: std::io::Error) -> NodeCredentialError {
     NodeCredentialError::Internal(format!("{action} {} 失败: {err}", path.to_string_lossy()))
 }
+
+#[cfg(test)]
+mod tests {
+    use sqlx::sqlite::SqliteConnectOptions;
+    use tempfile::{TempDir, tempdir};
+
+    use super::*;
+
+    const PUBLIC_KEY: &str = "ssh-ed25519 YWJjZGVm test@example";
+
+    async fn credential_service() -> (NodeCredentialService, SqlitePool, TempDir) {
+        let db = sqlx::SqlitePool::connect_with(
+            "sqlite::memory:"
+                .parse::<SqliteConnectOptions>()
+                .expect("valid in-memory sqlite url")
+                .foreign_keys(true),
+        )
+        .await
+        .expect("connect in-memory sqlite");
+        sqlx::migrate!("./migrations")
+            .run(&db)
+            .await
+            .expect("run migrations");
+        let data_dir = tempdir().expect("create data dir");
+        (
+            NodeCredentialService::new(db.clone(), data_dir.path()),
+            db,
+            data_dir,
+        )
+    }
+
+    #[tokio::test]
+    async fn uploaded_key_is_persisted_listed_and_disabled() {
+        let (service, db, _data_dir) = credential_service().await;
+
+        let created = service
+            .create_uploaded_key(CreateUploadedCredentialInput {
+                name: "  prod ssh key  ".to_owned(),
+                private_key:
+                    "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----"
+                        .to_owned(),
+                public_key: PUBLIC_KEY.to_owned(),
+                passphrase_hint: "vault item".to_owned(),
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect("create uploaded key");
+
+        assert_eq!(created.name, "prod ssh key");
+        assert_eq!(created.public_key, PUBLIC_KEY);
+        assert!(created.fingerprint.starts_with("SHA256:"));
+
+        sqlx::query("UPDATE nodes SET credential_id = ?1 WHERE node_key = 'local'")
+            .bind(created.id)
+            .execute(&db)
+            .await
+            .expect("bind credential to local node");
+
+        let credentials = service.list_credentials().await.expect("list credentials");
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0].name, "prod ssh key");
+        assert_eq!(credentials[0].status, "active");
+        assert_eq!(credentials[0].passphrase_hint, "vault item");
+        assert_eq!(credentials[0].bound_node_count, 1);
+        assert!(Path::new(&credentials[0].private_key_path).is_file());
+
+        let options = service.active_options().await.expect("active options");
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].id, created.id);
+
+        service
+            .set_status(created.id, "disabled")
+            .await
+            .expect("disable credential");
+
+        assert!(
+            service
+                .active_options()
+                .await
+                .expect("active options after disable")
+                .is_empty()
+        );
+        let credentials = service
+            .list_credentials()
+            .await
+            .expect("list after disable");
+        assert_eq!(credentials[0].status, "disabled");
+    }
+
+    #[tokio::test]
+    async fn uploaded_key_rejects_bad_inputs() {
+        let (service, _db, _data_dir) = credential_service().await;
+
+        let empty_name = service
+            .create_uploaded_key(CreateUploadedCredentialInput {
+                name: " ".to_owned(),
+                private_key:
+                    "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----"
+                        .to_owned(),
+                public_key: PUBLIC_KEY.to_owned(),
+                passphrase_hint: String::new(),
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect_err("empty name should be rejected");
+        assert!(matches!(empty_name, NodeCredentialError::InvalidInput(_)));
+
+        let bad_public_key = service
+            .create_uploaded_key(CreateUploadedCredentialInput {
+                name: "bad public key".to_owned(),
+                private_key:
+                    "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----"
+                        .to_owned(),
+                public_key: "ssh-ed25519 not-base64".to_owned(),
+                passphrase_hint: String::new(),
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect_err("bad public key should be rejected");
+        assert!(matches!(
+            bad_public_key,
+            NodeCredentialError::InvalidInput(_)
+        ));
+
+        let bad_status = service
+            .set_status(404, "deleted")
+            .await
+            .expect_err("bad status should be rejected");
+        assert!(matches!(bad_status, NodeCredentialError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn generated_key_algorithm_accepts_supported_values_only() {
+        assert!(matches!(
+            GeneratedKeyAlgorithm::parse("").expect("default algorithm"),
+            GeneratedKeyAlgorithm::Ed25519
+        ));
+        assert!(matches!(
+            GeneratedKeyAlgorithm::parse("rsa_4096").expect("rsa algorithm"),
+            GeneratedKeyAlgorithm::Rsa4096
+        ));
+        assert!(GeneratedKeyAlgorithm::parse("dsa").is_err());
+    }
+}

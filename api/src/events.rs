@@ -256,3 +256,155 @@ fn truncate(value: &str, max_chars: usize) -> String {
     }
     truncated
 }
+
+#[cfg(test)]
+mod tests {
+    use sqlx::sqlite::SqliteConnectOptions;
+
+    use super::*;
+
+    async fn event_service() -> EventLogService {
+        let db = sqlx::SqlitePool::connect_with(
+            "sqlite::memory:"
+                .parse::<SqliteConnectOptions>()
+                .expect("valid in-memory sqlite url")
+                .foreign_keys(true),
+        )
+        .await
+        .expect("connect in-memory sqlite");
+        sqlx::migrate!("./migrations")
+            .run(&db)
+            .await
+            .expect("run migrations");
+        EventLogService::new(db)
+    }
+
+    #[tokio::test]
+    async fn records_events_and_applies_filters() {
+        let service = event_service().await;
+        service
+            .record(EventLogInput {
+                event_type: "node.check",
+                level: "",
+                target_type: "node",
+                target_id: "1",
+                target_name: "test-node",
+                title: "node probe",
+                summary: "docker ok",
+                detail: "probe output",
+            })
+            .await
+            .expect("record info event");
+        service
+            .record(EventLogInput {
+                event_type: "release.deploy",
+                level: "error",
+                target_type: "app",
+                target_id: "orders",
+                target_name: "Orders API",
+                title: "deploy failed",
+                summary: "disk full",
+                detail: "no space left on device",
+            })
+            .await
+            .expect("record error event");
+
+        let all = service
+            .list_filtered(EventLogFilter::default())
+            .await
+            .expect("list events");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].event_type, "release.deploy");
+        assert_eq!(all[1].level, "info");
+
+        let filtered = service
+            .list_filtered(EventLogFilter {
+                level: Some(" error ".to_owned()),
+                target_type: Some("app".to_owned()),
+                query: Some("disk".to_owned()),
+                ..Default::default()
+            })
+            .await
+            .expect("filter events");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].target_id, "orders");
+        assert_eq!(filtered[0].summary, "disk full");
+    }
+
+    #[tokio::test]
+    async fn filter_options_are_distinct_and_sorted() {
+        let service = event_service().await;
+        for (event_type, target_type) in [
+            ("node.check", "node"),
+            ("release.deploy", "app"),
+            ("node.check", "node"),
+        ] {
+            service
+                .record(EventLogInput {
+                    event_type,
+                    level: "info",
+                    target_type,
+                    target_id: "1",
+                    target_name: "target",
+                    title: "title",
+                    summary: "",
+                    detail: "",
+                })
+                .await
+                .expect("record event");
+        }
+
+        let event_types = service
+            .event_type_options()
+            .await
+            .expect("event type options")
+            .into_iter()
+            .map(|item| item.value)
+            .collect::<Vec<_>>();
+        assert_eq!(event_types, ["node.check", "release.deploy"]);
+
+        let target_types = service
+            .target_type_options()
+            .await
+            .expect("target type options")
+            .into_iter()
+            .map(|item| item.value)
+            .collect::<Vec<_>>();
+        assert_eq!(target_types, ["app", "node"]);
+    }
+
+    #[tokio::test]
+    async fn rejects_unsupported_levels() {
+        let service = event_service().await;
+        let record_err = service
+            .record(EventLogInput {
+                event_type: "node.check",
+                level: "fatal",
+                target_type: "node",
+                target_id: "1",
+                target_name: "node",
+                title: "title",
+                summary: "",
+                detail: "",
+            })
+            .await
+            .expect_err("record should reject unsupported level");
+        assert!(matches!(record_err, EventLogError::InvalidInput(_)));
+
+        let filter_err = service
+            .list_filtered(EventLogFilter {
+                level: Some("fatal".to_owned()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("filter should reject unsupported level");
+        assert!(matches!(filter_err, EventLogError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn truncate_adds_marker_when_value_is_too_long() {
+        let truncated = truncate("abcdef", 3);
+
+        assert_eq!(truncated, "abc\n... truncated ...");
+    }
+}

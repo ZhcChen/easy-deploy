@@ -256,7 +256,7 @@ ED_PROBE_END=nginx_version
 
         service.check_node(2).await.expect("check ssh node");
 
-        let specs = runner.specs.lock().expect("lock specs");
+        let specs = { runner.specs.lock().expect("lock specs").clone() };
         let keygen_specs = specs
             .iter()
             .filter(|spec| spec.program == "ssh-keygen")

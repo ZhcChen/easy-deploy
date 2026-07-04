@@ -1699,7 +1699,7 @@ impl DeployScriptSlot {
         }
     }
 
-    fn script_content<'a>(self, scripts: &'a DeployScriptSet) -> &'a str {
+    fn script_content(self, scripts: &DeployScriptSet) -> &str {
         match self {
             Self::PreDeploy => &scripts.pre_deploy,
             Self::Deploy => &scripts.deploy,
@@ -4340,6 +4340,7 @@ async fn run_local_proxy_switch(
     Ok(outputs)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_ssh_proxy_switch(
     tasks: &TaskService,
     task_id: i64,
@@ -4696,6 +4697,7 @@ async fn load_health_check_config(
     .map_err(AppError::from)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_app_health_check(
     db: &SqlitePool,
     tasks: &TaskService,
@@ -10963,6 +10965,7 @@ fn normalize_published_at(value: &str) -> Result<Option<String>, AppError> {
     Ok(Some(value.to_owned()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upsert_app_release(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     app_id: i64,
@@ -11027,6 +11030,7 @@ async fn upsert_app_release(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn enqueue_app_release(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     app_id: i64,
@@ -11337,11 +11341,31 @@ fn dedupe_strings(values: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::runtimefs::RELEASE_META_FILE_NAME;
+    use std::sync::Arc;
+
+    use crate::{
+        deploy::{CommandResult, CommandRunner, CommandSpec},
+        runtimefs::RELEASE_META_FILE_NAME,
+    };
+    use async_trait::async_trait;
     use sqlx::sqlite::SqliteConnectOptions;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
     use super::*;
+
+    #[derive(Default)]
+    struct NoopCommandRunner;
+
+    #[async_trait]
+    impl CommandRunner for NoopCommandRunner {
+        async fn run(&self, _spec: CommandSpec) -> Result<CommandResult, DeployError> {
+            Ok(CommandResult {
+                status_code: Some(0),
+                stdout: "ok\n".to_owned(),
+                stderr: String::new(),
+            })
+        }
+    }
 
     async fn task_service() -> TaskService {
         let db = sqlx::SqlitePool::connect_with(
@@ -11357,6 +11381,87 @@ mod tests {
             .await
             .expect("run migrations");
         TaskService::new(db)
+    }
+
+    async fn app_service() -> (AppService, SqlitePool, TempDir) {
+        let db = sqlx::SqlitePool::connect_with(
+            "sqlite::memory:"
+                .parse::<SqliteConnectOptions>()
+                .expect("valid in-memory sqlite url")
+                .foreign_keys(true),
+        )
+        .await
+        .expect("connect in-memory sqlite");
+        sqlx::migrate!("./migrations")
+            .run(&db)
+            .await
+            .expect("run migrations");
+        let data_dir = tempdir().expect("create app data dir");
+        let runner = Arc::new(NoopCommandRunner);
+        let tasks = TaskService::new(db.clone());
+        let platform = PlatformConfigService::new(db.clone());
+        let apps = AppService::new(
+            db.clone(),
+            RuntimeFs::new(data_dir.path()),
+            ComposeExecutor::new(runner.clone()),
+            SystemdExecutor::new(runner),
+            tasks,
+            platform,
+        );
+        (apps, db, data_dir)
+    }
+
+    async fn create_manual_compose_app(apps: &AppService, app_key: &str) -> i64 {
+        apps.create_app(CreateAppInput {
+            app_key: app_key.to_owned(),
+            name: format!("{app_key} app"),
+            description: String::new(),
+            environment: "test".to_owned(),
+            app_type: "compose".to_owned(),
+            deploy_strategy: "rolling_stop_on_failure".to_owned(),
+            release_source: "package_upload".to_owned(),
+            auto_queue_release: false,
+            work_dir: format!("/opt/easy-deploy/apps/{app_key}"),
+            target_node_ids: vec![1],
+            compose_content: "services:\n  app:\n    image: nginx:alpine\n".to_owned(),
+            env_content: "RUST_LOG=info".to_owned(),
+            deploy_scripts: DeployScriptSet::default(),
+            health_check: Default::default(),
+            binary_artifact_version: String::new(),
+            binary_artifact_path: String::new(),
+            binary_exec_args: String::new(),
+            binary_service_user: String::new(),
+            binary_unit_name: String::new(),
+            binary_release_strategy: "restart".to_owned(),
+            binary_active_slot: "blue".to_owned(),
+            binary_base_port: 8080,
+            binary_standby_port: 18080,
+            binary_proxy_enabled: false,
+            binary_proxy_kind: "none".to_owned(),
+            binary_proxy_domain: String::new(),
+            binary_proxy_config_path: String::new(),
+        })
+        .await
+        .expect("create manual compose app")
+    }
+
+    async fn upload_manual_release(
+        apps: &AppService,
+        app_id: i64,
+        version: &str,
+    ) -> UploadReleasePackageResult {
+        apps.upload_release_package(UploadReleasePackageInput {
+            app_id,
+            release_version: version.to_owned(),
+            version_code: None,
+            published_at: "2026-06-23T10:00:00Z".to_owned(),
+            file_name: format!("package-{version}.bin"),
+            bytes: format!("release {version}").into_bytes(),
+            entry_file: String::new(),
+            source: "web".to_owned(),
+        })
+        .await
+        .expect("upload manual release")
     }
 
     #[tokio::test]
@@ -11408,6 +11513,120 @@ mod tests {
                 && log.stream == "combined"
                 && log.content.contains("redis")
         }));
+    }
+
+    #[tokio::test]
+    async fn manual_release_upload_can_be_scheduled_and_canceled() {
+        let (apps, _db, _data_dir) = app_service().await;
+        let app_id = create_manual_compose_app(&apps, "orders-api").await;
+        let upload = upload_manual_release(&apps, app_id, "v1.2.3").await;
+
+        assert!(!upload.queued);
+        assert_eq!(upload.queue_id, None);
+        assert_eq!(upload.publish_status, release_publish_mode_label(false));
+        let releases = apps.list_app_releases().await.expect("list releases");
+        let release = releases
+            .iter()
+            .find(|item| item.id == upload.release_id)
+            .expect("uploaded release");
+        assert_eq!(release.status, "received");
+        assert_eq!(release.scheduled_publish_at, None);
+
+        let scheduled_at = apps
+            .schedule_release_publish(upload.release_id, "2030-01-02T03:04:05Z")
+            .await
+            .expect("schedule release");
+        assert_eq!(scheduled_at, "2030-01-02T03:04:05Z");
+
+        let queue = apps
+            .list_app_release_queue()
+            .await
+            .expect("list release queue");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].release_id, upload.release_id);
+        assert_eq!(queue[0].status, "scheduled");
+        assert_eq!(
+            queue[0].scheduled_publish_at.as_deref(),
+            Some("2030-01-02T03:04:05Z")
+        );
+
+        let releases = apps
+            .list_app_releases()
+            .await
+            .expect("list scheduled releases");
+        let release = releases
+            .iter()
+            .find(|item| item.id == upload.release_id)
+            .expect("scheduled release");
+        assert_eq!(release.status, "queued");
+        assert_eq!(
+            release.scheduled_publish_at.as_deref(),
+            Some("2030-01-02T03:04:05Z")
+        );
+
+        apps.cancel_scheduled_release(upload.release_id)
+            .await
+            .expect("cancel scheduled release");
+        let queue = apps
+            .list_app_release_queue()
+            .await
+            .expect("list queue after cancel");
+        assert_eq!(queue[0].status, "canceled");
+        assert_eq!(queue[0].scheduled_publish_at, None);
+        let releases = apps
+            .list_app_releases()
+            .await
+            .expect("list release after cancel");
+        let release = releases
+            .iter()
+            .find(|item| item.id == upload.release_id)
+            .expect("canceled release");
+        assert_eq!(release.status, "received");
+        assert_eq!(release.scheduled_publish_at, None);
+    }
+
+    #[tokio::test]
+    async fn due_scheduled_releases_are_moved_to_queue_order() {
+        let (apps, db, _data_dir) = app_service().await;
+        let app_id = create_manual_compose_app(&apps, "billing-api").await;
+        let first = upload_manual_release(&apps, app_id, "v1.0.0").await;
+        let second = upload_manual_release(&apps, app_id, "v1.1.0").await;
+        apps.schedule_release_publish(first.release_id, "2030-01-02T03:04:05Z")
+            .await
+            .expect("schedule first release");
+        apps.schedule_release_publish(second.release_id, "2030-01-02T03:05:05Z")
+            .await
+            .expect("schedule second release");
+        sqlx::query(
+            r#"
+            UPDATE app_release_queue
+            SET scheduled_publish_at = CASE release_id
+                WHEN ?1 THEN '2000-01-01T00:00:00Z'
+                WHEN ?2 THEN '2000-01-01T00:01:00Z'
+            END
+            WHERE release_id IN (?1, ?2)
+            "#,
+        )
+        .bind(first.release_id)
+        .bind(second.release_id)
+        .execute(&db)
+        .await
+        .expect("move scheduled releases into the past");
+
+        let due_app_ids = enqueue_due_scheduled_releases(&db)
+            .await
+            .expect("enqueue due releases");
+
+        assert_eq!(due_app_ids, [app_id, app_id]);
+        let queue = apps
+            .list_app_release_queue()
+            .await
+            .expect("list due release queue");
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].release_id, first.release_id);
+        assert_eq!(queue[1].release_id, second.release_id);
+        assert!(queue.iter().all(|item| item.status == "queued"));
+        assert!(queue.iter().all(|item| item.scheduled_publish_at.is_none()));
     }
 
     #[test]
