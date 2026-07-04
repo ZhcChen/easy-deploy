@@ -224,6 +224,85 @@ mod tests {
     }
 
     #[test]
+    fn lists_templates_and_finds_by_key() {
+        let templates = compose_templates();
+
+        assert_eq!(templates.len(), 4);
+        assert_eq!(
+            template_by_key("redis-single")
+                .expect("redis template")
+                .image,
+            "redis:7-alpine"
+        );
+        assert!(template_by_key("missing").is_none());
+    }
+
+    #[test]
+    fn renders_compose_templates_with_sanitized_service_names() {
+        let cases = [
+            (
+                "nginx-static",
+                "Web App",
+                "web-app",
+                "nginx:1.27-alpine",
+                "PUBLIC_PORT=8081\n",
+            ),
+            (
+                "redis-single",
+                "Cache@Prod",
+                "cache-prod",
+                "redis:7-alpine",
+                "REDIS_PORT=6380\n",
+            ),
+            (
+                "caddy-gateway",
+                "Edge.Gateway",
+                "edge-gateway",
+                "caddy:2-alpine",
+                "PUBLIC_PORT=8088\n",
+            ),
+        ];
+
+        for (template_key, app_key, service, image, env) in cases {
+            let rendered = render_compose_template(RenderTemplateInput {
+                template_key,
+                app_key,
+                port: env
+                    .trim()
+                    .rsplit_once('=')
+                    .expect("env port")
+                    .1
+                    .parse()
+                    .expect("port"),
+            })
+            .expect("render template");
+
+            assert!(rendered.compose_content.contains(&format!("  {service}:")));
+            assert!(rendered.compose_content.contains(image));
+            assert_eq!(rendered.env_content, env);
+        }
+    }
+
+    #[test]
+    fn rejects_empty_app_key_and_zero_port() {
+        let empty_key = render_compose_template(RenderTemplateInput {
+            template_key: "nginx-static",
+            app_key: " ",
+            port: 8080,
+        })
+        .expect_err("empty app key should fail");
+        assert!(matches!(empty_key, CatalogError::InvalidInput(_)));
+
+        let zero_port = render_compose_template(RenderTemplateInput {
+            template_key: "nginx-static",
+            app_key: "demo",
+            port: 0,
+        })
+        .expect_err("zero port should fail");
+        assert!(matches!(zero_port, CatalogError::InvalidInput(_)));
+    }
+
+    #[test]
     fn rejects_unknown_template_key() {
         let err = render_compose_template(RenderTemplateInput {
             template_key: "unknown",

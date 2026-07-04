@@ -573,6 +573,8 @@ mod tests {
         assert_eq!(rate_label(1024.0), "1.00 KB/s");
         assert_eq!(rate_label(1536.99), "1.50 KB/s");
         assert_eq!(rate_label(1024.0 * 1024.0), "1.00 MB/s");
+        assert_eq!(bytes_label(1024.0 * 1024.0 * 1024.0), "1.00 GB");
+        assert_eq!(bytes_label(-1.0), "0 B");
     }
 
     #[test]
@@ -583,6 +585,66 @@ mod tests {
         assert_eq!(usage_percent(1, 3), 33.33);
         assert_eq!(truncated_percent(33.339), 33.33);
         assert_eq!(percent_label(truncated_percent(33.339)), "33.33%");
+    }
+
+    #[test]
+    fn usage_view_formats_used_total_and_detail() {
+        let view = usage_view(512, 1024, "custom detail".to_owned());
+
+        assert_eq!(view.percent, 50.0);
+        assert_eq!(view.percent_label, "50.00%");
+        assert_eq!(view.used_label, "512 B");
+        assert_eq!(view.total_label, "1.00 KB");
+        assert_eq!(view.detail, "custom detail");
+    }
+
+    #[test]
+    fn rate_metric_formats_delta_and_updates_previous_sample() {
+        let start = Instant::now();
+        let mut old_busy = HashMap::new();
+        old_busy.insert("sda".to_owned(), 100);
+        let mut current_busy = HashMap::new();
+        current_busy.insert("sda".to_owned(), 600);
+        let mut previous = Some(CounterSample {
+            read: 1_024,
+            write: 2_048,
+            busy_millis_by_device: old_busy,
+            sampled_at: start,
+        });
+
+        let metric = rate_metric(
+            &mut previous,
+            Some(CounterSample {
+                read: 3_072,
+                write: 4_096,
+                busy_millis_by_device: current_busy,
+                sampled_at: start + std::time::Duration::from_secs(2),
+            }),
+            "read",
+            "write",
+            "unavailable",
+        );
+
+        assert_eq!(metric.read_label, "1.00 KB/s");
+        assert_eq!(metric.write_label, "1.00 KB/s");
+        assert_eq!(metric.utilization_percent, Some(25.0));
+        assert_eq!(metric.utilization_label, "25.00%");
+        assert_eq!(
+            previous.as_ref().map(|sample| (sample.read, sample.write)),
+            Some((3_072, 4_096))
+        );
+    }
+
+    #[test]
+    fn rate_metric_reports_unavailable_without_current_sample() {
+        let mut previous = None;
+        let metric = rate_metric(&mut previous, None, "read", "write", "unavailable");
+
+        assert_eq!(metric.read_label, "--");
+        assert_eq!(metric.write_label, "--");
+        assert_eq!(metric.detail, "unavailable");
+        assert_eq!(metric.utilization_percent, None);
+        assert!(previous.is_none());
     }
 
     #[test]
@@ -606,6 +668,28 @@ mod tests {
         };
 
         assert_eq!(disk_busy_percent(&old, &current, 3.0), Some(33.33));
+    }
+
+    #[test]
+    fn disk_busy_percent_handles_missing_devices_and_zero_elapsed() {
+        let mut old_busy = HashMap::new();
+        old_busy.insert("sda".to_owned(), 1_000);
+        let old = CounterSample {
+            read: 0,
+            write: 0,
+            busy_millis_by_device: old_busy,
+            sampled_at: Instant::now(),
+        };
+
+        let current = CounterSample {
+            read: 0,
+            write: 0,
+            busy_millis_by_device: HashMap::from([("vdb".to_owned(), 2_000)]),
+            sampled_at: Instant::now(),
+        };
+
+        assert_eq!(disk_busy_percent(&old, &current, 3.0), None);
+        assert_eq!(disk_busy_percent(&old, &current, 0.0), None);
     }
 
     #[cfg(target_os = "linux")]

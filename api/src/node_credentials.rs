@@ -655,14 +655,55 @@ mod tests {
 
     #[test]
     fn generated_key_algorithm_accepts_supported_values_only() {
-        assert!(matches!(
-            GeneratedKeyAlgorithm::parse("").expect("default algorithm"),
-            GeneratedKeyAlgorithm::Ed25519
-        ));
-        assert!(matches!(
-            GeneratedKeyAlgorithm::parse("rsa_4096").expect("rsa algorithm"),
-            GeneratedKeyAlgorithm::Rsa4096
-        ));
+        let ed25519 = GeneratedKeyAlgorithm::parse("").expect("default algorithm");
+        let rsa = GeneratedKeyAlgorithm::parse("rsa_4096").expect("rsa algorithm");
+
+        assert!(matches!(ed25519, GeneratedKeyAlgorithm::Ed25519));
+        assert_eq!(ed25519.ssh_keygen_type(), "ed25519");
+        assert_eq!(ed25519.bits(), None);
+        assert_eq!(ed25519.private_key_file(), "id_ed25519");
+        assert!(matches!(rsa, GeneratedKeyAlgorithm::Rsa4096));
+        assert_eq!(rsa.ssh_keygen_type(), "rsa");
+        assert_eq!(rsa.bits(), Some(4096));
+        assert_eq!(rsa.private_key_file(), "id_rsa");
         assert!(GeneratedKeyAlgorithm::parse("dsa").is_err());
+    }
+
+    #[test]
+    fn normalizes_and_rejects_private_key_content() {
+        let normalized = normalize_private_key(
+            "  -----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----  ",
+        )
+        .expect("valid rsa key");
+
+        assert!(normalized.ends_with('\n'));
+        assert!(normalize_private_key("").is_err());
+        assert!(normalize_private_key("plain text").is_err());
+        assert!(normalize_private_key("-----BEGIN OPENSSH PRIVATE KEY-----\0").is_err());
+    }
+
+    #[test]
+    fn validates_required_text_and_generated_key() {
+        assert_eq!(
+            required_text("  prod key  ", "name required").expect("required text"),
+            "prod key"
+        );
+        assert!(required_text("line\nbreak", "name required").is_err());
+        assert!(required_text(" ", "name required").is_err());
+        assert!(validate_generated_key("cred-abc_123").is_ok());
+        assert!(validate_generated_key("bad key").is_err());
+    }
+
+    #[test]
+    fn validates_public_key_and_builds_stable_fingerprint() {
+        validate_public_key(PUBLIC_KEY).expect("valid public key");
+        assert!(validate_public_key("ssh-dss AAAA").is_err());
+        assert!(validate_public_key("ssh-ed25519 not-base64").is_err());
+
+        assert_eq!(
+            public_key_fingerprint(PUBLIC_KEY),
+            public_key_fingerprint(PUBLIC_KEY)
+        );
+        assert!(public_key_fingerprint(PUBLIC_KEY).starts_with("SHA256:"));
     }
 }
