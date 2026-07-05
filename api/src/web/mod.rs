@@ -8545,6 +8545,7 @@ pub fn html_response(html: String) -> Response {
 mod tests {
     use std::sync::Arc;
 
+    use async_trait::async_trait;
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
@@ -8556,7 +8557,10 @@ mod tests {
     use crate::{
         apps::{AppService, CreateAppInput, UploadBinaryArtifactInput},
         auth::{AuthService, MemorySessionStore},
-        deploy::{ComposeExecutor, SystemdExecutor, TokioCommandRunner},
+        deploy::{
+            CommandResult, CommandRunner, CommandSpec, ComposeExecutor, DeployError,
+            SystemdExecutor,
+        },
         nodes::NodeService,
         runtimefs::RuntimeFs,
         tasks::TaskService,
@@ -8569,6 +8573,19 @@ mod tests {
         auth: AuthService,
         apps: AppService,
         _data_dir: TempDir,
+    }
+
+    struct WebTestCommandRunner;
+
+    #[async_trait]
+    impl CommandRunner for WebTestCommandRunner {
+        async fn run(&self, spec: CommandSpec) -> Result<CommandResult, DeployError> {
+            Ok(CommandResult {
+                status_code: Some(0),
+                stdout: format!("{} {}\n", spec.program, spec.args.join(" ")),
+                stderr: String::new(),
+            })
+        }
     }
 
     async fn test_web_app() -> TestWebApp {
@@ -8602,7 +8619,7 @@ mod tests {
         let tasks = TaskService::new(db.clone());
         let platform = PlatformConfigService::new(db.clone());
         let events = EventLogService::new(db.clone());
-        let command_runner = Arc::new(TokioCommandRunner::new(settings.command_timeout_secs));
+        let command_runner = Arc::new(WebTestCommandRunner);
         let nodes =
             NodeService::new_with_data_dir(db.clone(), command_runner.clone(), data_dir.path());
         let node_credentials = NodeCredentialService::new(db.clone(), data_dir.path());
@@ -9340,6 +9357,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_v1_package_upload_rejects_revoked_token() {
+        let app = test_web_app().await;
+        create_compose_test_app(&app.apps, "orders-api-prod").await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let created = app
+            .auth
+            .create_api_token(&login.session, "revoked-upload")
+            .await
+            .expect("create api token");
+        app.auth
+            .revoke_api_token(&login.session, created.id)
+            .await
+            .expect("revoke api token");
+        let boundary = "easy-deploy-test-boundary";
+        let body = multipart_body(
+            boundary,
+            "package_file",
+            "orders-api-prod_version_1_2_3",
+            "binary data",
+            &[],
+        );
+
+        let response = app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/services/orders-api-prod/packages")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", created.token))
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("api error json response");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("已吊销")
+        );
+        assert!(app.apps.list_app_releases().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_v1_package_upload_rejects_manual_release_source_app() {
+        let app = test_web_app().await;
+        app.apps
+            .create_app(CreateAppInput {
+                app_key: "orders-manual".to_owned(),
+                name: "orders manual".to_owned(),
+                description: String::new(),
+                environment: "test".to_owned(),
+                app_type: "compose".to_owned(),
+                deploy_strategy: "rolling_stop_on_failure".to_owned(),
+                release_source: "manual".to_owned(),
+                auto_queue_release: false,
+                work_dir: "/opt/easy-deploy/apps/orders-manual".to_owned(),
+                target_node_ids: vec![1],
+                compose_content: "services:\n  app:\n    image: nginx:alpine\n".to_owned(),
+                env_content: String::new(),
+                deploy_scripts: DeployScriptSet::default(),
+                health_check: Default::default(),
+                binary_artifact_version: String::new(),
+                binary_artifact_path: String::new(),
+                binary_exec_args: String::new(),
+                binary_service_user: String::new(),
+                binary_unit_name: String::new(),
+                binary_release_strategy: "restart".to_owned(),
+                binary_active_slot: "blue".to_owned(),
+                binary_base_port: 8080,
+                binary_standby_port: 18080,
+                binary_proxy_enabled: false,
+                binary_proxy_kind: "none".to_owned(),
+                binary_proxy_domain: String::new(),
+                binary_proxy_config_path: String::new(),
+            })
+            .await
+            .expect("create manual release source app");
+        let token = super_admin_api_token(&app.auth, "manual-upload-denied").await;
+        let boundary = "easy-deploy-test-boundary";
+        let body = multipart_body(
+            boundary,
+            "package_file",
+            "orders-manual_version_1_2_3",
+            "binary data",
+            &[],
+        );
+
+        let response = app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/services/orders-manual/packages")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("api error json response");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("版本包发布模式")
+        );
+        assert!(app.apps.list_app_releases().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn api_v1_control_endpoints_are_not_routed() {
         let app = test_web_app().await;
         let token = super_admin_api_token(&app.auth, "control-api-removed").await;
@@ -9673,6 +9832,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifacts_page_upload_requires_valid_csrf_without_creating_release() {
+        let app = test_web_app().await;
+        let app_id = create_compose_test_app(&app.apps, "orders-api-prod").await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+        let app_id_field = app_id.to_string();
+        let boundary = "easy-deploy-page-upload-boundary";
+        let body = multipart_body(
+            boundary,
+            "artifact_file",
+            "orders-api-prod_version_1_4_0",
+            "orders binary v1.4.0",
+            &[
+                ("csrf_token", "wrong-token"),
+                ("app_id", app_id_field.as_str()),
+                ("artifact_version", "v1.4.0"),
+                ("versionCode", "1004000"),
+                ("publishedAt", "2026-06-09T12:00:00Z"),
+                ("entry_file", ""),
+            ],
+        );
+
+        let upload_response = app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/artifacts/upload")
+                    .header(header::COOKIE, &cookie_value)
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send upload request");
+
+        assert_eq!(upload_response.status(), StatusCode::FORBIDDEN);
+        assert!(app.apps.list_app_releases().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn manual_publish_mode_keeps_uploaded_release_received() {
         let app = test_web_app().await;
         let app_id = create_compose_test_app_with_mode(&app.apps, "orders-api-manual", false).await;
@@ -9819,6 +10032,264 @@ mod tests {
         assert!(html.contains("2026-06-09 18:00:00"));
         assert!(html.contains("计划 2026-06-23 15:30:00"));
         assert!(html.contains("action=\"/artifacts/schedule/cancel\""));
+    }
+
+    #[tokio::test]
+    async fn artifact_publish_schedule_and_queue_cancel_routes_update_release_state() {
+        let app = test_web_app().await;
+        let app_id =
+            create_compose_test_app_with_mode(&app.apps, "orders-api-controls", false).await;
+        let first_release = app
+            .apps
+            .upload_release_package(UploadReleasePackageInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: Some(1_002_003),
+                published_at: "2026-06-09T10:00:00Z".to_owned(),
+                file_name: "orders-api-controls".to_owned(),
+                bytes: b"release controls v1.2.3".to_vec(),
+                entry_file: String::new(),
+                source: "route-test".to_owned(),
+            })
+            .await
+            .expect("upload first release");
+        let second_release = app
+            .apps
+            .upload_release_package(UploadReleasePackageInput {
+                app_id,
+                release_version: "v1.2.4".to_owned(),
+                version_code: Some(1_002_004),
+                published_at: "2026-06-10T10:00:00Z".to_owned(),
+                file_name: "orders-api-controls".to_owned(),
+                bytes: b"release controls v1.2.4".to_vec(),
+                entry_file: String::new(),
+                source: "route-test".to_owned(),
+            })
+            .await
+            .expect("upload second release");
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+
+        let forbidden_schedule = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/artifacts/schedule")
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token=bad-token&release_id={}&scheduled_publish_at=2030-01-02T03%3A04%3A05Z",
+                        first_release.release_id
+                    )))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send forbidden schedule request");
+        assert_eq!(forbidden_schedule.status(), StatusCode::FORBIDDEN);
+        assert!(app.apps.list_app_release_queue().await.unwrap().is_empty());
+
+        let schedule_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/artifacts/schedule")
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={}&release_id={}&scheduled_publish_at=2030-01-02T03%3A04%3A05Z",
+                        login.session.csrf_token, first_release.release_id
+                    )))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send schedule request");
+        assert_eq!(schedule_response.status(), StatusCode::SEE_OTHER);
+
+        let scheduled_queue = app
+            .apps
+            .list_app_release_queue()
+            .await
+            .expect("list scheduled queue")
+            .into_iter()
+            .find(|item| item.release_id == first_release.release_id)
+            .expect("scheduled queue item");
+        assert_eq!(scheduled_queue.status, "scheduled");
+        assert_eq!(
+            scheduled_queue.scheduled_publish_at.as_deref(),
+            Some("2030-01-02T03:04:05Z")
+        );
+
+        let forbidden_cancel_schedule = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/artifacts/schedule/cancel")
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token=bad-token&release_id={}",
+                        first_release.release_id
+                    )))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send forbidden schedule cancel request");
+        assert_eq!(forbidden_cancel_schedule.status(), StatusCode::FORBIDDEN);
+
+        let cancel_schedule_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/artifacts/schedule/cancel")
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={}&release_id={}",
+                        login.session.csrf_token, first_release.release_id
+                    )))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send schedule cancel request");
+        assert_eq!(cancel_schedule_response.status(), StatusCode::SEE_OTHER);
+        let first_release_after_cancel = app
+            .apps
+            .list_app_releases()
+            .await
+            .expect("list releases after schedule cancel")
+            .into_iter()
+            .find(|release| release.id == first_release.release_id)
+            .expect("first release after schedule cancel");
+        assert_eq!(first_release_after_cancel.status, "received");
+
+        app.apps
+            .schedule_release_publish(first_release.release_id, "2030-01-02T03:04:05Z")
+            .await
+            .expect("schedule first release again");
+        let queue_id = app
+            .apps
+            .list_app_release_queue()
+            .await
+            .expect("list queue before generic cancel")
+            .into_iter()
+            .find(|item| item.release_id == first_release.release_id && item.status == "scheduled")
+            .expect("queue to cancel")
+            .id;
+        let forbidden_queue_cancel = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/artifacts/queue/cancel")
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token=bad-token&queue_id={queue_id}"
+                    )))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send forbidden queue cancel request");
+        assert_eq!(forbidden_queue_cancel.status(), StatusCode::FORBIDDEN);
+
+        let queue_cancel_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/artifacts/queue/cancel")
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={}&queue_id={}",
+                        login.session.csrf_token, queue_id
+                    )))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send queue cancel request");
+        assert_eq!(queue_cancel_response.status(), StatusCode::SEE_OTHER);
+        let canceled_queue = app
+            .apps
+            .list_app_release_queue()
+            .await
+            .expect("list queue after generic cancel")
+            .into_iter()
+            .find(|item| item.id == queue_id)
+            .expect("canceled queue");
+        assert_eq!(canceled_queue.status, "canceled");
+
+        let forbidden_publish = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/artifacts/publish")
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token=bad-token&release_id={}",
+                        second_release.release_id
+                    )))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send forbidden publish request");
+        assert_eq!(forbidden_publish.status(), StatusCode::FORBIDDEN);
+
+        let publish_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/artifacts/publish")
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={}&release_id={}",
+                        login.session.csrf_token, second_release.release_id
+                    )))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send publish request");
+        assert_eq!(publish_response.status(), StatusCode::SEE_OTHER);
+        assert!(
+            app.apps
+                .list_app_release_queue()
+                .await
+                .expect("list queue after publish")
+                .into_iter()
+                .any(|item| {
+                    item.release_id == second_release.release_id
+                        && matches!(
+                            item.status.as_str(),
+                            "queued" | "running" | "success" | "failed"
+                        )
+                })
+        );
     }
 
     #[tokio::test]

@@ -144,6 +144,63 @@ ED_PROBE_END=nginx_version
         }
     }
 
+    struct SshFailureRunner {
+        specs: Mutex<Vec<CommandSpec>>,
+    }
+
+    impl SshFailureRunner {
+        fn new() -> Self {
+            Self {
+                specs: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CommandRunner for SshFailureRunner {
+        async fn run(&self, spec: CommandSpec) -> Result<CommandResult, DeployError> {
+            let result = match spec.program.as_str() {
+                "ssh-keygen" => {
+                    let known_hosts_file = spec
+                        .args
+                        .windows(2)
+                        .find(|window| window[0] == "-f")
+                        .map(|window| PathBuf::from(&window[1]));
+                    let exists = known_hosts_file
+                        .as_ref()
+                        .and_then(|path| std::fs::read_to_string(path).ok())
+                        .is_some_and(|content| content.contains("ssh-ed25519"));
+                    CommandResult {
+                        status_code: Some(if exists { 0 } else { 1 }),
+                        stdout: if exists {
+                            "10.0.2.11 ssh-ed25519 AAAA\n".to_owned()
+                        } else {
+                            String::new()
+                        },
+                        stderr: String::new(),
+                    }
+                }
+                "ssh-keyscan" => CommandResult {
+                    status_code: Some(0),
+                    stdout: "10.0.2.11 ssh-ed25519 AAAA\n".to_owned(),
+                    stderr: String::new(),
+                },
+                "ssh" => CommandResult {
+                    status_code: Some(255),
+                    stdout: String::new(),
+                    stderr: "Host key verification failed.".to_owned(),
+                },
+                _ => CommandResult {
+                    status_code: Some(0),
+                    stdout: "ok\n".to_owned(),
+                    stderr: String::new(),
+                },
+            };
+            self.specs.lock().expect("lock specs").push(spec);
+            Ok(result)
+        }
+    }
+
     async fn node_service(work_dir: PathBuf) -> (NodeService, Arc<ProbeRunner>) {
         let db = SqlitePool::connect_with(
             "sqlite::memory:"
@@ -167,6 +224,70 @@ ED_PROBE_END=nginx_version
             NodeService::new_with_data_dir(db, runner.clone(), work_dir),
             runner,
         )
+    }
+
+    async fn node_service_with_runner(work_dir: PathBuf, runner: DynCommandRunner) -> NodeService {
+        let db = SqlitePool::connect_with(
+            "sqlite::memory:"
+                .parse::<SqliteConnectOptions>()
+                .expect("valid in-memory sqlite url")
+                .foreign_keys(true),
+        )
+        .await
+        .expect("connect in-memory sqlite");
+        sqlx::migrate!("./migrations")
+            .run(&db)
+            .await
+            .expect("run migrations");
+        sqlx::query("UPDATE nodes SET work_dir = ?1 WHERE node_key = 'local'")
+            .bind(work_dir.to_string_lossy().to_string())
+            .execute(&db)
+            .await
+            .expect("set local work dir");
+        NodeService::new_with_data_dir(db, runner, work_dir)
+    }
+
+    async fn create_active_ssh_credential(service: &NodeService, identity_file: &Path) -> i64 {
+        sqlx::query(
+            r#"
+            INSERT INTO node_credentials(
+                credential_key,
+                name,
+                public_key,
+                private_key_path,
+                fingerprint,
+                status
+            )
+            VALUES ('test-key', '测试密钥', 'ssh-ed25519 AAAA', ?1, 'SHA256:test', 'active')
+            "#,
+        )
+        .bind(identity_file.to_string_lossy().to_string())
+        .execute(&service.db)
+        .await
+        .expect("insert credential")
+        .last_insert_rowid()
+    }
+
+    async fn create_test_ssh_node(service: &NodeService, credential_id: Option<i64>) -> i64 {
+        service
+            .create_node(CreateNodeInput {
+                node_key: "prod-a".to_owned(),
+                name: "生产节点 A".to_owned(),
+                node_type: "ssh".to_owned(),
+                address: "10.0.2.11".to_owned(),
+                ssh_port: 22,
+                ssh_user: "deploy".to_owned(),
+                credential_id,
+                work_dir: "/opt/easy-deploy/apps".to_owned(),
+                region: "prod".to_owned(),
+                labels: "prod".to_owned(),
+            })
+            .await
+            .expect("create ssh node");
+        sqlx::query_scalar("SELECT id FROM nodes WHERE node_key = 'prod-a'")
+            .fetch_one(&service.db)
+            .await
+            .expect("read ssh node id")
     }
 
     #[tokio::test]
@@ -220,41 +341,10 @@ ED_PROBE_END=nginx_version
         let identity_file = work_dir.path().join("id_ed25519");
         std::fs::write(&identity_file, "private").expect("write identity file");
         let (service, runner) = node_service(work_dir.path().to_path_buf()).await;
-        let credential_id = sqlx::query(
-            r#"
-            INSERT INTO node_credentials(
-                credential_key,
-                name,
-                public_key,
-                private_key_path,
-                fingerprint,
-                status
-            )
-            VALUES ('test-key', '娴嬭瘯瀵嗛挜', 'ssh-ed25519 AAAA', ?1, 'SHA256:test', 'active')
-            "#,
-        )
-        .bind(identity_file.to_string_lossy().to_string())
-        .execute(&service.db)
-        .await
-        .expect("insert credential")
-        .last_insert_rowid();
-        service
-            .create_node(CreateNodeInput {
-                node_key: "prod-a".to_owned(),
-                name: "鐢熶骇鑺傜偣 A".to_owned(),
-                node_type: "ssh".to_owned(),
-                address: "10.0.2.11".to_owned(),
-                ssh_port: 22,
-                ssh_user: "deploy".to_owned(),
-                credential_id: Some(credential_id),
-                work_dir: "/opt/easy-deploy/apps".to_owned(),
-                region: "prod".to_owned(),
-                labels: "prod".to_owned(),
-            })
-            .await
-            .expect("create ssh node");
+        let credential_id = create_active_ssh_credential(&service, &identity_file).await;
+        let node_id = create_test_ssh_node(&service, Some(credential_id)).await;
 
-        service.check_node(2).await.expect("check ssh node");
+        service.check_node(node_id).await.expect("check ssh node");
 
         let specs = { runner.specs.lock().expect("lock specs").clone() };
         let keygen_specs = specs
@@ -314,12 +404,123 @@ ED_PROBE_END=nginx_version
         .expect("read node check event");
         assert_eq!(event.0, "node.check");
         assert_eq!(event.1, "info");
-        assert_eq!(event.2, "2");
+        assert_eq!(event.2, node_id.to_string());
         assert!(event.3.contains("destination=deploy@10.0.2.11"));
         assert!(event.3.contains("known_host_added=true"));
         assert!(event.3.contains("StrictHostKeyChecking=yes"));
         assert!(event.3.contains("IdentitiesOnly=yes"));
         assert!(event.3.contains("compose_version: status=ok"));
+    }
+
+    #[tokio::test]
+    async fn failed_ssh_probe_records_error_event_with_command_output() {
+        let work_dir = tempdir().expect("temp dir");
+        let identity_file = work_dir.path().join("id_ed25519");
+        std::fs::write(&identity_file, "private").expect("write identity file");
+        let runner = Arc::new(SshFailureRunner::new());
+        let service = node_service_with_runner(work_dir.path().to_path_buf(), runner.clone()).await;
+        let credential_id = create_active_ssh_credential(&service, &identity_file).await;
+        let node_id = create_test_ssh_node(&service, Some(credential_id)).await;
+
+        let result = service.check_node(node_id).await.expect("check ssh node");
+
+        assert_eq!(result.status, "failed");
+        assert!(result.message.contains("Host key verification failed"));
+        let node = service.fetch_node(node_id).await.expect("fetch node");
+        assert_eq!(node.status, "offline");
+        assert_eq!(node.docker_status, "unknown");
+        let event = sqlx::query_as::<_, (String, String, String, String, String)>(
+            r#"
+            SELECT event_type, level, target_id, summary, detail
+            FROM event_logs
+            WHERE event_type = 'node.check'
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&service.db)
+        .await
+        .expect("read node check event");
+        assert_eq!(event.0, "node.check");
+        assert_eq!(event.1, "error");
+        assert_eq!(event.2, node_id.to_string());
+        assert!(event.3.contains("Host key verification failed"));
+        assert!(event.4.contains("destination=deploy@10.0.2.11"));
+        assert!(event.4.contains("exit_code=Some(255)"));
+        assert!(event.4.contains("Host key verification failed"));
+        assert!(event.4.contains("command=ssh -p 22"));
+        let specs = runner.specs.lock().expect("lock specs");
+        assert!(specs.iter().any(|spec| spec.program == "ssh-keyscan"));
+        assert!(specs.iter().any(|spec| spec.program == "ssh"));
+    }
+
+    #[test]
+    fn ssh_probe_result_reports_missing_compose_section() {
+        let result = ssh_probe_result_from_output_clean(
+            "\
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=work_dir
+/opt/easy-deploy/apps
+ED_PROBE_END=work_dir
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=docker_version
+Docker version 26.1.0
+ED_PROBE_END=docker_version
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=docker_info
+Server Version: 26.1.0
+ED_PROBE_END=docker_info
+",
+        );
+
+        assert_eq!(result.status, "failed");
+        assert!(result.message.contains("SSH Docker Compose 不可用"));
+        assert!(result.message.contains("探测未返回结果"));
+        assert_eq!(result.docker_version, "Docker version 26.1.0");
+        assert!(result.compose_version.is_empty());
+    }
+
+    #[tokio::test]
+    async fn node_install_command_uses_known_hosts_identity_and_component_script() {
+        let work_dir = tempdir().expect("temp dir");
+        let identity_file = work_dir.path().join("id_ed25519");
+        std::fs::write(&identity_file, "private").expect("write identity file");
+        let (service, runner) = node_service(work_dir.path().to_path_buf()).await;
+        let credential_id = create_active_ssh_credential(&service, &identity_file).await;
+        let node_id = create_test_ssh_node(&service, Some(credential_id)).await;
+        let node = service.fetch_node(node_id).await.expect("fetch node");
+
+        let output = run_node_install_command(
+            &service.runner,
+            &node,
+            NodeInstallComponent::Compose,
+            Some(&service.ssh_known_hosts_file),
+        )
+        .await
+        .expect("run install command");
+
+        assert!(output.success());
+        let specs = { runner.specs.lock().expect("lock specs").clone() };
+        let ssh = specs
+            .iter()
+            .find(|spec| spec.program == "ssh")
+            .expect("ssh install command");
+        let identity_arg = identity_file.to_string_lossy().to_string();
+        assert!(ssh.args.contains(&"BatchMode=yes".to_owned()));
+        assert!(ssh.args.contains(&"ConnectTimeout=10".to_owned()));
+        assert!(ssh.args.contains(&"StrictHostKeyChecking=yes".to_owned()));
+        assert!(
+            ssh.args
+                .iter()
+                .any(|arg| arg.starts_with("UserKnownHostsFile="))
+        );
+        assert!(ssh.args.contains(&identity_arg));
+        assert!(ssh.args.contains(&"IdentitiesOnly=yes".to_owned()));
+        assert!(ssh.args.contains(&"deploy@10.0.2.11".to_owned()));
+        let script = ssh.args.last().expect("install script");
+        assert!(script.contains("docker-compose-plugin"));
+        assert!(script.starts_with('\''));
+        assert!(script.ends_with('\''));
     }
 }
 
@@ -1481,7 +1682,7 @@ async fn run_ssh_node_probe_clean(
             message: if output.is_empty() {
                 format!("{rendered_command} 执行失败: {:?}", result.status_code)
             } else {
-                format!("{rendered_command}: {output}")
+                format!("SSH 探测失败: {}", first_non_empty_line(&output))
             },
             probe_log: probe_log.finish(),
             docker_version: String::new(),

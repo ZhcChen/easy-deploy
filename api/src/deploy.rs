@@ -1634,6 +1634,36 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct KeyscanFailureRunner {
+        specs: Mutex<Vec<CommandSpec>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for KeyscanFailureRunner {
+        async fn run(&self, spec: CommandSpec) -> Result<CommandResult, DeployError> {
+            let result = match spec.program.as_str() {
+                "ssh-keygen" => CommandResult {
+                    status_code: Some(1),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                "ssh-keyscan" => CommandResult {
+                    status_code: Some(1),
+                    stdout: String::new(),
+                    stderr: "no route to host".to_owned(),
+                },
+                _ => CommandResult {
+                    status_code: Some(0),
+                    stdout: "ok\n".to_owned(),
+                    stderr: String::new(),
+                },
+            };
+            self.specs.lock().expect("lock specs").push(spec);
+            Ok(result)
+        }
+    }
+
     #[tokio::test]
     async fn compose_config_uses_docker_compose_in_work_dir() {
         let work_dir = tempdir().expect("temp dir");
@@ -2015,6 +2045,84 @@ mod tests {
         );
         let known_hosts = std::fs::read_to_string(&known_hosts_file).expect("known hosts");
         assert!(known_hosts.contains("ssh-ed25519"));
+    }
+
+    #[tokio::test]
+    async fn ensure_ssh_known_host_reports_keyscan_failure_output() {
+        let work_dir = tempdir().expect("temp dir");
+        let known_hosts_file = work_dir.path().join("ssh").join("known_hosts");
+        let runner = Arc::new(KeyscanFailureRunner::default());
+        let dyn_runner: DynCommandRunner = runner.clone();
+
+        let err = ensure_ssh_known_host(&dyn_runner, &known_hosts_file, "10.0.2.11", 22)
+            .await
+            .expect_err("keyscan failure should fail");
+
+        assert!(err.message().contains("采集 SSH 主机指纹失败"));
+        assert!(err.message().contains("no route to host"));
+        assert!(known_hosts_file.is_file());
+        let specs = runner.specs.lock().expect("lock specs");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].program, "ssh-keygen");
+        assert_eq!(specs[1].program, "ssh-keyscan");
+        assert_eq!(specs[1].args, ["-p", "22", "-T", "10", "-H", "10.0.2.11"]);
+    }
+
+    #[tokio::test]
+    async fn ssh_executor_uses_managed_known_hosts_for_scp_and_remote_compose() {
+        let work_dir = tempdir().expect("temp dir");
+        let known_hosts_file = work_dir.path().join("ssh").join("known_hosts");
+        let local_file = work_dir.path().join("orders-api");
+        std::fs::write(&local_file, "binary").expect("write local file");
+        let runner = Arc::new(RecordingRunner::default());
+        let executor =
+            SshExecutor::new(runner.clone()).with_known_hosts_file(known_hosts_file.clone());
+        let target = SshTarget::new("deploy", "10.0.2.11", 2222).expect("valid ssh target");
+
+        executor
+            .copy_file(
+                &target,
+                work_dir.path().to_path_buf(),
+                local_file,
+                "/opt/easy-deploy/apps/orders-api/current",
+            )
+            .await
+            .expect("copy file");
+        executor
+            .compose_up(
+                &target,
+                work_dir.path().to_path_buf(),
+                "/opt/easy-deploy/apps/orders-api",
+            )
+            .await
+            .expect("run remote compose up");
+
+        let specs = runner.specs.lock().expect("lock specs");
+        assert!(specs.iter().any(|spec| {
+            spec.program == "ssh-keygen"
+                && spec
+                    .args
+                    .get(1)
+                    .is_some_and(|arg| arg == "[10.0.2.11]:2222")
+        }));
+        let scp = specs
+            .iter()
+            .find(|spec| spec.program == "scp")
+            .expect("scp command");
+        let ssh = specs
+            .iter()
+            .rfind(|spec| spec.program == "ssh")
+            .expect("ssh command");
+        let known_hosts_arg = format!("UserKnownHostsFile={}", known_hosts_file.to_string_lossy());
+        for spec in [scp, ssh] {
+            assert!(spec.args.contains(&known_hosts_arg));
+            assert!(spec.args.contains(&"StrictHostKeyChecking=yes".to_owned()));
+            assert!(spec.args.contains(&"-o".to_owned()));
+        }
+        assert_eq!(scp.args[0], "-P");
+        assert_eq!(scp.args[1], "2222");
+        assert_eq!(ssh.args[0], "-p");
+        assert_eq!(ssh.args[1], "2222");
     }
 
     #[tokio::test]

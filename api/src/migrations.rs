@@ -4,6 +4,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 use anyhow::{Context, anyhow, bail};
@@ -11,7 +12,7 @@ use clap::Subcommand;
 use sqlx::{
     Sqlite, SqlitePool,
     migrate::{MigrateDatabase, Migration},
-    sqlite::SqliteConnectOptions,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -45,9 +46,12 @@ pub async fn connect_database(
         .parse::<SqliteConnectOptions>()
         .with_context(|| format!("parse database url {database_url}"))?
         .create_if_missing(create_if_missing)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(30));
 
-    SqlitePool::connect_with(options)
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
         .await
         .with_context(|| format!("connect database {database_url}"))
 }
@@ -628,6 +632,34 @@ mod tests {
         assert_eq!(row.description, "add_release_queue");
         assert!(row.success);
         assert_eq!(row.checksum, vec![1_u8, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn connect_database_keeps_file_backup_semantics_without_wal_sidecars() {
+        let temp_dir = tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("easy-deploy.db");
+        let database_url = format!("sqlite://{}", database_path.to_string_lossy());
+
+        let db = connect_database(&database_url, true)
+            .await
+            .expect("connect database");
+        sqlx::query("CREATE TABLE smoke(id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .execute(&db)
+            .await
+            .expect("create smoke table");
+        sqlx::query("INSERT INTO smoke(name) VALUES ('backup-safe')")
+            .execute(&db)
+            .await
+            .expect("insert smoke row");
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM smoke")
+            .fetch_one(&db)
+            .await
+            .expect("count smoke rows");
+
+        assert_eq!(count, 1);
+        assert!(database_path.is_file());
+        assert!(!database_path.with_file_name("easy-deploy.db-wal").exists());
+        assert!(!database_path.with_file_name("easy-deploy.db-shm").exists());
     }
 
     #[test]

@@ -8325,6 +8325,11 @@ impl AppService {
         let app = self.fetch_app_detail(input.app_id).await?;
         ensure_app_enabled(&app)?;
         self.ensure_compose_app(&app)?;
+        if app.release_source != "package_upload" {
+            return Err(AppError::InvalidInput(
+                "当前应用不是版本包发布模式，不能上传版本包".to_owned(),
+            ));
+        }
         let release_version = normalize_release_id(&input.release_version)?;
         let version_code = match input.version_code {
             Some(version_code) if version_code > 0 => version_code,
@@ -11341,10 +11346,10 @@ fn dedupe_strings(values: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use crate::{
-        deploy::{CommandResult, CommandRunner, CommandSpec},
+        deploy::{CommandResult, CommandRunner, CommandSpec, DynCommandRunner},
         runtimefs::RELEASE_META_FILE_NAME,
     };
     use async_trait::async_trait;
@@ -11367,6 +11372,53 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingCommandRunner {
+        specs: Mutex<Vec<CommandSpec>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for RecordingCommandRunner {
+        async fn run(&self, spec: CommandSpec) -> Result<CommandResult, DeployError> {
+            self.specs.lock().expect("lock command specs").push(spec);
+            Ok(CommandResult {
+                status_code: Some(0),
+                stdout: "ok\n".to_owned(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct ComposeUpFailureRunner {
+        specs: Mutex<Vec<CommandSpec>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for ComposeUpFailureRunner {
+        async fn run(&self, spec: CommandSpec) -> Result<CommandResult, DeployError> {
+            let should_fail = spec.program == "docker"
+                && spec.args.windows(2).any(|window| {
+                    window[0] == "compose"
+                        && matches!(window.get(1).map(String::as_str), Some("up" | "restart"))
+                });
+            self.specs.lock().expect("lock command specs").push(spec);
+            if should_fail {
+                Ok(CommandResult {
+                    status_code: Some(1),
+                    stdout: String::new(),
+                    stderr: "compose up failed".to_owned(),
+                })
+            } else {
+                Ok(CommandResult {
+                    status_code: Some(0),
+                    stdout: "ok\n".to_owned(),
+                    stderr: String::new(),
+                })
+            }
+        }
+    }
+
     async fn task_service() -> TaskService {
         let db = sqlx::SqlitePool::connect_with(
             "sqlite::memory:"
@@ -11384,6 +11436,12 @@ mod tests {
     }
 
     async fn app_service() -> (AppService, SqlitePool, TempDir) {
+        app_service_with_runner(Arc::new(NoopCommandRunner)).await
+    }
+
+    async fn app_service_with_runner(
+        runner: DynCommandRunner,
+    ) -> (AppService, SqlitePool, TempDir) {
         let db = sqlx::SqlitePool::connect_with(
             "sqlite::memory:"
                 .parse::<SqliteConnectOptions>()
@@ -11397,7 +11455,6 @@ mod tests {
             .await
             .expect("run migrations");
         let data_dir = tempdir().expect("create app data dir");
-        let runner = Arc::new(NoopCommandRunner);
         let tasks = TaskService::new(db.clone());
         let platform = PlatformConfigService::new(db.clone());
         let apps = AppService::new(
@@ -11445,6 +11502,107 @@ mod tests {
         .expect("create manual compose app")
     }
 
+    async fn create_auto_compose_app(apps: &AppService, app_key: &str) -> i64 {
+        apps.create_app(CreateAppInput {
+            app_key: app_key.to_owned(),
+            name: format!("{app_key} app"),
+            description: String::new(),
+            environment: "test".to_owned(),
+            app_type: "compose".to_owned(),
+            deploy_strategy: "rolling_stop_on_failure".to_owned(),
+            release_source: "package_upload".to_owned(),
+            auto_queue_release: true,
+            work_dir: format!("/opt/easy-deploy/apps/{app_key}"),
+            target_node_ids: vec![1],
+            compose_content: "services:\n  app:\n    image: nginx:alpine\n".to_owned(),
+            env_content: "RUST_LOG=info".to_owned(),
+            deploy_scripts: DeployScriptSet {
+                pre_deploy: "echo pre".to_owned(),
+                deploy: String::new(),
+                post_deploy: "echo post".to_owned(),
+                switch_traffic: "echo switch".to_owned(),
+                cleanup: "echo cleanup".to_owned(),
+            },
+            health_check: Default::default(),
+            binary_artifact_version: String::new(),
+            binary_artifact_path: String::new(),
+            binary_exec_args: String::new(),
+            binary_service_user: String::new(),
+            binary_unit_name: String::new(),
+            binary_release_strategy: "restart".to_owned(),
+            binary_active_slot: "blue".to_owned(),
+            binary_base_port: 8080,
+            binary_standby_port: 18080,
+            binary_proxy_enabled: false,
+            binary_proxy_kind: "none".to_owned(),
+            binary_proxy_domain: String::new(),
+            binary_proxy_config_path: String::new(),
+        })
+        .await
+        .expect("create auto compose app")
+    }
+
+    async fn create_ssh_target_node(db: &SqlitePool, data_dir: &TempDir) -> i64 {
+        let identity_file = data_dir.path().join("id_ed25519");
+        fs::write(&identity_file, "private key").expect("write identity file");
+        let credential_id = sqlx::query(
+            r#"
+            INSERT INTO node_credentials(
+                credential_key,
+                name,
+                public_key,
+                private_key_path,
+                fingerprint,
+                status
+            )
+            VALUES ('ssh-test-key', 'SSH 测试密钥', 'ssh-ed25519 AAAA', ?1, 'SHA256:ssh-test', 'active')
+            "#,
+        )
+        .bind(identity_file.to_string_lossy().to_string())
+        .execute(db)
+        .await
+        .expect("insert ssh credential")
+        .last_insert_rowid();
+
+        sqlx::query(
+            r#"
+            INSERT INTO nodes(
+                node_key,
+                name,
+                node_type,
+                address,
+                ssh_port,
+                ssh_user,
+                credential_id,
+                work_dir,
+                region,
+                labels,
+                status,
+                docker_status
+            )
+            VALUES (
+                'ssh-prod-a',
+                'SSH 生产节点 A',
+                'ssh',
+                '10.0.2.11',
+                22,
+                'deploy',
+                ?1,
+                '/opt/easy-deploy/apps',
+                'prod',
+                'ssh',
+                'online',
+                'available'
+            )
+            "#,
+        )
+        .bind(credential_id)
+        .execute(db)
+        .await
+        .expect("insert ssh node")
+        .last_insert_rowid()
+    }
+
     async fn upload_manual_release(
         apps: &AppService,
         app_id: i64,
@@ -11462,6 +11620,30 @@ mod tests {
         })
         .await
         .expect("upload manual release")
+    }
+
+    async fn wait_for_release_queue_status(
+        apps: &AppService,
+        release_id: i64,
+        expected_status: &str,
+    ) -> AppReleaseQueueItem {
+        let mut last_status = String::new();
+        for _ in 0..200 {
+            let queue = apps
+                .list_app_release_queue()
+                .await
+                .expect("list release queue while waiting");
+            if let Some(item) = queue.into_iter().find(|item| item.release_id == release_id) {
+                last_status = item.status.clone();
+                if item.status == expected_status {
+                    return item;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "release {release_id} did not reach status {expected_status}, last status: {last_status}"
+        );
     }
 
     #[tokio::test]
@@ -11586,6 +11768,194 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn release_package_upload_validates_version_code_and_allows_explicit_code() {
+        let (apps, _db, _data_dir) = app_service().await;
+        let app_id = create_manual_compose_app(&apps, "orders-version-code").await;
+
+        let missing_code_err = apps
+            .upload_release_package(UploadReleasePackageInput {
+                app_id,
+                release_version: "build-main".to_owned(),
+                version_code: None,
+                published_at: "2026-06-23T10:00:00Z".to_owned(),
+                file_name: "orders-version-code-build-main.bin".to_owned(),
+                bytes: b"build-main".to_vec(),
+                entry_file: String::new(),
+                source: "openapi".to_owned(),
+            })
+            .await
+            .expect_err("non-semver release without version code should fail");
+        assert!(matches!(missing_code_err, AppError::InvalidInput(_)));
+        assert!(missing_code_err.message().contains("versionCode"));
+
+        let zero_code_err = apps
+            .upload_release_package(UploadReleasePackageInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: Some(0),
+                published_at: "2026-06-23T10:00:00Z".to_owned(),
+                file_name: "orders-version-code_v1_2_3.bin".to_owned(),
+                bytes: b"v1.2.3".to_vec(),
+                entry_file: String::new(),
+                source: "openapi".to_owned(),
+            })
+            .await
+            .expect_err("zero version code should fail");
+        assert!(matches!(zero_code_err, AppError::InvalidInput(_)));
+        assert!(zero_code_err.message().contains("大于 0"));
+
+        let uploaded = apps
+            .upload_release_package(UploadReleasePackageInput {
+                app_id,
+                release_version: "build-main".to_owned(),
+                version_code: Some(20260705),
+                published_at: String::new(),
+                file_name: "orders-version-code-build-main.bin".to_owned(),
+                bytes: b"build-main".to_vec(),
+                entry_file: String::new(),
+                source: "openapi".to_owned(),
+            })
+            .await
+            .expect("explicit version code should allow non-semver package version");
+
+        assert_eq!(uploaded.version_code, 20260705);
+        assert_eq!(uploaded.queue_id, None);
+        assert!(!uploaded.published_at.trim().is_empty());
+        let release = apps
+            .list_app_releases()
+            .await
+            .expect("list releases")
+            .into_iter()
+            .find(|item| item.id == uploaded.release_id)
+            .expect("uploaded release");
+        assert_eq!(release.status, "received");
+        assert_eq!(release.version, "build-main");
+    }
+
+    #[tokio::test]
+    async fn queued_release_can_be_canceled_and_invalid_queue_states_are_rejected() {
+        let (apps, _db, _data_dir) = app_service().await;
+        let app_id = create_manual_compose_app(&apps, "orders-cancel-queue").await;
+        let upload = upload_manual_release(&apps, app_id, "v1.2.3").await;
+        apps.schedule_release_publish(upload.release_id, "2030-01-02T03:04:05Z")
+            .await
+            .expect("schedule release");
+        let queue_id = apps
+            .list_app_release_queue()
+            .await
+            .expect("list scheduled queue")
+            .into_iter()
+            .find(|item| item.release_id == upload.release_id)
+            .expect("scheduled queue")
+            .id;
+
+        let canceled_app_id = apps
+            .cancel_release_queue_item(queue_id)
+            .await
+            .expect("cancel scheduled queue through generic queue endpoint");
+
+        assert_eq!(canceled_app_id, app_id);
+        let queue = apps
+            .list_app_release_queue()
+            .await
+            .expect("list canceled queue");
+        let canceled = queue
+            .iter()
+            .find(|item| item.id == queue_id)
+            .expect("canceled queue item");
+        assert_eq!(canceled.status, "canceled");
+        assert_eq!(canceled.scheduled_publish_at, None);
+        let release = apps
+            .list_app_releases()
+            .await
+            .expect("list release after cancel")
+            .into_iter()
+            .find(|item| item.id == upload.release_id)
+            .expect("canceled release");
+        assert_eq!(release.status, "received");
+
+        let canceled_again = apps
+            .cancel_release_queue_item(queue_id)
+            .await
+            .expect_err("canceled queue should not be cancelable again");
+        assert!(matches!(canceled_again, AppError::InvalidInput(_)));
+        assert!(canceled_again.message().contains("只能取消等待中"));
+
+        let missing = apps
+            .cancel_release_queue_item(9_999_999)
+            .await
+            .expect_err("missing queue should fail");
+        assert!(matches!(missing, AppError::InvalidInput(_)));
+        assert!(missing.message().contains("发布队列项不存在"));
+    }
+
+    #[tokio::test]
+    async fn manual_publish_falls_back_to_latest_snapshot_for_legacy_release_metadata() {
+        let (apps, db, _data_dir) = app_service().await;
+        let app_id = create_manual_compose_app(&apps, "orders-legacy-snapshot").await;
+        let upload = upload_manual_release(&apps, app_id, "v1.2.3").await;
+
+        apps.update_app_config(UpdateAppConfigInput {
+            app_id,
+            compose_content: "services:\n  app:\n    image: nginx:stable\n".to_owned(),
+            env_content: "RUST_LOG=debug".to_owned(),
+            deploy_scripts: DeployScriptSet {
+                pre_deploy: "echo latest pre".to_owned(),
+                deploy: String::new(),
+                post_deploy: "echo latest post".to_owned(),
+                switch_traffic: String::new(),
+                cleanup: String::new(),
+            },
+            binary_artifact_version: String::new(),
+            binary_artifact_path: String::new(),
+            binary_exec_args: String::new(),
+            binary_service_user: String::new(),
+            binary_unit_name: String::new(),
+            binary_release_strategy: "restart".to_owned(),
+            binary_active_slot: "blue".to_owned(),
+            binary_base_port: 8080,
+            binary_standby_port: 18080,
+            binary_proxy_enabled: false,
+            binary_proxy_kind: "none".to_owned(),
+            binary_proxy_domain: String::new(),
+            binary_proxy_config_path: String::new(),
+            health_check: Default::default(),
+        })
+        .await
+        .expect("update app config after upload");
+        let latest_snapshot = apps
+            .app_detail(app_id)
+            .await
+            .expect("app detail")
+            .config_snapshots
+            .into_iter()
+            .next()
+            .expect("latest snapshot");
+        assert_ne!(latest_snapshot.id, upload.config_snapshot_id);
+
+        sqlx::query("UPDATE app_releases SET metadata = '{}' WHERE id = ?1")
+            .bind(upload.release_id)
+            .execute(&db)
+            .await
+            .expect("simulate legacy release metadata without snapshot id");
+
+        let queue_id = apps
+            .publish_release_now(upload.release_id, "admin")
+            .await
+            .expect("publish legacy release")
+            .expect("queue id");
+        let queue = apps
+            .list_app_release_queue()
+            .await
+            .expect("list release queue")
+            .into_iter()
+            .find(|item| item.id == queue_id)
+            .expect("legacy release queue item");
+
+        assert_eq!(queue.config_snapshot_id, Some(latest_snapshot.id));
+    }
+
+    #[tokio::test]
     async fn due_scheduled_releases_are_moved_to_queue_order() {
         let (apps, db, _data_dir) = app_service().await;
         let app_id = create_manual_compose_app(&apps, "billing-api").await;
@@ -11627,6 +11997,409 @@ mod tests {
         assert_eq!(queue[1].release_id, second.release_id);
         assert!(queue.iter().all(|item| item.status == "queued"));
         assert!(queue.iter().all(|item| item.scheduled_publish_at.is_none()));
+    }
+
+    #[tokio::test]
+    async fn manual_publish_uses_release_snapshot_not_latest_config() {
+        let (apps, _db, _data_dir) = app_service().await;
+        let app_id = create_manual_compose_app(&apps, "orders-snapshot").await;
+        let upload = upload_manual_release(&apps, app_id, "v1.2.3").await;
+
+        apps.update_app_config(UpdateAppConfigInput {
+            app_id,
+            compose_content: "services:\n  app:\n    image: nginx:stable\n".to_owned(),
+            env_content: "RUST_LOG=debug".to_owned(),
+            deploy_scripts: DeployScriptSet {
+                pre_deploy: "echo changed pre".to_owned(),
+                deploy: "docker compose up -d".to_owned(),
+                post_deploy: String::new(),
+                switch_traffic: String::new(),
+                cleanup: String::new(),
+            },
+            binary_artifact_version: String::new(),
+            binary_artifact_path: String::new(),
+            binary_exec_args: String::new(),
+            binary_service_user: String::new(),
+            binary_unit_name: String::new(),
+            binary_release_strategy: "restart".to_owned(),
+            binary_active_slot: "blue".to_owned(),
+            binary_base_port: 8080,
+            binary_standby_port: 18080,
+            binary_proxy_enabled: false,
+            binary_proxy_kind: "none".to_owned(),
+            binary_proxy_domain: String::new(),
+            binary_proxy_config_path: String::new(),
+            health_check: Default::default(),
+        })
+        .await
+        .expect("update app config after upload");
+
+        let detail = apps.app_detail(app_id).await.expect("app detail");
+        let latest_snapshot = detail
+            .config_snapshots
+            .first()
+            .expect("latest config snapshot");
+        assert_ne!(latest_snapshot.id, upload.config_snapshot_id);
+        assert!(latest_snapshot.revision_no > upload.config_revision_no);
+
+        let queue_id = apps
+            .publish_release_now(upload.release_id, "admin")
+            .await
+            .expect("publish release now")
+            .expect("queue id");
+
+        let queue = apps
+            .list_app_release_queue()
+            .await
+            .expect("list release queue");
+        let queued = queue
+            .iter()
+            .find(|item| item.id == queue_id)
+            .expect("published queue item");
+        assert_eq!(queued.release_id, upload.release_id);
+        assert_eq!(queued.config_snapshot_id, Some(upload.config_snapshot_id));
+        assert_ne!(queued.config_snapshot_id, Some(latest_snapshot.id));
+    }
+
+    #[tokio::test]
+    async fn scheduled_release_rejects_duplicate_active_plan() {
+        let (apps, _db, _data_dir) = app_service().await;
+        let app_id = create_manual_compose_app(&apps, "orders-duplicate-schedule").await;
+        let upload = upload_manual_release(&apps, app_id, "v1.2.3").await;
+
+        apps.schedule_release_publish(upload.release_id, "2030-01-02T03:04:05Z")
+            .await
+            .expect("schedule release");
+
+        let err = apps
+            .schedule_release_publish(upload.release_id, "2030-01-02T04:04:05Z")
+            .await
+            .expect_err("duplicate schedule should fail");
+
+        assert!(matches!(err, AppError::Conflict(_)));
+        assert!(err.message().contains("已经在发布队列中"));
+        let queue = apps
+            .list_app_release_queue()
+            .await
+            .expect("list release queue");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue[0].scheduled_publish_at.as_deref(),
+            Some("2030-01-02T03:04:05Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_queue_release_preserves_receive_order_not_version_code_order() {
+        let (apps, _db, _data_dir) = app_service().await;
+        let app_id = apps
+            .create_app(CreateAppInput {
+                app_key: "orders-auto-order".to_owned(),
+                name: "orders auto order".to_owned(),
+                description: String::new(),
+                environment: "test".to_owned(),
+                app_type: "compose".to_owned(),
+                deploy_strategy: "rolling_stop_on_failure".to_owned(),
+                release_source: "package_upload".to_owned(),
+                auto_queue_release: true,
+                work_dir: "/opt/easy-deploy/apps/orders-auto-order".to_owned(),
+                target_node_ids: vec![1],
+                compose_content: "services:\n  app:\n    image: nginx:alpine\n".to_owned(),
+                env_content: "RUST_LOG=info".to_owned(),
+                deploy_scripts: DeployScriptSet::default(),
+                health_check: Default::default(),
+                binary_artifact_version: String::new(),
+                binary_artifact_path: String::new(),
+                binary_exec_args: String::new(),
+                binary_service_user: String::new(),
+                binary_unit_name: String::new(),
+                binary_release_strategy: "restart".to_owned(),
+                binary_active_slot: "blue".to_owned(),
+                binary_base_port: 8080,
+                binary_standby_port: 18080,
+                binary_proxy_enabled: false,
+                binary_proxy_kind: "none".to_owned(),
+                binary_proxy_domain: String::new(),
+                binary_proxy_config_path: String::new(),
+            })
+            .await
+            .expect("create auto queue app");
+        let newer = apps
+            .upload_release_package(UploadReleasePackageInput {
+                app_id,
+                release_version: "v2.0.0".to_owned(),
+                version_code: Some(2_000_000),
+                published_at: "2026-06-23T10:00:00Z".to_owned(),
+                file_name: "orders-auto-order-v2.bin".to_owned(),
+                bytes: b"newer release".to_vec(),
+                entry_file: String::new(),
+                source: "web".to_owned(),
+            })
+            .await
+            .expect("upload newer release");
+        let older_late = apps
+            .upload_release_package(UploadReleasePackageInput {
+                app_id,
+                release_version: "v1.9.0".to_owned(),
+                version_code: Some(1_009_000),
+                published_at: "2026-06-23T10:01:00Z".to_owned(),
+                file_name: "orders-auto-order-v1-9.bin".to_owned(),
+                bytes: b"older late release".to_vec(),
+                entry_file: String::new(),
+                source: "web".to_owned(),
+            })
+            .await
+            .expect("upload older late release");
+
+        assert!(newer.queued);
+        assert!(older_late.queued);
+        let queue = apps
+            .list_app_release_queue()
+            .await
+            .expect("list release queue");
+        let app_queue = queue
+            .iter()
+            .filter(|item| item.app_id == app_id)
+            .map(|item| (item.release_id, item.version.as_str(), item.queue_seq))
+            .collect::<Vec<_>>();
+
+        assert_eq!(app_queue.len(), 2);
+        assert_eq!(app_queue[0].0, newer.release_id);
+        assert_eq!(app_queue[0].1, "v2.0.0");
+        assert_eq!(app_queue[1].0, older_late.release_id);
+        assert_eq!(app_queue[1].1, "v1.9.0");
+        assert!(app_queue[0].2 < app_queue[1].2);
+    }
+
+    #[tokio::test]
+    async fn auto_queued_releases_run_serially_and_record_task_steps() {
+        let (apps, db, data_dir) = app_service().await;
+        let app_id = create_auto_compose_app(&apps, "orders-serial").await;
+        let first = upload_manual_release(&apps, app_id, "v1.0.0").await;
+        let second = upload_manual_release(&apps, app_id, "v1.0.1").await;
+
+        let first_queue = wait_for_release_queue_status(&apps, first.release_id, "success").await;
+        let second_queue = wait_for_release_queue_status(&apps, second.release_id, "success").await;
+
+        assert!(first_queue.queue_seq < second_queue.queue_seq);
+        let first_task_id = first_queue.task_id.expect("first task id");
+        let second_task_id = second_queue.task_id.expect("second task id");
+        assert!(first_task_id < second_task_id);
+        let releases = apps.list_app_releases().await.expect("list releases");
+        let statuses = releases
+            .iter()
+            .filter(|release| release.app_id == app_id)
+            .map(|release| (release.version.as_str(), release.status.as_str()))
+            .collect::<Vec<_>>();
+        assert!(statuses.contains(&("v1.0.0", "deployed")));
+        assert!(statuses.contains(&("v1.0.1", "deployed")));
+
+        let task_rows = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT status, phase
+            FROM operation_tasks
+            WHERE id IN (?1, ?2)
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(first_task_id)
+        .bind(second_task_id)
+        .fetch_all(&db)
+        .await
+        .expect("read release tasks");
+        assert_eq!(
+            task_rows,
+            vec![
+                ("success".to_owned(), "completed".to_owned()),
+                ("success".to_owned(), "completed".to_owned())
+            ]
+        );
+
+        let step_keys = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT step_key
+            FROM operation_task_steps
+            WHERE task_id = ?1
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(first_task_id)
+        .fetch_all(&db)
+        .await
+        .expect("read task steps");
+        assert!(step_keys.contains(&"node.preflight".to_owned()));
+        assert!(step_keys.contains(&"compose.config".to_owned()));
+        assert!(step_keys.contains(&"compose.action".to_owned()));
+        assert!(step_keys.contains(&"script.pre_deploy".to_owned()));
+        assert!(step_keys.contains(&"script.post_deploy".to_owned()));
+        assert!(step_keys.contains(&"script.switch_traffic".to_owned()));
+        assert!(step_keys.contains(&"script.cleanup".to_owned()));
+
+        let combined_logs = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT COALESCE(GROUP_CONCAT(content, CHAR(10)), '')
+            FROM operation_task_logs
+            WHERE task_id IN (?1, ?2)
+            "#,
+        )
+        .bind(first_task_id)
+        .bind(second_task_id)
+        .fetch_one(&db)
+        .await
+        .expect("read task logs");
+        assert!(combined_logs.contains("版本 v1.0.0 已进入串行发布队列"));
+        assert!(combined_logs.contains("版本 v1.0.1 已进入串行发布队列"));
+        assert!(combined_logs.contains("已更新当前生效版本指针"));
+        assert!(data_dir.path().join("apps/orders-serial/current").is_file());
+    }
+
+    #[tokio::test]
+    async fn auto_queued_release_runs_remote_compose_sync_and_updates_ssh_runtime_state() {
+        let runner = Arc::new(RecordingCommandRunner::default());
+        let (apps, db, data_dir) = app_service_with_runner(runner.clone()).await;
+        let ssh_node_id = create_ssh_target_node(&db, &data_dir).await;
+        let app_id = create_auto_compose_app(&apps, "orders-ssh").await;
+        sqlx::query("DELETE FROM app_targets WHERE app_id = ?1")
+            .bind(app_id)
+            .execute(&db)
+            .await
+            .expect("clear local target");
+        sqlx::query(
+            "INSERT INTO app_targets(app_id, node_id, target_role) VALUES (?1, ?2, 'primary')",
+        )
+        .bind(app_id)
+        .bind(ssh_node_id)
+        .execute(&db)
+        .await
+        .expect("bind ssh target");
+        sqlx::query(
+            r#"
+            INSERT INTO app_runtime_states(app_id, node_id, runtime_status, message)
+            VALUES (?1, ?2, 'unknown', '等待首次部署')
+            "#,
+        )
+        .bind(app_id)
+        .bind(ssh_node_id)
+        .execute(&db)
+        .await
+        .expect("insert ssh runtime state");
+
+        let release = upload_manual_release(&apps, app_id, "v2.0.0").await;
+        let queue = wait_for_release_queue_status(&apps, release.release_id, "success").await;
+
+        assert_eq!(queue.version, "v2.0.0");
+        let runtime = sqlx::query_as::<_, (String, String, i64, Option<i64>)>(
+            r#"
+            SELECT runtime_status, active_version, service_count, last_task_id
+            FROM app_runtime_states
+            WHERE app_id = ?1 AND node_id = ?2
+            "#,
+        )
+        .bind(app_id)
+        .bind(ssh_node_id)
+        .fetch_one(&db)
+        .await
+        .expect("read ssh runtime state");
+        assert_eq!(runtime.0, "healthy");
+        assert_eq!(runtime.1, "v2.0.0");
+        assert_eq!(runtime.2, 1);
+        assert_eq!(runtime.3, queue.task_id);
+
+        let specs = runner.specs.lock().expect("lock command specs").clone();
+        assert!(specs.iter().any(|spec| spec.program == "scp"));
+        assert!(specs.iter().any(|spec| {
+            spec.program == "ssh"
+                && spec.args.contains(&"deploy@10.0.2.11".to_owned())
+                && spec
+                    .args
+                    .iter()
+                    .any(|arg| arg.contains("/opt/easy-deploy/apps/orders-ssh"))
+        }));
+        assert!(specs.iter().any(|spec| {
+            spec.program == "ssh"
+                && spec.args.windows(3).any(|window| {
+                    window[0] == "docker" && window[1] == "compose" && window[2] == "up"
+                })
+        }));
+    }
+
+    #[tokio::test]
+    async fn failed_auto_queue_blocks_later_release_and_marks_remaining_nodes_skipped() {
+        let runner = Arc::new(ComposeUpFailureRunner::default());
+        let (apps, db, data_dir) = app_service_with_runner(runner.clone()).await;
+        let ssh_node_id = create_ssh_target_node(&db, &data_dir).await;
+        let app_id = create_auto_compose_app(&apps, "orders-fail-block").await;
+        sqlx::query(
+            "INSERT INTO app_targets(app_id, node_id, target_role) VALUES (?1, ?2, 'primary')",
+        )
+        .bind(app_id)
+        .bind(ssh_node_id)
+        .execute(&db)
+        .await
+        .expect("bind second ssh target");
+        sqlx::query(
+            r#"
+            INSERT INTO app_runtime_states(app_id, node_id, runtime_status, message)
+            VALUES (?1, ?2, 'unknown', '等待首次部署')
+            "#,
+        )
+        .bind(app_id)
+        .bind(ssh_node_id)
+        .execute(&db)
+        .await
+        .expect("insert ssh runtime state");
+        let first = upload_manual_release(&apps, app_id, "v3.0.0").await;
+        let second = upload_manual_release(&apps, app_id, "v3.0.1").await;
+
+        let failed_queue = wait_for_release_queue_status(&apps, first.release_id, "failed").await;
+        for _ in 0..30 {
+            let queue = apps.list_app_release_queue().await.expect("list queue");
+            let later = queue
+                .iter()
+                .find(|item| item.release_id == second.release_id)
+                .expect("second release queue item");
+            assert_eq!(
+                later.status, "queued",
+                "later release should stay queued after first release failed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let task_id = failed_queue.task_id.expect("failed task id");
+        let task = apps.tasks.task_detail(task_id).await.expect("task detail");
+        assert_eq!(task.status, "failed");
+        assert!(task.summary.contains("compose up failed"));
+        let node_results = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT node_key, status
+            FROM operation_task_node_results
+            WHERE task_id = ?1
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(task_id)
+        .fetch_all(&db)
+        .await
+        .expect("read task node results");
+        assert_eq!(
+            node_results,
+            vec![
+                ("local".to_owned(), "failed".to_owned()),
+                ("ssh-prod-a".to_owned(), "skipped".to_owned())
+            ]
+        );
+
+        let releases = apps.list_app_releases().await.expect("list releases");
+        let first_release = releases
+            .iter()
+            .find(|release| release.id == first.release_id)
+            .expect("first release");
+        let second_release = releases
+            .iter()
+            .find(|release| release.id == second.release_id)
+            .expect("second release");
+        assert_eq!(first_release.status, "failed");
+        assert_eq!(second_release.status, "queued");
     }
 
     #[test]

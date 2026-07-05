@@ -11,6 +11,7 @@ use api::{
         CommandResult, CommandRunner, CommandSpec, ComposeExecutor, DeployError, SystemdExecutor,
     },
     events::EventLogService,
+    migrations::connect_database,
     node_credentials::NodeCredentialService,
     nodes::NodeService,
     platform::PlatformConfigService,
@@ -18,7 +19,6 @@ use api::{
     tasks::TaskService,
 };
 use async_trait::async_trait;
-use sqlx::sqlite::SqliteConnectOptions;
 use tokio::net::TcpListener;
 
 const LOCAL_TEST_ADMIN_PASSWORD: &str = "gf7G7MQKPcQoHa79RUdz09yg";
@@ -151,10 +151,7 @@ pub async fn smoke_test() -> anyhow::Result<()> {
     let database_path = temp_dir.path().join("e2e.db");
     let database_url = format!("sqlite://{}", database_path.to_string_lossy());
 
-    let options = database_url
-        .parse::<SqliteConnectOptions>()?
-        .create_if_missing(true);
-    let db = sqlx::SqlitePool::connect_with(options).await?;
+    let db = connect_database(&database_url, true).await?;
     sqlx::migrate!("../api/migrations").run(&db).await?;
     let auth = AuthService::new(db.clone(), Arc::new(MemorySessionStore::new()));
     auth.sync_permission_registry().await?;
