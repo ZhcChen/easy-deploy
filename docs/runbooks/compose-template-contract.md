@@ -39,7 +39,7 @@ deploy/easy-deploy/
         90-healthcheck.sh
 ```
 
-复杂系统可以拆成多个发布单元，例如数据库、Redis、NATS、Loki、Alloy、Gateway、Backend、Worker 和前端静态站点。每个发布单元在 easy-deploy 中对应一个应用。
+复杂系统可以拆成多个发布单元，例如 Redis、NATS、Loki、Alloy、Gateway、Backend、Worker 和前端静态站点。每个发布单元在 easy-deploy 中对应一个应用。PostgreSQL 等关系型数据库在正式环境优先使用云 RDS，本地 Compose 数据库只建议用于开发、演示或临时验证。
 
 ## app.yaml.example
 
@@ -68,9 +68,22 @@ notes:
 - `deploy_strategy`：节点滚动策略，当前支持 `rolling_stop_on_failure` 和 `rolling_continue`。
 - `health_*`：部署后健康检查默认值。
 
-基础设施类应用通常使用 `release_source: manual`，例如 Redis、PostgreSQL、NATS、Loki、Alloy 和 Gateway。
+基础设施类应用通常使用 `release_source: manual`，例如 Redis、NATS、Loki、Alloy 和 Gateway。PostgreSQL 正式环境建议接入云 RDS，业务服务只在 `.env` 中配置数据库连接串。
 
 业务运行类应用通常使用 `release_source: package_upload`，由业务项目或 CI 调用 OpenAPI 投递版本包。
+
+## 内置基础设施模板
+
+后台“模板管理”当前提供一组只读 Compose 模板，定位是快速初始化基础设施发布单元，而不是长期替代用户自己的生产配置：
+
+- Redis 单节点：默认开启密码、AOF 持久化、内存上限、健康检查和 Docker 日志轮转，端口默认绑定 `127.0.0.1`。
+- Loki 单节点：用于单机日志存储，默认文件系统存储，适合配合 Alloy 采集 Docker stdout 日志。
+- Alloy Docker 日志采集：默认只采集带 `qfy_logs_enabled=true` 标签的容器，并把 `qfy_project`、`qfy_env`、`qfy_service` 标签写入日志流。
+- NATS JetStream：默认启用 JetStream、持久化目录、账号密码和监控端口，业务发布单元可通过 `.env` 引用连接信息。
+
+这类模板创建后应按实际环境补齐密码、绑定地址、资源上限、保留周期和安全组策略。跨节点访问时不要直接沿用默认本机绑定地址，应结合内网地址、防火墙或网关策略明确暴露范围。
+
+PostgreSQL 模板仅保留为开发、演示或临时验证入口；正式环境默认走云 RDS，不建议用 easy-deploy 管理生产 PG 数据目录。
 
 ## compose.yaml.example
 
