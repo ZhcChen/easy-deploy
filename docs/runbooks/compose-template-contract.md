@@ -41,6 +41,36 @@ deploy/easy-deploy/
 
 复杂系统可以拆成多个发布单元，例如 Redis、NATS、Loki、Alloy、Gateway、Backend、Worker 和前端静态站点。每个发布单元在 easy-deploy 中对应一个应用。PostgreSQL 等关系型数据库在正式环境优先使用云 RDS，本地 Compose 数据库只建议用于开发、演示或临时验证。
 
+## 部署目录约定
+
+easy-deploy 不维护业务专属部署流程。每个应用都按固定目录约定落到目标节点，并在该目录内执行 `docker compose`：
+
+```text
+<node.work_dir>/<app_key>/
+├── compose.yaml
+├── .env
+├── .easy-deploy/
+│   ├── app.yaml
+│   └── scripts/
+├── releases/
+├── current
+├── data/
+├── config/
+├── logs/
+└── storage/
+```
+
+约定：
+
+- `node.work_dir` 是节点上的应用根目录，默认 `/opt/easy-deploy/apps`。
+- `app_key` 是应用标识，也是应用目录名。
+- `compose.yaml` 和 `.env` 固定由平台写在应用目录根部，不允许把部署目录填写到 `compose.yaml` 文件本身。
+- 平台在应用目录中执行 `docker compose config`、`docker compose up -d --remove-orphans`、`docker compose restart` 和日志命令。
+- 容器需要持久化的数据、配置、日志和对象文件应映射到 `compose.yaml` 同级的相对目录，例如 `./data`、`./config`、`./logs`、`./storage`。
+- 默认不使用绝对宿主机路径、匿名 volume 或 named volume 保存应用数据；少数系统挂载例外，例如 Alloy 采集 Docker 日志需要的 `/var/run/docker.sock`。
+
+这个约定让测试环境和正式环境只差 `.env`、节点、域名、密钥和资源上限，避免每个项目都重新设计目录结构。
+
 ## app.yaml.example
 
 `app.yaml.example` 只描述部署单元的元信息和默认健康检查，不放真实密钥。

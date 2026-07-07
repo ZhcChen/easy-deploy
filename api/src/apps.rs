@@ -4967,6 +4967,7 @@ fn run_local_preflight(work_dir: &Path) -> Result<LocalPreflightResult, AppError
             compose_path.to_string_lossy()
         ))
     })?;
+    validate_compose_deploy_conventions(&compose_content)?;
     let ports = parse_compose_host_ports(&compose_content)?;
     let occupied_ports = occupied_ports(&ports);
 
@@ -7724,7 +7725,7 @@ impl AppService {
         let deploy_strategy = normalize_deploy_strategy(&input.deploy_strategy)?;
         let release_source = normalize_release_source(&input.release_source)?;
         let auto_queue_release = input.auto_queue_release;
-        let work_dir = required_text(&input.work_dir, "请输入部署目录")?;
+        let work_dir = normalize_deploy_work_dir(&input.work_dir)?;
         let description = input.description.trim().to_owned();
         let runtime_name = name.clone();
         let compose_content = if app_type == "compose" {
@@ -8152,7 +8153,7 @@ impl AppService {
         let name = required_text(&input.name, "请输入应用名称")?;
         let description = input.description.trim().to_owned();
         let environment = normalize_app_environment(&input.environment)?;
-        let work_dir = required_text(&input.work_dir, "请输入部署目录")?;
+        let work_dir = normalize_deploy_work_dir(&input.work_dir)?;
         let deploy_strategy = normalize_deploy_strategy(&input.deploy_strategy)?;
         let release_source = normalize_release_source(&input.release_source)?;
         let auto_queue_release = input.auto_queue_release;
@@ -10466,18 +10467,129 @@ fn required_text(value: &str, message: &str) -> Result<String, AppError> {
     }
 }
 
+fn normalize_deploy_work_dir(value: &str) -> Result<String, AppError> {
+    let value = required_text(value, "请输入部署目录")?
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_owned();
+    if value.contains('\n') || value.contains('\r') {
+        return Err(AppError::InvalidInput("部署目录不能包含换行".to_owned()));
+    }
+    if !value.starts_with('/') && !value.starts_with('.') {
+        return Err(AppError::InvalidInput(
+            "部署目录必须使用绝对路径，或使用 . 开头的相对路径".to_owned(),
+        ));
+    }
+    let last_segment = value.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+    if matches!(
+        last_segment.as_str(),
+        "compose.yaml" | "compose.yml" | "docker-compose.yaml" | "docker-compose.yml"
+    ) {
+        return Err(AppError::InvalidInput(
+            "部署目录必须是应用目录，compose.yaml 会由平台固定生成在该目录下".to_owned(),
+        ));
+    }
+    Ok(value)
+}
+
 fn normalize_compose_content(value: &str, app_key: &str) -> Result<String, AppError> {
     let value = value.trim();
     if value.is_empty() {
         return Ok(default_compose_content(app_key));
     }
     let value = strip_top_level_compose_version(value);
-    if !value.contains("services:") {
+    validate_compose_deploy_conventions(&value)?;
+    Ok(ensure_trailing_newline(&value))
+}
+
+fn validate_compose_deploy_conventions(value: &str) -> Result<(), AppError> {
+    let parsed = serde_yaml::from_str::<Value>(value)
+        .map_err(|err| AppError::InvalidInput(format!("Compose YAML 解析失败: {err}")))?;
+    let Some(services) = parsed.get("services").and_then(Value::as_mapping) else {
         return Err(AppError::InvalidInput(
             "Compose 内容需要包含 services 定义".to_owned(),
         ));
+    };
+    if services.is_empty() {
+        return Err(AppError::InvalidInput(
+            "Compose 内容需要至少定义一个 service".to_owned(),
+        ));
     }
-    Ok(ensure_trailing_newline(&value))
+    validate_compose_volume_sources(services)
+}
+
+fn validate_compose_volume_sources(services: &serde_yaml::Mapping) -> Result<(), AppError> {
+    for (service_name, service) in services {
+        let service_name = service_name.as_str().unwrap_or("unknown");
+        let Some(volumes) = service.get("volumes").and_then(Value::as_sequence) else {
+            continue;
+        };
+        for volume in volumes {
+            match volume {
+                Value::String(value) => {
+                    let source = compose_volume_source_from_short_syntax(value);
+                    validate_compose_volume_source(service_name, &source)?;
+                }
+                Value::Mapping(mapping) => {
+                    let volume_type = mapping
+                        .get(Value::String("type".to_owned()))
+                        .and_then(Value::as_str)
+                        .unwrap_or("bind");
+                    if volume_type == "tmpfs" {
+                        continue;
+                    }
+                    let source = mapping
+                        .get(Value::String("source".to_owned()))
+                        .or_else(|| mapping.get(Value::String("src".to_owned())))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    validate_compose_volume_source(service_name, source)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compose_volume_source_from_short_syntax(value: &str) -> String {
+    let value = value.trim();
+    let Some((source, _target)) = value.split_once(':') else {
+        return value.to_owned();
+    };
+    source.trim().to_owned()
+}
+
+fn validate_compose_volume_source(service_name: &str, source: &str) -> Result<(), AppError> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Err(AppError::InvalidInput(format!(
+            "Compose service {service_name} 的 volume 缺少宿主机 source，请使用 ./data、./config、./logs 等相对目录"
+        )));
+    }
+    if source.starts_with("./") {
+        let relative = source.strip_prefix("./").unwrap_or(source);
+        if relative.is_empty()
+            || relative
+                .split('/')
+                .any(|segment| matches!(segment, "" | "." | ".."))
+        {
+            return Err(AppError::InvalidInput(format!(
+                "Compose service {service_name} 的 volume source {source} 必须留在应用目录内"
+            )));
+        }
+        return Ok(());
+    }
+    if is_allowed_system_bind_mount(source) {
+        return Ok(());
+    }
+    Err(AppError::InvalidInput(format!(
+        "Compose service {service_name} 的 volume source {source} 不符合目录约定；持久化目录请放在 compose.yaml 同级目录下，例如 ./data、./config、./logs"
+    )))
+}
+
+fn is_allowed_system_bind_mount(source: &str) -> bool {
+    matches!(source, "/var/run/docker.sock")
 }
 
 fn render_runtime_metadata(
@@ -12424,6 +12536,96 @@ mod tests {
         .expect("normalize compose");
 
         assert!(content.contains("      version: stable"));
+    }
+
+    #[test]
+    fn normalize_compose_content_enforces_local_bind_mount_convention() {
+        let content = normalize_compose_content(
+            r#"
+services:
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - ./data/redis:/data
+  alloy:
+    image: grafana/alloy:v1.6.1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+"#,
+            "infra",
+        )
+        .expect("local bind mounts should be accepted");
+
+        assert!(content.contains("./data/redis:/data"));
+
+        let absolute = normalize_compose_content(
+            r#"
+services:
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - /data/redis:/data
+"#,
+            "infra",
+        )
+        .expect_err("absolute data path should fail");
+        assert!(absolute.message().contains("compose.yaml 同级目录"));
+
+        let named = normalize_compose_content(
+            r#"
+services:
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+"#,
+            "infra",
+        )
+        .expect_err("named volume should fail");
+        assert!(named.message().contains("目录约定"));
+
+        let parent = normalize_compose_content(
+            r#"
+services:
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - ./../redis:/data
+"#,
+            "infra",
+        )
+        .expect_err("parent traversal should fail");
+        assert!(parent.message().contains("应用目录内"));
+
+        let dot_segment = normalize_compose_content(
+            r#"
+services:
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - ././redis:/data
+"#,
+            "infra",
+        )
+        .expect_err("dot segment should fail");
+        assert!(dot_segment.message().contains("应用目录内"));
+    }
+
+    #[test]
+    fn normalize_deploy_work_dir_keeps_directory_level_contract() {
+        assert_eq!(
+            normalize_deploy_work_dir(r" \opt\easy-deploy\apps\orders-api\ ")
+                .expect("normalized deploy dir"),
+            "/opt/easy-deploy/apps/orders-api"
+        );
+        assert!(
+            normalize_deploy_work_dir("/opt/easy-deploy/apps/orders-api/compose.yaml").is_err()
+        );
+        assert!(
+            normalize_deploy_work_dir("/opt/easy-deploy/apps/orders-api/docker-compose.yml")
+                .is_err()
+        );
+        assert!(normalize_deploy_work_dir("relative/orders-api").is_err());
     }
 
     #[test]

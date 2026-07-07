@@ -192,6 +192,11 @@ fn normalize_app_work_dir_template(value: &str) -> Result<String, PlatformConfig
             "默认应用部署目录必须包含 {app_key} 占位符".to_owned(),
         ));
     }
+    if normalized.rsplit('/').next() != Some("{app_key}") {
+        return Err(PlatformConfigError::InvalidInput(
+            "默认应用部署目录必须以 {app_key} 作为最后一级目录".to_owned(),
+        ));
+    }
     Ok(normalized)
 }
 
@@ -355,6 +360,14 @@ mod tests {
         let err = normalize_app_work_dir_template("/opt/easy-deploy/apps")
             .expect_err("missing placeholder should fail");
         assert!(matches!(err, PlatformConfigError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn app_work_dir_template_requires_app_key_as_last_segment() {
+        let err = normalize_app_work_dir_template("/opt/easy-deploy/{app_key}/apps")
+            .expect_err("placeholder must be final segment");
+        assert!(matches!(err, PlatformConfigError::InvalidInput(_)));
+        assert!(err.message().contains("最后一级目录"));
     }
 
     #[test]
