@@ -43,6 +43,7 @@
 - 后续用户说“部署正式环境”“发正式”“部署生产”等同类指令时，默认目标就是 `qfy-sc-test` 上的 easy-deploy 正式环境，除非用户当次明确指定其他服务器或域名。
 - 正式环境服务使用 systemd 单机部署：
   - systemd 服务：`easy-deploy.service`
+  - 运行用户：`root:root`
   - 后端监听：`127.0.0.1:9066`
   - 程序文件：`/opt/easy-deploy/easy-deploy-api`
   - 环境配置：`/etc/easy-deploy/easy-deploy.env`

@@ -6,8 +6,8 @@ INSTALL_DIR="/opt/easy-deploy"
 CONFIG_DIR="/etc/easy-deploy"
 DATA_DIR="/var/lib/easy-deploy"
 LOCAL_APP_DIR="/opt/easy-deploy/apps"
-RUN_USER="easy-deploy"
-RUN_GROUP="easy-deploy"
+RUN_USER="root"
+RUN_GROUP="root"
 BIND_ADDR="127.0.0.1:9066"
 COOKIE_SECURE="false"
 COMMAND_TIMEOUT_SECS="120"
@@ -33,8 +33,8 @@ Options:
   --config-dir <path>          Config directory. Default: /etc/easy-deploy.
   --data-dir <path>            Data directory. Default: /var/lib/easy-deploy.
   --local-app-dir <path>       Writable local app deployment directory. Default: /opt/easy-deploy/apps.
-  --user <name>                Runtime user. Default: easy-deploy.
-  --group <name>               Runtime group. Default: easy-deploy.
+  --user <name>                Runtime user. Default: root.
+  --group <name>               Runtime group. Default: root.
   --bind <addr:port>           Listen address. Default: 127.0.0.1:9066.
   --cookie-secure <true|false> Secure cookie flag. Default: false.
   --command-timeout-secs <n>   Command timeout. Default: 120.

@@ -69,7 +69,7 @@ sudo bash scripts/deploy-systemd.sh
 
 - 检查 Linux + systemd 环境。
 - 判断 `/etc/systemd/system/easy-deploy.service` 是否存在，用于区分首次部署和更新部署。
-- 创建 `easy-deploy` 系统用户和组。
+- 使用 `root:root` 作为默认 systemd 运行用户和组。
 - 创建 `/opt/easy-deploy`、`/etc/easy-deploy`、`/var/lib/easy-deploy`。
 - 创建 `/opt/easy-deploy/apps` 作为默认本机节点应用部署目录。
 - 安装二进制到 `/opt/easy-deploy/easy-deploy-api`。
@@ -95,26 +95,23 @@ sudo bash scripts/deploy-systemd.sh --binary ./target/release/api --skip-build -
 
 ## 运行权限
 
-脚本默认使用低权限系统用户运行：
+脚本默认使用 root 运行：
 
 ```text
-easy-deploy:easy-deploy
+root:root
 ```
 
-这适合控制台只通过 SSH 管理远程节点的场景。
+原因是 easy-deploy 是部署控制台，不是普通业务 Web 服务。它需要管理本机 Docker Compose、读取主机进程 IO、写入部署目录并执行发布脚本；如果使用低权限用户，磁盘 IO 进程 Top、Docker 操作和部分本机部署动作会被 Linux 权限拦截。
 
-如果要让 easy-deploy 控制台直接管理“本机节点”的 Docker Compose 或 systemd 二进制服务，需要额外处理宿主机权限：
-
-- Docker Compose：把 `easy-deploy` 用户加入 `docker` 组，或改为用 root 运行服务。
-- systemd 二进制部署：`systemctl link/restart/stop` 通常需要 root 权限，低权限用户默认会失败。
-
-为了保持平台自身部署简单，脚本不自动写 sudoers 或 polkit 规则。如果你的部署平台本身就要管理本机 Docker/systemd，最直接的方式是用 root 运行：
+如果确实只通过 SSH 管理远程节点，并且不需要本机 Docker、进程 IO 和本机部署能力，可以显式降权运行：
 
 ```bash
-sudo bash scripts/deploy-systemd.sh --binary ./target/release/api --skip-build --user root --group root
+sudo bash scripts/deploy-systemd.sh --binary ./target/release/api --skip-build --user easy-deploy --group easy-deploy
 ```
 
-如果只管理远程 SSH 节点，保留默认低权限用户即可。
+降权运行前需要自行创建用户和组，或让脚本创建 `easy-deploy` 系统用户。降权后如需访问 Docker，需要额外配置 docker 组、sudoers 或 polkit；脚本不会自动写这些宿主机权限规则。
+
+正式环境 `easy-deploy.quanxinfu.com` 当前按 `root:root` 运行。
 
 ## 更新部署
 
@@ -223,7 +220,7 @@ sudo bash scripts/deploy-systemd.sh --binary ./target/release/api --skip-build -
 --binary <path>             使用已构建好的 api 二进制。
 --skip-build                跳过 cargo build，通常和 --binary 一起使用。
 --bind <addr:port>          修改监听地址，默认 127.0.0.1:9066。
---user <name> --group <g>   修改 systemd 运行用户和组。
+--user <name> --group <g>   修改 systemd 运行用户和组，默认 root:root。
 --no-start                  只安装/更新文件，不启动服务；如果原服务正在运行，更新前会先停止。
 --force-env                 覆盖已有 /etc/easy-deploy/easy-deploy.env。
 --dry-run                   只打印将执行的动作。
@@ -254,7 +251,7 @@ sudo install -m 0755 -o root -g root \
 如需恢复数据库：
 
 ```bash
-sudo install -m 0640 -o easy-deploy -g easy-deploy \
+sudo install -m 0640 -o root -g root \
   /var/lib/easy-deploy/backups/<backup>/easy-deploy.db \
   /var/lib/easy-deploy/easy-deploy.db
 ```
