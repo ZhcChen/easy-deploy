@@ -8794,6 +8794,9 @@ mod tests {
         assert!(html.contains("name=\"app_type\" value=\"compose\""));
         assert!(html.contains("name=\"release_source\""));
         assert!(html.contains("value=\"package_upload\""));
+        assert!(html.contains("对象存储"));
+        assert!(html.contains("name=\"private_bucket\""));
+        assert!(html.contains("qfy-sc worker"));
         assert!(!html.contains("二进制直部署"));
         assert!(!html.contains("systemd 管理"));
     }
@@ -9669,6 +9672,46 @@ mod tests {
             "unexpected queue status: {}",
             queue_item.status
         );
+    }
+
+    #[tokio::test]
+    async fn app_detail_exposes_object_storage_env_controls() {
+        let app = test_web_app().await;
+        let app_id = create_compose_test_app(&app.apps, "orders-api-prod").await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+
+        let detail_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/apps/{app_id}"))
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let body = to_bytes(detail_response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("对象存储"));
+        assert!(html.contains("name=\"private_bucket\""));
+        assert!(html.contains("name=\"application_key\""));
+        assert!(html.contains("ALIYUN_OSS_ACCESS_KEY_ID"));
     }
 
     #[tokio::test]
