@@ -234,6 +234,34 @@ impl ComposeExecutor {
         })
     }
 
+    pub async fn run_shell_redacted(
+        &self,
+        work_dir: PathBuf,
+        command: &str,
+        display_command: &str,
+    ) -> Result<ComposeCommandOutput, DeployError> {
+        if !work_dir.is_dir() {
+            return Err(DeployError::InvalidInput(format!(
+                "Compose 工作目录不存在: {}",
+                work_dir.to_string_lossy()
+            )));
+        }
+        let result = self
+            .runner
+            .run(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec!["-lc".to_owned(), command.to_owned()],
+                current_dir: work_dir,
+            })
+            .await?;
+        Ok(ComposeCommandOutput {
+            command: display_command.to_owned(),
+            success: result.success(),
+            status_code: result.status_code,
+            output: result.combined_output(),
+        })
+    }
+
     pub async fn logs(&self, work_dir: PathBuf) -> Result<ComposeCommandOutput, DeployError> {
         self.logs_with_tail(work_dir, 200).await
     }
@@ -742,6 +770,24 @@ impl SshExecutor {
             vec!["sh".to_owned(), "-lc".to_owned(), command],
         )
         .await
+    }
+
+    pub async fn run_shell_redacted(
+        &self,
+        target: &SshTarget,
+        local_work_dir: PathBuf,
+        command: &str,
+        display_command: &str,
+    ) -> Result<CommandOutput, DeployError> {
+        let mut output = self
+            .run_ssh(
+                target,
+                local_work_dir,
+                vec!["sh".to_owned(), "-lc".to_owned(), command.to_owned()],
+            )
+            .await?;
+        output.command = display_command.to_owned();
+        Ok(output)
     }
 
     pub async fn compose_ps_running(
@@ -1682,6 +1728,29 @@ mod tests {
         assert_eq!(specs[0].program, "docker");
         assert_eq!(specs[0].args, ["compose", "config"]);
         assert_eq!(specs[0].current_dir, work_dir.path());
+    }
+
+    #[tokio::test]
+    async fn compose_run_shell_redacted_hides_sensitive_command_label() {
+        let work_dir = tempdir().expect("temp dir");
+        let runner = Arc::new(RecordingRunner::default());
+        let executor = ComposeExecutor::new(runner.clone());
+
+        let output = executor
+            .run_shell_redacted(
+                work_dir.path().to_path_buf(),
+                "curl 'https://bucket.oss/test?Signature=secret'",
+                "download oss://bucket/test",
+            )
+            .await
+            .expect("run shell");
+
+        assert!(output.success);
+        assert_eq!(output.command, "download oss://bucket/test");
+        assert!(!output.command.contains("Signature=secret"));
+        let specs = runner.specs.lock().expect("lock specs");
+        assert_eq!(specs[0].program, "sh");
+        assert!(specs[0].args[1].contains("Signature=secret"));
     }
 
     #[tokio::test]

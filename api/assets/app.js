@@ -2,7 +2,6 @@
   const MODAL_CLOSING_CLASS = "is-closing";
   const APP_CONFIG_KIND = "easy-deploy.app-config";
   const COMPOSE_TEMPLATE_KIND = "easy-deploy.compose-template";
-  const STORAGE_CONFIG_SCHEMA = "qfy-sc.worker.storage-config";
   const APP_CONFIG_BASE_FIELDS = [
     "app_key",
     "name",
@@ -34,44 +33,16 @@
     "health_timeout_secs",
     "health_expected_status",
   ];
-  const APP_CONFIG_STORAGE_FIELDS = [
-    "provider",
-    "region",
-    "endpoint",
-    "private_bucket",
-    "public_bucket",
-    "public_base_url",
-    "upload_url_ttl_seconds",
-    "download_url_ttl_seconds",
-    "key_id",
-    "application_key",
-  ];
-  const APP_CONFIG_STORAGE_ENV_MAP = {
-    provider: "OBJECT_STORAGE_PROVIDER",
-    region: "ALIYUN_OSS_REGION",
-    endpoint: "ALIYUN_OSS_ENDPOINT",
-    private_bucket: "ALIYUN_OSS_PRIVATE_BUCKET",
-    public_bucket: "ALIYUN_OSS_PUBLIC_BUCKET",
-    public_base_url: "ALIYUN_OSS_PUBLIC_BASE_URL",
-    upload_url_ttl_seconds: "ALIYUN_OSS_UPLOAD_URL_TTL_SECONDS",
-    download_url_ttl_seconds: "ALIYUN_OSS_DOWNLOAD_URL_TTL_SECONDS",
-    key_id: "ALIYUN_OSS_ACCESS_KEY_ID",
-    application_key: "ALIYUN_OSS_ACCESS_KEY_SECRET",
-  };
-  const APP_CONFIG_STORAGE_ENV_KEYS = new Set(Object.values(APP_CONFIG_STORAGE_ENV_MAP));
   const APP_CONFIG_BOOLEAN_FIELDS = ["auto_queue_release"];
   const APP_CONFIG_NUMBER_FIELDS = new Set([
     "health_timeout_secs",
     "health_expected_status",
-    "upload_url_ttl_seconds",
-    "download_url_ttl_seconds",
   ]);
   const APP_CONFIG_FIELD_NAMES = new Set([
     ...APP_CONFIG_BASE_FIELDS,
     ...APP_CONFIG_COMPOSE_FIELDS,
     ...APP_CONFIG_SCRIPT_FIELDS,
     ...APP_CONFIG_HEALTH_FIELDS,
-    ...APP_CONFIG_STORAGE_FIELDS,
     ...APP_CONFIG_BOOLEAN_FIELDS,
   ]);
   const UTC_TIMESTAMP_TEXT_PATTERN =
@@ -356,18 +327,6 @@
         timeout_secs: readFieldValue(root, "health_timeout_secs"),
         expected_status: readFieldValue(root, "health_expected_status"),
       },
-      object_storage: {
-        provider: readFieldValue(root, "provider") || "aliyun_oss",
-        region: readFieldValue(root, "region"),
-        endpoint: readFieldValue(root, "endpoint"),
-        private_bucket: readFieldValue(root, "private_bucket"),
-        public_bucket: readFieldValue(root, "public_bucket"),
-        public_base_url: readFieldValue(root, "public_base_url"),
-        upload_url_ttl_seconds: readFieldValue(root, "upload_url_ttl_seconds"),
-        download_url_ttl_seconds: readFieldValue(root, "download_url_ttl_seconds"),
-        key_id: readFieldValue(root, "key_id"),
-        application_key: readFieldValue(root, "application_key"),
-      },
       binary: {
         artifact_version: readFieldValue(root, "binary_artifact_version"),
         artifact_path: readFieldValue(root, "binary_artifact_path"),
@@ -448,9 +407,6 @@
       }
     });
 
-    if (APP_CONFIG_STORAGE_FIELDS.includes(control.name)) {
-      syncObjectStorageEnv(root);
-    }
   };
 
   const assignIfPresent = (target, key, value) => {
@@ -483,103 +439,6 @@
 
   const firstDefined = (...values) =>
     values.find((value) => value !== undefined && value !== null);
-
-  const firstFieldValue = (source, keys) => {
-    if (!source || typeof source !== "object") return undefined;
-    return keys
-      .map((key) => source[key])
-      .find((value) => value !== undefined && value !== null);
-  };
-
-  const parseEnvContent = (content) =>
-    String(content || "")
-      .replace(/\r\n/g, "\n")
-      .split("\n")
-      .reduce((result, line) => {
-        const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
-        if (match) {
-          result[match[1]] = unquoteYamlScalar(match[2]);
-        }
-        return result;
-      }, {});
-
-  const hasObjectStorageEnvKeys = (content) =>
-    Object.keys(parseEnvContent(content)).some((key) => APP_CONFIG_STORAGE_ENV_KEYS.has(key));
-
-  const renderEnvValue = (value) => String(value ?? "").replace(/\r?\n/g, " ").trim();
-
-  const mergeEnvValues = (content, values) => {
-    const normalized = Object.entries(values).reduce((result, [key, value]) => {
-      const text = renderEnvValue(value);
-      if (text) result[key] = text;
-      return result;
-    }, {});
-    const seen = new Set();
-    const normalizedContent = String(content || "").replace(/\r\n/g, "\n").replace(/\n+$/, "");
-    const lines = normalizedContent.trim()
-      ? normalizedContent.split("\n")
-      : [];
-    const next = [];
-
-    lines.forEach((line) => {
-      const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=/);
-      if (!match || !APP_CONFIG_STORAGE_ENV_KEYS.has(match[1])) {
-        next.push(line);
-        return;
-      }
-
-      if (Object.prototype.hasOwnProperty.call(normalized, match[1]) && !seen.has(match[1])) {
-        next.push(`${match[1]}=${normalized[match[1]]}`);
-      }
-      seen.add(match[1]);
-    });
-
-    Object.entries(normalized).forEach(([key, value]) => {
-      if (!seen.has(key)) {
-        next.push(`${key}=${value}`);
-      }
-    });
-
-    return next.length > 0 ? `${next.join("\n")}\n` : "";
-  };
-
-  const objectStorageEnvValues = (root) =>
-    APP_CONFIG_STORAGE_FIELDS.reduce((result, name) => {
-      const envKey = APP_CONFIG_STORAGE_ENV_MAP[name];
-      const value = readFieldValue(root, name);
-      if (envKey && String(value ?? "").trim()) {
-        result[envKey] = value;
-      }
-      return result;
-    }, {});
-
-  const syncObjectStorageEnv = (root) => {
-    const envControls = namedControls(root, "env_content");
-    if (envControls.length === 0) return;
-
-    const base = readFieldValue(root, "env_content");
-    const merged = mergeEnvValues(base, objectStorageEnvValues(root));
-    envControls.forEach((control) => {
-      setControlValue(control, merged);
-    });
-  };
-
-  const hydrateObjectStorageFromEnv = (root) => {
-    const env = parseEnvContent(readFieldValue(root, "env_content"));
-    APP_CONFIG_STORAGE_FIELDS.forEach((name) => {
-      const envKey = APP_CONFIG_STORAGE_ENV_MAP[name];
-      if (!envKey || env[envKey] === undefined) return;
-      namedControls(root, name).forEach((control) => {
-        setControlValue(control, env[envKey]);
-      });
-    });
-  };
-
-  const initObjectStorageConfigControls = () => {
-    document.querySelectorAll("[data-app-config-transfer]").forEach((root) => {
-      hydrateObjectStorageFromEnv(root);
-    });
-  };
 
   const normalizeScriptKey = (key) =>
     String(key || "")
@@ -629,12 +488,8 @@
       throw new Error("config kind mismatch");
     }
 
-    const isStorageConfigPackage = payload.schema === STORAGE_CONFIG_SCHEMA;
-    if (payload.schema && !isStorageConfigPackage) {
+    if (payload.schema) {
       throw new Error("config schema mismatch");
-    }
-    if (isStorageConfigPackage && Number(payload.version || 0) !== 1) {
-      throw new Error("config schema version mismatch");
     }
 
     const source =
@@ -701,45 +556,11 @@
       firstDefined(source.health_expected_status, health.expected_status, appYaml.health_expected_status),
     );
 
-    const objectStorage =
-      source.object_storage && typeof source.object_storage === "object"
-        ? source.object_storage
-        : source.storage_config && typeof source.storage_config === "object"
-          ? source.storage_config
-          : source;
-    const storageAliases = {
-      provider: ["provider"],
-      region: ["region"],
-      endpoint: ["endpoint"],
-      private_bucket: ["private_bucket", "privateBucket"],
-      public_bucket: ["public_bucket", "publicBucket"],
-      public_base_url: ["public_base_url", "publicBaseUrl"],
-      upload_url_ttl_seconds: ["upload_url_ttl_seconds", "uploadUrlTTLSeconds"],
-      download_url_ttl_seconds: ["download_url_ttl_seconds", "downloadUrlTTLSeconds"],
-      key_id: ["key_id", "keyId"],
-      application_key: ["application_key", "applicationKey"],
-    };
-    Object.entries(storageAliases).forEach(([field, aliases]) => {
-      assignIfPresent(config, field, firstFieldValue(objectStorage, aliases));
-    });
-    if (isStorageConfigPackage) {
-      if (firstFieldValue(objectStorage, storageAliases.key_id) === undefined) {
-        config.key_id = "";
-      }
-      if (firstFieldValue(objectStorage, storageAliases.application_key) === undefined) {
-        config.application_key = "";
-      }
-    }
-
     return config;
   };
 
   const applyAppDeployConfig = (root, config) => {
     let applied = 0;
-    const hasStorageFields = Object.keys(config).some((name) =>
-      APP_CONFIG_STORAGE_FIELDS.includes(name),
-    );
-    const hasEnvContent = Object.prototype.hasOwnProperty.call(config, "env_content");
     Object.entries(config).forEach(([name, value]) => {
       if (!APP_CONFIG_FIELD_NAMES.has(name)) return;
 
@@ -754,13 +575,6 @@
       });
       applied += 1;
     });
-
-    if (hasStorageFields) {
-      syncObjectStorageEnv(root);
-    } else if (hasEnvContent && hasObjectStorageEnvKeys(readFieldValue(root, "env_content"))) {
-      hydrateObjectStorageFromEnv(root);
-      syncObjectStorageEnv(root);
-    }
 
     return applied;
   };
@@ -1407,7 +1221,6 @@
 
   window.addEventListener("hashchange", openHashModal);
   observeEast8Timestamps();
-  initObjectStorageConfigControls();
   initSearchableSelects();
   initHostMetrics();
   openHashModal();

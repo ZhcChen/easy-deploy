@@ -23,11 +23,13 @@ use tracing::warn;
 use crate::{
     Settings,
     apps::{
-        AppDeployDiffStatus, AppError, AppService, BinaryPackageNameError, ComposeTaskAction,
-        CreateAppInput, RELEASE_PACKAGE_EXAMPLE, RELEASE_PACKAGE_PATTERN, ServiceTargetNodeItem,
-        UpdateAppConfigInput, UpdateAppMetadataInput, UploadReleasePackageInput,
-        artifact_metadata_value, normalize_deploy_strategy, normalize_release_source,
-        parse_release_package_name_for_service, release_publish_mode_label,
+        AppDeployDiffStatus, AppError, AppService, BinaryPackageNameError,
+        CompleteReleasePackageUploadInput, ComposeTaskAction, CreateAppInput,
+        CreateReleasePackageUploadInput, RELEASE_PACKAGE_EXAMPLE, RELEASE_PACKAGE_PATTERN,
+        ServiceTargetNodeItem, UpdateAppConfigInput, UpdateAppMetadataInput,
+        UploadReleasePackageInput, artifact_metadata_value, normalize_deploy_strategy,
+        normalize_release_source, parse_release_package_name_for_service,
+        release_publish_mode_label,
     },
     auth::{
         API_TOKENS_MANAGE, API_TOKENS_VIEW, APPS_STATUS, APPS_VIEW, ARTIFACTS_UPLOAD,
@@ -264,6 +266,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/services/{service_key}/packages",
             post(api_v1_upload_service_package),
+        )
+        .route(
+            "/api/v1/services/{service_key}/packages/uploads",
+            post(api_v1_create_service_package_upload),
+        )
+        .route(
+            "/api/v1/services/{service_key}/packages/uploads/{upload_id}/complete",
+            post(api_v1_complete_service_package_upload),
         )
         .route("/healthz", get(healthz))
         .route("/assets/logo.svg", get(logo_svg))
@@ -639,6 +649,15 @@ struct SettingsForm {
     default_app_work_dir: String,
     default_node_work_dir: String,
     uploaded_binary_releases_to_keep: usize,
+    artifact_storage_provider: String,
+    aliyun_oss_region: String,
+    aliyun_oss_endpoint: String,
+    aliyun_oss_bucket: String,
+    aliyun_oss_object_prefix: String,
+    aliyun_oss_access_key_id: String,
+    aliyun_oss_access_key_secret: String,
+    aliyun_oss_upload_url_ttl_seconds: i64,
+    aliyun_oss_download_url_ttl_seconds: i64,
 }
 
 #[derive(Deserialize)]
@@ -845,6 +864,32 @@ struct ApiPackageUploadInput {
     file_name: String,
     bytes: Vec<u8>,
     entry_file: String,
+    source: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ApiCreatePackageUploadRequest {
+    #[serde(default, alias = "fileName")]
+    file_name: String,
+    #[serde(default, alias = "releaseVersion", alias = "artifact_version")]
+    release_version: String,
+    #[serde(default, alias = "versionCode")]
+    version_code: Option<i64>,
+    #[serde(default, alias = "publishedAt")]
+    published_at: String,
+    #[serde(default)]
+    source: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ApiCompletePackageUploadRequest {
+    #[serde(default, alias = "checksumSha256")]
+    checksum_sha256: String,
+    #[serde(default, alias = "sizeBytes")]
+    size_bytes: i64,
+    #[serde(default, alias = "publishedAt")]
+    published_at: String,
+    #[serde(default)]
     source: String,
 }
 
@@ -3315,12 +3360,14 @@ async fn artifacts_page(
                 return true;
             }
             let haystack = format!(
-                "{} {} {} {} {} {}",
+                "{} {} {} {} {} {} {} {}",
                 release.app_name,
                 release.app_key,
                 release.version,
                 release.package_name,
                 release.package_path,
+                release.storage_bucket,
+                release.storage_object_key,
                 release.checksum_sha256
             )
             .to_lowercase();
@@ -3346,6 +3393,11 @@ async fn artifacts_page(
                 .find(|app| app.id == release.app_id)
                 .map(|app| release_publish_mode_label(app.auto_queue_release == 1))
                 .unwrap_or("手动发布");
+            let storage_detail = if release.storage_provider == "aliyun_oss" {
+                format!("{}/{}", release.storage_bucket, release.storage_object_key)
+            } else {
+                release.package_path.clone()
+            };
             ArtifactPageRow {
                 id: release.id,
                 app_id: release.app_id,
@@ -3363,7 +3415,8 @@ async fn artifacts_page(
                     .map(|item| queue_status_tone(&item.status))
                     .unwrap_or("neutral"),
                 publish_mode,
-                artifact_path: release.package_path.clone(),
+                storage: storage_provider_label(&release.storage_provider).to_owned(),
+                storage_detail,
                 sha256: short_hash(&release.checksum_sha256),
                 size: format_size(&release.size_bytes.to_string()),
                 entry_file: display_text(
@@ -3564,6 +3617,19 @@ async fn settings_page(State(state): State<AppState>, session: CurrentSession) -
             value: settings.database_url.clone(),
             detail: "来自 EASY_DEPLOY_DATABASE_URL / --database-url",
         },
+        SettingsRow {
+            label: "制品存储",
+            value: storage_provider_label(&platform_config.artifact_storage.provider).to_owned(),
+            detail: "OpenAPI 版本包投递使用的平台级存储后端",
+        },
+        SettingsRow {
+            label: "OSS Bucket",
+            value: display_text(
+                platform_config.artifact_storage.aliyun_oss.bucket.clone(),
+                "未配置",
+            ),
+            detail: "阿里云 OSS 直传和目标节点下载使用的私有 Bucket",
+        },
     ];
     let auth_rows = vec![
         SettingsRow {
@@ -3627,6 +3693,12 @@ async fn settings_page(State(state): State<AppState>, session: CurrentSession) -
         },
     ];
     let nav_sections = nav_sections("/settings", &session);
+    let oss = &platform_config.artifact_storage.aliyun_oss;
+    let aliyun_oss_secret_status = if oss.access_key_secret.trim().is_empty() {
+        "未配置"
+    } else {
+        "已配置"
+    };
     render_html(SettingsTemplate {
         product_name: "Easy Deploy",
         css: include_str!("../../assets/app.css"),
@@ -3644,6 +3716,15 @@ async fn settings_page(State(state): State<AppState>, session: CurrentSession) -
         default_app_work_dir: &platform_config.default_app_work_dir,
         default_node_work_dir: &platform_config.default_node_work_dir,
         uploaded_binary_releases_to_keep: platform_config.uploaded_binary_releases_to_keep,
+        artifact_storage_provider: &platform_config.artifact_storage.provider,
+        aliyun_oss_region: &oss.region,
+        aliyun_oss_endpoint: &oss.endpoint,
+        aliyun_oss_bucket: &oss.bucket,
+        aliyun_oss_object_prefix: &oss.object_prefix,
+        aliyun_oss_access_key_id: &oss.access_key_id,
+        aliyun_oss_secret_status,
+        aliyun_oss_upload_url_ttl_seconds: oss.upload_url_ttl_seconds,
+        aliyun_oss_download_url_ttl_seconds: oss.download_url_ttl_seconds,
     })
 }
 
@@ -3665,6 +3746,15 @@ async fn settings_submit(
                 default_app_work_dir: form.default_app_work_dir,
                 default_node_work_dir: form.default_node_work_dir,
                 uploaded_binary_releases_to_keep: form.uploaded_binary_releases_to_keep,
+                artifact_storage_provider: form.artifact_storage_provider,
+                aliyun_oss_region: form.aliyun_oss_region,
+                aliyun_oss_endpoint: form.aliyun_oss_endpoint,
+                aliyun_oss_bucket: form.aliyun_oss_bucket,
+                aliyun_oss_object_prefix: form.aliyun_oss_object_prefix,
+                aliyun_oss_access_key_id: form.aliyun_oss_access_key_id,
+                aliyun_oss_access_key_secret: form.aliyun_oss_access_key_secret,
+                aliyun_oss_upload_url_ttl_seconds: form.aliyun_oss_upload_url_ttl_seconds,
+                aliyun_oss_download_url_ttl_seconds: form.aliyun_oss_download_url_ttl_seconds,
             },
             &session.account.username,
         )
@@ -4528,6 +4618,119 @@ async fn api_v1_upload_service_package(
             bytes: upload.bytes,
             entry_file: upload.entry_file,
             source: upload.source,
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(err) => return api_error(app_error_status(&err), err.message()),
+    };
+    Json(serde_json::json!({
+        "data": {
+            "app_id": result.app_id,
+            "service_key": result.app_key,
+            "release_id": result.release_id,
+            "queue_id": result.queue_id,
+            "release_version": result.release_version,
+            "version_code": result.version_code,
+            "versionCode": result.version_code,
+            "published_at": result.published_at,
+            "publishedAt": result.published_at,
+            "package_path": result.package_path,
+            "package_kind": result.package_kind,
+            "config_snapshot_id": result.config_snapshot_id,
+            "config_revision_no": result.config_revision_no,
+            "config_revision": format!("config#{}", result.config_revision_no),
+            "queued": result.queued,
+            "task_id": serde_json::Value::Null
+        }
+    }))
+    .into_response()
+}
+
+async fn api_v1_create_service_package_upload(
+    State(state): State<AppState>,
+    api: ApiSession,
+    Path(service_key): Path<String>,
+    Json(payload): Json<ApiCreatePackageUploadRequest>,
+) -> Response {
+    if !api.can(ARTIFACTS_UPLOAD) {
+        return api_error(StatusCode::FORBIDDEN, "permission denied");
+    }
+    let parsed = match parse_release_package_name_for_service(
+        &payload.file_name,
+        &service_key,
+        Some(&payload.release_version),
+    ) {
+        Ok(parsed) => parsed,
+        Err(err) => return api_package_error(StatusCode::BAD_REQUEST, err),
+    };
+    let app_id = match state.apps().app_id_by_key(&service_key).await {
+        Ok(app_id) => app_id,
+        Err(err) => return api_error(app_error_status(&err), err.message()),
+    };
+    let result = match state
+        .apps()
+        .create_release_package_upload(CreateReleasePackageUploadInput {
+            app_id,
+            release_version: parsed.release_version,
+            version_code: payload.version_code.or(Some(parsed.version_code)),
+            published_at: payload.published_at,
+            file_name: payload.file_name,
+            source: payload.source,
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(err) => return api_error(app_error_status(&err), err.message()),
+    };
+    let upload_headers = result
+        .upload_headers
+        .iter()
+        .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+        .collect::<serde_json::Map<_, _>>();
+    Json(serde_json::json!({
+        "data": {
+            "app_id": result.app_id,
+            "service_key": result.app_key,
+            "upload_id": result.upload_id,
+            "release_version": result.release_version,
+            "version_code": result.version_code,
+            "versionCode": result.version_code,
+            "file_name": result.file_name,
+            "object_key": result.object_key,
+            "bucket": result.bucket,
+            "endpoint": result.endpoint,
+            "upload": {
+                "method": result.upload_method,
+                "url": result.upload_url,
+                "headers": upload_headers,
+                "expires_at": result.expires_at,
+                "expiresAt": result.expires_at
+            },
+            "complete_path": result.complete_path
+        }
+    }))
+    .into_response()
+}
+
+async fn api_v1_complete_service_package_upload(
+    State(state): State<AppState>,
+    api: ApiSession,
+    Path((service_key, upload_id)): Path<(String, String)>,
+    Json(payload): Json<ApiCompletePackageUploadRequest>,
+) -> Response {
+    if !api.can(ARTIFACTS_UPLOAD) {
+        return api_error(StatusCode::FORBIDDEN, "permission denied");
+    }
+    let result = match state
+        .apps()
+        .complete_release_package_upload(CompleteReleasePackageUploadInput {
+            upload_id,
+            service_key,
+            checksum_sha256: payload.checksum_sha256,
+            size_bytes: payload.size_bytes,
+            published_at: payload.published_at,
+            source: payload.source,
         })
         .await
     {
@@ -6588,6 +6791,13 @@ fn artifact_source_label(source: &str) -> &'static str {
     }
 }
 
+fn storage_provider_label(provider: &str) -> &'static str {
+    match provider {
+        "aliyun_oss" => "阿里云 OSS",
+        _ => "本机存储",
+    }
+}
+
 fn release_status_label(status: &str) -> &'static str {
     match status {
         "received" => "待处理",
@@ -7570,7 +7780,8 @@ fn task_log_stream_tone(stream: &str) -> &'static str {
     }
 }
 
-fn openapi_spec() -> serde_json::Value {
+#[allow(dead_code)]
+fn legacy_openapi_spec() -> serde_json::Value {
     serde_json::json!({
         "openapi": "3.1.0",
         "info": {
@@ -7687,7 +7898,8 @@ fn openapi_spec() -> serde_json::Value {
         }
     })
 }
-fn openapi_docs_public_html() -> String {
+#[allow(dead_code)]
+fn legacy_openapi_docs_public_html() -> String {
     r###"<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -7838,6 +8050,449 @@ qfy-sc-test-admin_version_v1.2.3.tar.gz</code></pre>
             <li><code>404</code>：服务标识不存在，需要先在后台创建并配置应用。</li>
           </ul>
           <p>包名错误会返回 <code>expected_pattern</code> 和 <code>example</code>，调用方可以直接把错误内容展示给开发者或 AI。</p>
+        </section>
+      </article>
+    </div>
+  </div>
+</body>
+</html>"###.to_owned()
+}
+
+fn openapi_spec() -> serde_json::Value {
+    serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Easy Deploy Package Upload API",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": "Easy Deploy OpenAPI 只提供版本包投递能力。应用、节点、环境变量、Compose 配置、部署脚本、自动/手动/定时发布策略都在平台后台维护。推荐流程是申请 OSS 直传地址、PUT 上传到 OSS、完成登记。"
+        },
+        "servers": [
+            { "url": "http://127.0.0.1:9066", "description": "本机默认地址" },
+            { "url": "https://easy-deploy.quanxinfu.com", "description": "当前正式环境" }
+        ],
+        "security": [{ "BearerAuth": [] }],
+        "paths": {
+            "/api/v1/services/{service_key}/packages/uploads": {
+                "post": {
+                    "operationId": "createServicePackageUpload",
+                    "summary": "申请版本包 OSS 直传地址",
+                    "description": "校验服务标识和包名后，返回一次性 OSS PUT 签名 URL。此接口不会创建 release，也不会触发发布；调用方必须先把文件 PUT 到返回的 upload.url，再调用 complete 接口登记。",
+                    "parameters": [{ "$ref": "#/components/parameters/ServiceKey" }],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/CreatePackageUploadRequest" },
+                                "examples": {
+                                    "default": {
+                                        "value": {
+                                            "file_name": "orders-api-prod_version_1_2_3.tar.gz",
+                                            "source": "ai-agent",
+                                            "published_at": "2026-07-09T10:00:00+08:00"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "上传地址已创建",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/CreatePackageUploadResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/PackageBadRequest" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "404": { "description": "service_key 不存在" }
+                    }
+                }
+            },
+            "/api/v1/services/{service_key}/packages/uploads/{upload_id}/complete": {
+                "post": {
+                    "operationId": "completeServicePackageUpload",
+                    "summary": "完成版本包上传登记",
+                    "description": "调用方完成 OSS PUT 后，提交 SHA-256 和文件大小。平台登记 release、保存配置快照，并按应用的发布设置决定是否自动进入串行发布队列。",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/ServiceKey" },
+                        {
+                            "name": "upload_id",
+                            "in": "path",
+                            "required": true,
+                            "schema": { "type": "string" },
+                            "description": "申请上传地址接口返回的 upload_id。"
+                        }
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/CompletePackageUploadRequest" },
+                                "examples": {
+                                    "default": {
+                                        "value": {
+                                            "checksum_sha256": "64位小写sha256",
+                                            "size_bytes": 10485760,
+                                            "source": "ai-agent"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "版本包已登记",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/UploadServicePackageResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/PackageBadRequest" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "409": { "description": "上传会话已完成、过期或不可用" }
+                    }
+                }
+            },
+            "/api/v1/services/{service_key}/packages": {
+                "post": {
+                    "operationId": "uploadServicePackageLegacy",
+                    "summary": "兼容：multipart 直接上传到平台",
+                    "description": "保留给旧脚本使用。新项目建议使用 OSS 直传接口，避免大文件经过 easy-deploy 后台进程。",
+                    "parameters": [{ "$ref": "#/components/parameters/ServiceKey" }],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "multipart/form-data": {
+                                "schema": { "$ref": "#/components/schemas/UploadServicePackageRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "版本包已登记",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/UploadServicePackageResponse" }
+                                }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/PackageBadRequest" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" }
+                    }
+                }
+            }
+        },
+        "components": {
+            "securitySchemes": {
+                "BearerAuth": { "type": "http", "scheme": "bearer" }
+            },
+            "parameters": {
+                "ServiceKey": {
+                    "name": "service_key",
+                    "in": "path",
+                    "required": true,
+                    "schema": { "type": "string" },
+                    "description": "后台应用标识，必须与版本包文件名前缀一致。"
+                }
+            },
+            "responses": {
+                "PackageBadRequest": {
+                    "description": "包名、字段或上传会话校验失败",
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "oneOf": [
+                                    { "$ref": "#/components/schemas/PackageError" },
+                                    { "$ref": "#/components/schemas/ApiError" }
+                                ]
+                            }
+                        }
+                    }
+                },
+                "Unauthorized": { "description": "缺少或无效 API Token" },
+                "Forbidden": { "description": "API Token 没有版本包上传权限" }
+            },
+            "schemas": {
+                "CreatePackageUploadRequest": {
+                    "type": "object",
+                    "required": ["file_name"],
+                    "properties": {
+                        "file_name": { "type": "string", "description": "版本包文件名，例如 orders-api-prod_version_1_2_3.tar.gz。兼容 fileName。" },
+                        "release_version": { "type": "string", "description": "可选。显式版本号，必须与包名解析结果一致。兼容 releaseVersion、artifact_version。" },
+                        "version_code": { "type": "integer", "description": "可选。版本排序号；不传时平台按 vX.Y.Z 解析。兼容 versionCode。" },
+                        "published_at": { "type": "string", "description": "可选。构建或发布时间，ISO-8601。兼容 publishedAt。" },
+                        "source": { "type": "string", "description": "可选。来源标记，例如 ai-agent、local-script、ci。" }
+                    }
+                },
+                "CreatePackageUploadResponse": {
+                    "type": "object",
+                    "properties": {
+                        "data": {
+                            "type": "object",
+                            "properties": {
+                                "app_id": { "type": "integer" },
+                                "service_key": { "type": "string" },
+                                "upload_id": { "type": "string" },
+                                "release_version": { "type": "string" },
+                                "version_code": { "type": "integer" },
+                                "versionCode": { "type": "integer" },
+                                "file_name": { "type": "string" },
+                                "object_key": { "type": "string" },
+                                "bucket": { "type": "string" },
+                                "endpoint": { "type": "string" },
+                                "upload": {
+                                    "type": "object",
+                                    "properties": {
+                                        "method": { "type": "string", "enum": ["PUT"] },
+                                        "url": { "type": "string" },
+                                        "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+                                        "expires_at": { "type": "string" },
+                                        "expiresAt": { "type": "string" }
+                                    }
+                                },
+                                "complete_path": { "type": "string" }
+                            }
+                        }
+                    }
+                },
+                "CompletePackageUploadRequest": {
+                    "type": "object",
+                    "required": ["checksum_sha256", "size_bytes"],
+                    "properties": {
+                        "checksum_sha256": { "type": "string", "description": "上传文件的 64 位 SHA-256 hex。兼容 checksumSha256。" },
+                        "size_bytes": { "type": "integer", "description": "上传文件字节数。兼容 sizeBytes。" },
+                        "published_at": { "type": "string", "description": "可选，覆盖申请上传地址时的 published_at。兼容 publishedAt。" },
+                        "source": { "type": "string", "description": "可选，覆盖申请上传地址时的来源标记。" }
+                    }
+                },
+                "UploadServicePackageRequest": {
+                    "type": "object",
+                    "required": ["package_file"],
+                    "properties": {
+                        "package_file": { "type": "string", "format": "binary", "description": "版本包文件。兼容 file、artifact_file。" },
+                        "release_version": { "type": "string" },
+                        "version_code": { "type": "integer" },
+                        "published_at": { "type": "string" },
+                        "entry_file": { "type": "string" },
+                        "source": { "type": "string" }
+                    }
+                },
+                "UploadServicePackageResponse": {
+                    "type": "object",
+                    "properties": {
+                        "data": {
+                            "type": "object",
+                            "properties": {
+                                "app_id": { "type": "integer" },
+                                "service_key": { "type": "string" },
+                                "release_id": { "type": "integer" },
+                                "queue_id": { "type": ["integer", "null"] },
+                                "release_version": { "type": "string" },
+                                "version_code": { "type": "integer" },
+                                "versionCode": { "type": "integer" },
+                                "published_at": { "type": "string" },
+                                "publishedAt": { "type": "string" },
+                                "package_path": { "type": "string" },
+                                "package_kind": { "type": "string" },
+                                "config_snapshot_id": { "type": "integer" },
+                                "config_revision_no": { "type": "integer" },
+                                "config_revision": { "type": "string" },
+                                "queued": { "type": "boolean" },
+                                "task_id": { "type": ["integer", "null"], "description": "上传接口不直接创建部署任务。" }
+                            }
+                        }
+                    }
+                },
+                "PackageError": {
+                    "type": "object",
+                    "properties": {
+                        "code": { "type": "string" },
+                        "error": { "type": "string" },
+                        "expected_pattern": { "type": "string" },
+                        "example": { "type": "string" }
+                    }
+                },
+                "ApiError": {
+                    "type": "object",
+                    "properties": { "error": { "type": "string" } }
+                }
+            }
+        }
+    })
+}
+
+fn openapi_docs_public_html() -> String {
+    r###"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Easy Deploy OpenAPI</title>
+  <style>
+    :root { color-scheme: light; --bg:#f6f8fc; --panel:#fff; --text:#172033; --muted:#667085; --line:#d8e0ef; --brand:#2563eb; --soft:#eef4ff; --code:#0b1220; --codeText:#e6edf7; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height:1.72; }
+    .page { max-width:1180px; margin:0 auto; padding:28px 20px 56px; }
+    .hero { border:1px solid var(--line); border-radius:10px; background:linear-gradient(135deg,#fff 0%,#eff6ff 100%); padding:26px 28px; }
+    .eyebrow { margin:0 0 8px; color:var(--brand); font-size:13px; font-weight:800; }
+    h1 { margin:0; font-size:36px; line-height:1.15; letter-spacing:0; }
+    .summary { margin:12px 0 0; max-width:880px; color:var(--muted); }
+    .layout { display:grid; grid-template-columns:260px minmax(0,1fr); gap:20px; margin-top:20px; align-items:start; }
+    nav, section { border:1px solid var(--line); border-radius:10px; background:var(--panel); }
+    nav { position:sticky; top:16px; padding:14px; }
+    nav strong { display:block; margin:4px 8px 10px; }
+    nav a { display:block; padding:8px 10px; border-radius:7px; color:#344054; text-decoration:none; }
+    nav a:hover { background:var(--soft); color:var(--brand); }
+    article { display:grid; gap:16px; }
+    section { padding:22px 24px; }
+    h2 { margin:0 0 12px; font-size:22px; letter-spacing:0; }
+    h3 { margin:18px 0 8px; font-size:16px; letter-spacing:0; }
+    p, ol, ul { margin-top:0; }
+    li + li { margin-top:6px; }
+    code { padding:2px 5px; border-radius:5px; background:#eef2f7; color:#174a83; font-family:"JetBrains Mono", Consolas, monospace; font-size:.92em; }
+    pre { margin:12px 0 0; overflow:auto; border-radius:9px; background:var(--code); }
+    pre code { display:block; padding:16px; color:var(--codeText); background:transparent; white-space:pre; }
+    .callout { padding:13px 15px; border-radius:8px; background:var(--soft); color:#17406e; }
+    .endpoint { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:10px 0 12px; }
+    .method { padding:4px 8px; border-radius:6px; background:#16a34a; color:#fff; font-size:12px; font-weight:800; }
+    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+    .field { padding:12px; border:1px solid var(--line); border-radius:8px; background:#fbfcff; }
+    .field strong { display:block; margin-bottom:4px; }
+    @media (max-width:860px) { .layout, .grid { grid-template-columns:1fr; } nav { position:static; } h1 { font-size:30px; } }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <p class="eyebrow">Easy Deploy OpenAPI</p>
+      <h1>版本包投递接口</h1>
+      <p class="summary">这份文档无需登录即可访问，面向业务项目脚本和 AI。OpenAPI 只负责把规范命名的版本包投递到平台；应用配置、目标节点、环境变量、Compose 文件、部署脚本和发布时间由 easy-deploy 后台维护。</p>
+    </header>
+    <div class="layout">
+      <nav>
+        <strong>目录</strong>
+        <a href="#scope">职责边界</a>
+        <a href="#prepare">接入准备</a>
+        <a href="#naming">包名规范</a>
+        <a href="#flow">推荐流程</a>
+        <a href="#api-create">申请上传地址</a>
+        <a href="#api-complete">完成登记</a>
+        <a href="#script">脚本示例</a>
+        <a href="#legacy">兼容接口</a>
+        <a href="#errors">错误处理</a>
+      </nav>
+      <article>
+        <section id="scope">
+          <h2>职责边界</h2>
+          <div class="callout">外部项目不要通过 OpenAPI 创建应用、修改配置或直接触发部署。先在后台把应用参数配置好，外部项目只上传版本包，平台根据配置自动或手动发布。</div>
+          <ul>
+            <li>后台配置：应用标识、环境、目标节点、Compose 内容、环境变量、部署脚本、健康检查和发布策略。</li>
+            <li>业务项目：构建版本包、计算 SHA-256、调用 OpenAPI 上传并完成登记。</li>
+            <li>发布执行：平台按应用维度串行处理版本，部署时目标节点直接从 OSS 下载版本包。</li>
+          </ul>
+        </section>
+        <section id="prepare">
+          <h2>接入准备</h2>
+          <ol>
+            <li>在 easy-deploy 后台创建应用，记录应用标识，例如 <code>orders-api-prod</code>。</li>
+            <li>在设置页配置制品存储为阿里云 OSS，包括 region、endpoint、bucket、object prefix、AccessKey ID 和 Secret。</li>
+            <li>在 API Token 页面创建 token，并确保 token 拥有版本包上传权限。</li>
+            <li>业务项目按 <code>{service_key}_version_{x_y_z}.tar.gz</code> 命名版本包。</li>
+          </ol>
+        </section>
+        <section id="naming">
+          <h2>包名规范</h2>
+          <pre><code>{service_key}_version_{x_y_z}.tar.gz</code></pre>
+          <p>示例：</p>
+          <pre><code>orders-api-prod_version_1_2_3.tar.gz
+orders-api-prod_version_v1.2.3.tar.gz</code></pre>
+          <p><code>service_key</code> 必须等于路径中的服务标识。版本会规范化为 <code>v1.2.3</code>，未传 <code>versionCode</code> 时平台会解析为 <code>1002003</code>。</p>
+        </section>
+        <section id="flow">
+          <h2>推荐流程</h2>
+          <ol>
+            <li>调用 <code>POST /api/v1/services/{service_key}/packages/uploads</code>，拿到 OSS <code>PUT</code> 签名 URL。</li>
+            <li>按返回的 <code>upload.method</code>、<code>upload.url</code> 和 <code>upload.headers</code> 把版本包直传 OSS。</li>
+            <li>计算本地文件 SHA-256 和字节数，调用 complete 接口完成登记。</li>
+            <li>如果应用开启“自动上传即入队”，平台会把 release 加入串行发布队列；否则在发布版本页手动或定时发布。</li>
+          </ol>
+        </section>
+        <section id="api-create">
+          <h2>申请上传地址</h2>
+          <div class="endpoint"><span class="method">POST</span><code>/api/v1/services/{service_key}/packages/uploads</code></div>
+          <pre><code>Authorization: Bearer &lt;API_TOKEN&gt;
+Content-Type: application/json</code></pre>
+          <div class="grid">
+            <div class="field"><strong><code>file_name</code> 必填</strong>版本包文件名。兼容 <code>fileName</code>。</div>
+            <div class="field"><strong><code>release_version</code> 可选</strong>显式版本号，必须与包名一致。兼容 <code>releaseVersion</code>、<code>artifact_version</code>。</div>
+            <div class="field"><strong><code>version_code</code> 可选</strong>版本排序号。兼容 <code>versionCode</code>。</div>
+            <div class="field"><strong><code>source</code> 可选</strong>来源标记，例如 <code>ai-agent</code>、<code>local-script</code>、<code>ci</code>。</div>
+          </div>
+          <pre><code>{
+  "file_name": "orders-api-prod_version_1_2_3.tar.gz",
+  "source": "ai-agent",
+  "published_at": "2026-07-09T10:00:00+08:00"
+}</code></pre>
+        </section>
+        <section id="api-complete">
+          <h2>完成登记</h2>
+          <div class="endpoint"><span class="method">POST</span><code>/api/v1/services/{service_key}/packages/uploads/{upload_id}/complete</code></div>
+          <p>只有 OSS PUT 成功后才调用。平台会登记 release、记录配置快照，并按应用发布策略处理入队。</p>
+          <div class="grid">
+            <div class="field"><strong><code>checksum_sha256</code> 必填</strong>64 位 SHA-256 hex。兼容 <code>checksumSha256</code>。</div>
+            <div class="field"><strong><code>size_bytes</code> 必填</strong>上传文件字节数。兼容 <code>sizeBytes</code>。</div>
+            <div class="field"><strong><code>published_at</code> 可选</strong>覆盖申请上传地址时的发布时间。</div>
+            <div class="field"><strong><code>source</code> 可选</strong>覆盖申请上传地址时的来源标记。</div>
+          </div>
+        </section>
+        <section id="script">
+          <h2>脚本示例</h2>
+          <pre><code>#!/usr/bin/env bash
+set -euo pipefail
+
+EASY_DEPLOY_URL="${EASY_DEPLOY_URL:-https://easy-deploy.quanxinfu.com}"
+SERVICE_KEY="orders-api-prod"
+PACKAGE="orders-api-prod_version_1_2_3.tar.gz"
+SHA256="$(sha256sum "$PACKAGE" | awk '{print $1}')"
+SIZE_BYTES="$(wc -c &lt; "$PACKAGE" | tr -d ' ')"
+
+CREATE_JSON="$(curl -fsS -X POST "$EASY_DEPLOY_URL/api/v1/services/$SERVICE_KEY/packages/uploads" \
+  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"file_name\":\"$PACKAGE\",\"source\":\"local-script\"}")"
+
+UPLOAD_URL="$(printf '%s' "$CREATE_JSON" | jq -r '.data.upload.url')"
+UPLOAD_ID="$(printf '%s' "$CREATE_JSON" | jq -r '.data.upload_id')"
+
+curl -fsS -X PUT "$UPLOAD_URL" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary "@$PACKAGE"
+
+curl -fsS -X POST "$EASY_DEPLOY_URL/api/v1/services/$SERVICE_KEY/packages/uploads/$UPLOAD_ID/complete" \
+  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"checksum_sha256\":\"$SHA256\",\"size_bytes\":$SIZE_BYTES,\"source\":\"local-script\"}"</code></pre>
+        </section>
+        <section id="legacy">
+          <h2>兼容接口</h2>
+          <p>旧脚本仍可使用 <code>POST /api/v1/services/{service_key}/packages</code> 以 <code>multipart/form-data</code> 直接上传到平台。新项目建议使用 OSS 直传，避免大文件经过 easy-deploy 进程。</p>
+        </section>
+        <section id="errors">
+          <h2>错误处理</h2>
+          <ul>
+            <li><code>400</code>：包名不符合规范、服务标识不匹配、checksum/size 无效、上传会话过期。</li>
+            <li><code>401</code>：缺少或无效 API Token。</li>
+            <li><code>403</code>：Token 没有版本包上传权限。</li>
+            <li><code>409</code>：上传会话已经完成或不可用。</li>
+          </ul>
+          <p>包名错误会返回 <code>code</code>、<code>expected_pattern</code> 和 <code>example</code>，业务项目或 AI 可以直接把错误展示给开发者。</p>
         </section>
       </article>
     </div>
@@ -8572,6 +9227,7 @@ mod tests {
         router: Router,
         auth: AuthService,
         apps: AppService,
+        platform: PlatformConfigService,
         _data_dir: TempDir,
     }
 
@@ -8633,6 +9289,7 @@ mod tests {
             platform.clone(),
         );
         let apps_for_test = apps.clone();
+        let platform_for_test = platform.clone();
         TestWebApp {
             router: build_router(AppState::new(
                 settings,
@@ -8649,6 +9306,7 @@ mod tests {
             )),
             auth: auth_for_test,
             apps: apps_for_test,
+            platform: platform_for_test,
             _data_dir: data_dir,
         }
     }
@@ -8677,6 +9335,29 @@ mod tests {
             .await
             .expect("create api token")
             .token
+    }
+
+    async fn enable_oss_storage(platform: &PlatformConfigService) {
+        platform
+            .update_config(
+                UpdatePlatformConfigInput {
+                    default_app_work_dir: "/opt/easy-deploy/apps/{app_key}".to_owned(),
+                    default_node_work_dir: "/opt/easy-deploy/apps".to_owned(),
+                    uploaded_binary_releases_to_keep: 4,
+                    artifact_storage_provider: "aliyun_oss".to_owned(),
+                    aliyun_oss_region: "oss-cn-hangzhou".to_owned(),
+                    aliyun_oss_endpoint: "https://oss-cn-hangzhou.aliyuncs.com".to_owned(),
+                    aliyun_oss_bucket: "easy-deploy-test".to_owned(),
+                    aliyun_oss_object_prefix: "easy-deploy/releases".to_owned(),
+                    aliyun_oss_access_key_id: "test-key".to_owned(),
+                    aliyun_oss_access_key_secret: "test-secret".to_owned(),
+                    aliyun_oss_upload_url_ttl_seconds: 900,
+                    aliyun_oss_download_url_ttl_seconds: 600,
+                },
+                "test",
+            )
+            .await
+            .expect("enable oss storage");
     }
 
     async fn create_binary_test_app(apps: &AppService, app_key: &str) -> i64 {
@@ -8794,9 +9475,8 @@ mod tests {
         assert!(html.contains("name=\"app_type\" value=\"compose\""));
         assert!(html.contains("name=\"release_source\""));
         assert!(html.contains("value=\"package_upload\""));
-        assert!(html.contains("对象存储"));
-        assert!(html.contains("name=\"private_bucket\""));
-        assert!(html.contains("qfy-sc worker"));
+        assert!(!html.contains("name=\"private_bucket\""));
+        assert!(!html.contains("qfy-sc worker"));
         assert!(!html.contains("二进制直部署"));
         assert!(!html.contains("systemd 管理"));
     }
@@ -9070,19 +9750,39 @@ mod tests {
             "bearer"
         );
         let paths = spec["paths"].as_object().expect("paths object");
-        assert_eq!(paths.len(), 1);
+        assert_eq!(paths.len(), 3);
+        assert!(paths.contains_key("/api/v1/services/{service_key}/packages/uploads"));
+        assert!(
+            paths.contains_key(
+                "/api/v1/services/{service_key}/packages/uploads/{upload_id}/complete"
+            )
+        );
         assert!(paths.contains_key("/api/v1/services/{service_key}/packages"));
         assert_eq!(
+            spec["paths"]["/api/v1/services/{service_key}/packages/uploads"]["post"]["operationId"],
+            "createServicePackageUpload"
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/services/{service_key}/packages/uploads/{upload_id}/complete"]["post"]
+                ["operationId"],
+            "completeServicePackageUpload"
+        );
+        assert_eq!(
             spec["paths"]["/api/v1/services/{service_key}/packages"]["post"]["operationId"],
-            "uploadServicePackage"
+            "uploadServicePackageLegacy"
         );
         assert!(spec["paths"]["/api/v1/apps"].is_null());
         assert!(spec["paths"]["/api/v1/tasks"].is_null());
         assert!(spec["paths"]["/api/v1/services/{service_key}/deploy"].is_null());
         assert_eq!(
-            spec["components"]["schemas"]["UploadServicePackageRequest"]["properties"]["package_file"]
-                ["format"],
-            "binary"
+            spec["components"]["schemas"]["CreatePackageUploadRequest"]["properties"]["file_name"]
+                ["type"],
+            "string"
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["CompletePackageUploadRequest"]["properties"]["checksum_sha256"]
+                ["type"],
+            "string"
         );
         assert_eq!(
             spec["components"]["schemas"]["UploadServicePackageResponse"]["properties"]["data"]["properties"]
@@ -9109,10 +9809,15 @@ mod tests {
         let html = String::from_utf8_lossy(&body);
         assert!(html.contains("Easy Deploy OpenAPI"));
         assert!(html.contains("版本包投递接口"));
-        assert!(html.contains("后台页面配置"));
+        assert!(html.contains("申请上传地址"));
+        assert!(html.contains("完成登记"));
+        assert!(html.contains("sha256sum"));
+        assert!(html.contains("complete"));
+        assert!(html.contains("/api/v1/services/{service_key}/packages/uploads"));
         assert!(html.contains("/api/v1/services/{service_key}/packages"));
         assert!(html.contains("{service_key}_version_{x_y_z}.tar.gz"));
-        assert!(html.contains("package_file"));
+        assert!(html.contains("file_name"));
+        assert!(html.contains("checksum_sha256"));
         assert!(html.contains("source"));
         assert!(!html.contains("/api/v1/apps"));
         assert!(!html.contains("/api/v1/tasks"));
@@ -9177,6 +9882,99 @@ mod tests {
         let listed = app.auth.list_api_tokens().await.expect("list api tokens");
         assert_eq!(listed[0].source, "test-suite");
         assert!(listed[0].last_used_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn api_token_can_create_and_complete_oss_package_upload() {
+        let app = test_web_app().await;
+        create_compose_test_app_with_mode(&app.apps, "orders-api-prod", false).await;
+        enable_oss_storage(&app.platform).await;
+        let token = super_admin_api_token(&app.auth, "oss-upload-test").await;
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/services/orders-api-prod/packages/uploads")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"file_name":"orders-api-prod_version_1_2_3.tar.gz","source":"ai-agent"}"#,
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("create upload json response");
+        assert_eq!(payload["data"]["release_version"], "v1.2.3");
+        assert_eq!(payload["data"]["versionCode"], 1002003);
+        assert_eq!(payload["data"]["upload"]["method"], "PUT");
+        assert_eq!(
+            payload["data"]["upload"]["headers"]["Content-Type"],
+            "application/octet-stream"
+        );
+        assert!(
+            payload["data"]["upload"]["url"]
+                .as_str()
+                .expect("upload url")
+                .contains("easy-deploy-test.oss-cn-hangzhou.aliyuncs.com")
+        );
+        let upload_id = payload["data"]["upload_id"]
+            .as_str()
+            .expect("upload id")
+            .to_owned();
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/services/orders-api-prod/packages/uploads/{upload_id}/complete"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"checksum_sha256":"{}","size_bytes":12,"source":"ai-agent"}}"#,
+                        "a".repeat(64)
+                    )))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("complete upload json response");
+        assert_eq!(payload["data"]["release_version"], "v1.2.3");
+        assert_eq!(payload["data"]["queued"], false);
+
+        let releases = app.apps.list_app_releases().await.expect("list releases");
+        let release = releases
+            .into_iter()
+            .find(|release| release.version == "v1.2.3")
+            .expect("registered oss release");
+        assert_eq!(release.storage_provider, "aliyun_oss");
+        assert_eq!(release.storage_bucket, "easy-deploy-test");
+        assert!(
+            release
+                .storage_object_key
+                .contains("orders-api-prod/v1.2.3")
+        );
+        assert_eq!(release.checksum_sha256, "a".repeat(64));
+        assert_eq!(release.size_bytes, 12);
     }
 
     #[tokio::test]
@@ -9675,7 +10473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn app_detail_exposes_object_storage_env_controls() {
+    async fn app_detail_does_not_expose_object_storage_env_controls() {
         let app = test_web_app().await;
         let app_id = create_compose_test_app(&app.apps, "orders-api-prod").await;
         let login = app
@@ -9708,10 +10506,29 @@ mod tests {
             .await
             .expect("read body");
         let html = String::from_utf8_lossy(&body);
-        assert!(html.contains("对象存储"));
-        assert!(html.contains("name=\"private_bucket\""));
-        assert!(html.contains("name=\"application_key\""));
-        assert!(html.contains("ALIYUN_OSS_ACCESS_KEY_ID"));
+        assert!(!html.contains("name=\"private_bucket\""));
+        assert!(!html.contains("name=\"application_key\""));
+        assert!(!html.contains("ALIYUN_OSS_ACCESS_KEY_ID"));
+
+        let settings_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/settings")
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(settings_response.status(), StatusCode::OK);
+        let body = to_bytes(settings_response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("name=\"artifact_storage_provider\""));
+        assert!(html.contains("name=\"aliyun_oss_bucket\""));
     }
 
     #[tokio::test]

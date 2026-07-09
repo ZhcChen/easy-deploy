@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 pub mod apps;
+pub mod artifact_storage;
 pub mod auth;
 pub mod catalog;
 pub mod deploy;

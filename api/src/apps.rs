@@ -2,12 +2,13 @@ use std::{
     fs::{self, File},
     net::TcpListener,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use chrono::{DateTime, FixedOffset, NaiveDateTime, SecondsFormat, Utc};
 use flate2::read::GzDecoder;
 use fs2::available_space;
+use rand_core::{OsRng, RngCore};
 use serde_json::{Value as JsonValue, json};
 use serde_yaml::Value;
 use sha2::{Digest, Sha256};
@@ -22,6 +23,10 @@ use tracing::{error, warn};
 use url::Url;
 
 use crate::{
+    artifact_storage::{
+        ArtifactStorageError, STORAGE_PROVIDER_ALIYUN_OSS, STORAGE_PROVIDER_LOCAL,
+        normalize_checksum_sha256,
+    },
     deploy::{
         ComposeCommandOutput, ComposeExecutor, DeployError, SshExecutor, SshTarget, SystemdExecutor,
     },
@@ -185,6 +190,15 @@ impl From<PlatformConfigError> for AppError {
     }
 }
 
+impl From<ArtifactStorageError> for AppError {
+    fn from(value: ArtifactStorageError) -> Self {
+        match value {
+            ArtifactStorageError::InvalidInput(message)
+            | ArtifactStorageError::Unsupported(message) => Self::InvalidInput(message),
+        }
+    }
+}
+
 impl From<DeployError> for AppError {
     fn from(value: DeployError) -> Self {
         match value {
@@ -224,6 +238,17 @@ struct ReleaseDispatchQueue {
     sender: mpsc::Sender<i64>,
 }
 
+#[derive(Clone)]
+struct ComposeWorkerContext {
+    db: SqlitePool,
+    runtime_fs: RuntimeFs,
+    compose: ComposeExecutor,
+    systemd: SystemdExecutor,
+    tasks: TaskService,
+    platform: PlatformConfigService,
+    compose_queue: ComposeTaskQueue,
+}
+
 #[derive(Clone, Debug)]
 struct ComposeTaskJob {
     task_id: i64,
@@ -235,6 +260,13 @@ struct ComposeTaskJob {
     environment: String,
     compose_strategy: String,
     release_version: Option<String>,
+    release_package_name: Option<String>,
+    release_checksum_sha256: Option<String>,
+    release_size_bytes: Option<i64>,
+    release_storage_provider: Option<String>,
+    release_storage_bucket: Option<String>,
+    release_storage_object_key: Option<String>,
+    release_storage_endpoint: Option<String>,
     config_snapshot_id: Option<i64>,
     config_revision_no: i64,
     deploy_strategy: DeployStrategy,
@@ -324,21 +356,22 @@ impl ComposeTaskQueue {
         compose: ComposeExecutor,
         systemd: SystemdExecutor,
         tasks: TaskService,
+        platform: PlatformConfigService,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(COMPOSE_TASK_QUEUE_CAPACITY);
         let queue = Self { sender };
         let worker_queue = queue.clone();
+        let worker_context = ComposeWorkerContext {
+            db,
+            runtime_fs,
+            compose,
+            systemd,
+            tasks,
+            platform,
+            compose_queue: worker_queue,
+        };
         let _worker = tokio::spawn(async move {
-            compose_task_worker(
-                receiver,
-                db,
-                runtime_fs,
-                compose,
-                systemd,
-                tasks,
-                worker_queue,
-            )
-            .await;
+            compose_task_worker(receiver, worker_context).await;
         });
         queue
     }
@@ -403,24 +436,10 @@ impl ReleaseDispatchQueue {
 
 async fn compose_task_worker(
     mut receiver: mpsc::Receiver<ComposeTaskJob>,
-    db: SqlitePool,
-    runtime_fs: RuntimeFs,
-    compose: ComposeExecutor,
-    systemd: SystemdExecutor,
-    tasks: TaskService,
-    compose_queue: ComposeTaskQueue,
+    context: ComposeWorkerContext,
 ) {
     while let Some(job) = receiver.recv().await {
-        run_compose_task_job(
-            &db,
-            &runtime_fs,
-            &compose,
-            &systemd,
-            &tasks,
-            &compose_queue,
-            job,
-        )
-        .await;
+        run_compose_task_job(&context, job).await;
     }
 }
 
@@ -548,7 +567,14 @@ async fn dispatch_next_release_for_app(
             q.config_snapshot_id,
             r.version,
             r.version_code,
+            r.package_name,
             r.package_path,
+            r.checksum_sha256,
+            r.size_bytes,
+            r.storage_provider,
+            r.storage_bucket,
+            r.storage_object_key,
+            r.storage_endpoint,
             r.published_at
         FROM app_release_queue q
         JOIN app_releases r ON r.id = q.release_id
@@ -698,6 +724,13 @@ async fn dispatch_next_release_for_app(
         config_snapshot_id: Some(snapshot.id),
         config_revision_no: snapshot.revision_no,
         release_version: Some(queue_item.version),
+        release_package_name: Some(queue_item.package_name),
+        release_checksum_sha256: Some(queue_item.checksum_sha256),
+        release_size_bytes: Some(queue_item.size_bytes),
+        release_storage_provider: Some(queue_item.storage_provider),
+        release_storage_bucket: Some(queue_item.storage_bucket),
+        release_storage_object_key: Some(queue_item.storage_object_key),
+        release_storage_endpoint: Some(queue_item.storage_endpoint),
         deploy_strategy: parse_deploy_strategy(&app.deploy_strategy),
         action: ComposeTaskAction::Up,
     };
@@ -716,15 +749,15 @@ async fn dispatch_next_release_for_app(
     Ok(())
 }
 
-async fn run_compose_task_job(
-    db: &SqlitePool,
-    runtime_fs: &RuntimeFs,
-    compose: &ComposeExecutor,
-    systemd: &SystemdExecutor,
-    tasks: &TaskService,
-    compose_queue: &ComposeTaskQueue,
-    job: ComposeTaskJob,
-) {
+async fn run_compose_task_job(context: &ComposeWorkerContext, job: ComposeTaskJob) {
+    let db = &context.db;
+    let runtime_fs = &context.runtime_fs;
+    let compose = &context.compose;
+    let systemd = &context.systemd;
+    let tasks = &context.tasks;
+    let platform = &context.platform;
+    let compose_queue = &context.compose_queue;
+
     match tasks
         .mark_running(job.task_id, "部署前预检", "preflight")
         .await
@@ -791,6 +824,7 @@ async fn run_compose_task_job(
         systemd,
         ssh: &ssh,
         tasks,
+        platform,
         task_id: job.task_id,
         runtime_work_dir: &work_dir,
         job: &job,
@@ -1644,6 +1678,7 @@ struct ComposeTaskExecutionContext<'a> {
     systemd: &'a SystemdExecutor,
     ssh: &'a SshExecutor,
     tasks: &'a TaskService,
+    platform: &'a PlatformConfigService,
     task_id: i64,
     runtime_work_dir: &'a Path,
     job: &'a ComposeTaskJob,
@@ -1809,6 +1844,23 @@ async fn run_compose_task_on_node(
     } else {
         Vec::new()
     };
+
+    if let Some(output) = download_release_package_on_node(context, node).await? {
+        let success = output.success;
+        let message = if success {
+            "版本包下载和校验完成".to_owned()
+        } else {
+            friendly_command_error(&output.output, "版本包下载或校验失败")
+        };
+        outputs.push(output);
+        if !success {
+            return Ok(ComposeNodeTaskResult {
+                success: false,
+                message,
+                outputs,
+            });
+        }
+    }
 
     context
         .tasks
@@ -2068,6 +2120,154 @@ async fn run_compose_action_on_node(
     }
 }
 
+async fn download_release_package_on_node(
+    context: &ComposeTaskExecutionContext<'_>,
+    node: &AppTargetNode,
+) -> Result<Option<ComposeCommandOutput>, AppError> {
+    if context.job.action != ComposeTaskAction::Up {
+        return Ok(None);
+    }
+    let Some(storage_provider) = context.job.release_storage_provider.as_deref() else {
+        return Ok(None);
+    };
+    if storage_provider != STORAGE_PROVIDER_ALIYUN_OSS {
+        return Ok(None);
+    }
+    let release_version = context
+        .job
+        .release_version
+        .as_deref()
+        .ok_or_else(|| AppError::Internal("OSS 发布缺少版本号".to_owned()))?;
+    let package_name = context
+        .job
+        .release_package_name
+        .as_deref()
+        .ok_or_else(|| AppError::Internal("OSS 发布缺少版本包文件名".to_owned()))?;
+    let checksum = context
+        .job
+        .release_checksum_sha256
+        .as_deref()
+        .ok_or_else(|| AppError::Internal("OSS 发布缺少 SHA-256 校验值".to_owned()))?;
+    let size_bytes = context
+        .job
+        .release_size_bytes
+        .ok_or_else(|| AppError::Internal("OSS 发布缺少版本包大小".to_owned()))?;
+    let object_key = context
+        .job
+        .release_storage_object_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AppError::Internal("OSS 发布缺少 ObjectKey".to_owned()))?;
+    let bucket = context
+        .job
+        .release_storage_bucket
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AppError::Internal("OSS 发布缺少 Bucket".to_owned()))?;
+    let endpoint = context
+        .job
+        .release_storage_endpoint
+        .as_deref()
+        .unwrap_or("");
+    context
+        .tasks
+        .update_phase(context.task_id, "preparing_files")
+        .await?;
+    let step_id = start_task_step(
+        context.tasks,
+        context.task_id,
+        Some(node),
+        "artifact.download",
+        &format!("{} 下载版本包", node.name),
+        &format!("oss://{bucket}/{object_key}"),
+    )
+    .await?;
+    let output_result: Result<ComposeCommandOutput, AppError> = async {
+        let platform_config = context.platform.config().await?;
+        if !platform_config.artifact_storage.is_aliyun_oss() {
+            return Err(AppError::InvalidInput(
+                "当前平台制品存储未启用阿里云 OSS，无法下载 OSS 版本包".to_owned(),
+            ));
+        }
+        let mut oss = platform_config.artifact_storage.aliyun_oss.clone();
+        oss.bucket = bucket.to_owned();
+        if !endpoint.trim().is_empty() {
+            oss.endpoint = endpoint.to_owned();
+        }
+        let oss = oss.normalize()?;
+        let signed = oss.presign_download(object_key)?;
+        let app_dir = compose_node_runtime_dir_for_script(context, node);
+        let release_dir =
+            compose_script_join(&app_dir, &format!("{RELEASES_DIR_NAME}/{release_version}"));
+        let package_path = compose_script_join(&release_dir, package_name);
+        if release_dir.is_empty() || package_path.is_empty() {
+            return Err(AppError::Internal("无法计算目标节点版本包路径".to_owned()));
+        }
+        let command = render_release_package_download_command(
+            &release_dir,
+            &package_path,
+            &signed.url,
+            checksum,
+            size_bytes,
+        );
+        let display_command =
+            format!("download oss://{bucket}/{object_key} -> {package_path} && verify sha256");
+        match node.node_type.as_str() {
+            "local" => context
+                .compose
+                .run_shell_redacted(
+                    context.runtime_work_dir.to_path_buf(),
+                    &command,
+                    &display_command,
+                )
+                .await
+                .map_err(AppError::from),
+            "ssh" => {
+                let target = node.ssh_target()?;
+                context
+                    .ssh
+                    .run_shell_redacted(
+                        &target,
+                        context.runtime_work_dir.to_path_buf(),
+                        &command,
+                        &display_command,
+                    )
+                    .await
+                    .map_err(AppError::from)
+            }
+            _ => Err(AppError::InvalidInput(format!(
+                "节点 {} 的类型 {} 不支持版本包下载",
+                node.name, node.node_type
+            ))),
+        }
+    }
+    .await;
+    match output_result {
+        Ok(output) => {
+            append_step_command_output(context.tasks, context.task_id, step_id, &output).await?;
+            let message = if output.success {
+                "版本包下载和校验完成"
+            } else {
+                "版本包下载或校验失败"
+            };
+            finish_task_step(
+                context.tasks,
+                context.task_id,
+                step_id,
+                output.success,
+                output.status_code.map(i64::from),
+                message,
+            )
+            .await?;
+            Ok(Some(output))
+        }
+        Err(err) => {
+            fail_task_step_message(context.tasks, context.task_id, step_id, err.message()).await?;
+            Err(err)
+        }
+    }
+}
+
 async fn run_deploy_script_slot_on_node(
     context: &ComposeTaskExecutionContext<'_>,
     node: &AppTargetNode,
@@ -2174,6 +2374,42 @@ fn compose_script_environment(
         ("ED_APP_DIR".to_owned(), app_dir.clone()),
         ("ED_RELEASE_ID".to_owned(), release_id),
         ("ED_RELEASE_VERSION".to_owned(), release_version),
+        (
+            "ED_RELEASE_PACKAGE".to_owned(),
+            context.job.release_package_name.clone().unwrap_or_default(),
+        ),
+        (
+            "ED_RELEASE_SHA256".to_owned(),
+            context
+                .job
+                .release_checksum_sha256
+                .clone()
+                .unwrap_or_default(),
+        ),
+        (
+            "ED_RELEASE_SIZE_BYTES".to_owned(),
+            context
+                .job
+                .release_size_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "ED_RELEASE_STORAGE_PROVIDER".to_owned(),
+            context
+                .job
+                .release_storage_provider
+                .clone()
+                .unwrap_or_default(),
+        ),
+        (
+            "ED_RELEASE_OBJECT_KEY".to_owned(),
+            context
+                .job
+                .release_storage_object_key
+                .clone()
+                .unwrap_or_default(),
+        ),
         ("ED_RELEASE_DIR".to_owned(), release_dir.clone()),
         (
             "ED_RELEASE_BUNDLE_DIR".to_owned(),
@@ -2217,6 +2453,40 @@ fn compose_script_join(root: &str, relative: &str) -> String {
         return String::new();
     }
     remote_join(root, relative)
+}
+
+fn render_release_package_download_command(
+    release_dir: &str,
+    package_path: &str,
+    signed_url: &str,
+    checksum: &str,
+    size_bytes: i64,
+) -> String {
+    format!(
+        r#"set -eu
+release_dir={release_dir}
+package_path={package_path}
+mkdir -p "$release_dir" "$release_dir/bundle"
+curl -fL --retry 3 --connect-timeout 10 -o "$package_path" {signed_url}
+actual_size="$(wc -c < "$package_path" | tr -d ' ')"
+test "$actual_size" = "{size_bytes}"
+printf '%s  %s\n' {checksum} "$package_path" | sha256sum -c -
+case "$package_path" in
+  *.tar.gz|*.tgz) tar -xzf "$package_path" -C "$release_dir" ;;
+esac"#,
+        release_dir = shell_quote_script(release_dir),
+        package_path = shell_quote_script(package_path),
+        signed_url = shell_quote_script(signed_url),
+        checksum = shell_quote_script(checksum),
+        size_bytes = size_bytes,
+    )
+}
+
+fn shell_quote_script(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_owned();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 async fn run_compose_preflight_on_node(
@@ -6332,6 +6602,10 @@ pub struct AppReleaseItem {
     pub published_at: String,
     pub received_at: String,
     pub scheduled_publish_at: Option<String>,
+    pub storage_provider: String,
+    pub storage_bucket: String,
+    pub storage_object_key: String,
+    pub storage_endpoint: String,
     pub metadata: String,
 }
 
@@ -6363,8 +6637,31 @@ struct PendingReleaseQueueItem {
     config_snapshot_id: Option<i64>,
     version: String,
     version_code: i64,
+    package_name: String,
     package_path: String,
+    checksum_sha256: String,
+    size_bytes: i64,
     published_at: String,
+    storage_provider: String,
+    storage_bucket: String,
+    storage_object_key: String,
+    storage_endpoint: String,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+struct AppReleaseUploadRecord {
+    id: String,
+    app_id: i64,
+    release_version: String,
+    version_code: i64,
+    file_name: String,
+    object_key: String,
+    bucket: String,
+    endpoint: String,
+    status: String,
+    source: String,
+    published_at: String,
+    expires_at: String,
 }
 
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -6649,6 +6946,44 @@ pub struct UploadReleasePackageInput {
     pub source: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct CreateReleasePackageUploadInput {
+    pub app_id: i64,
+    pub release_version: String,
+    pub version_code: Option<i64>,
+    pub published_at: String,
+    pub file_name: String,
+    pub source: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CreateReleasePackageUploadResult {
+    pub upload_id: String,
+    pub app_id: i64,
+    pub app_key: String,
+    pub release_version: String,
+    pub version_code: i64,
+    pub file_name: String,
+    pub object_key: String,
+    pub bucket: String,
+    pub endpoint: String,
+    pub upload_url: String,
+    pub upload_method: String,
+    pub upload_headers: Vec<(String, String)>,
+    pub expires_at: String,
+    pub complete_path: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompleteReleasePackageUploadInput {
+    pub upload_id: String,
+    pub service_key: String,
+    pub checksum_sha256: String,
+    pub size_bytes: i64,
+    pub published_at: String,
+    pub source: String,
+}
+
 struct RegisterBinaryArtifactInput {
     app: AppDetailItem,
     artifact_version: String,
@@ -6771,6 +7106,7 @@ impl AppService {
             compose.clone(),
             systemd.clone(),
             tasks.clone(),
+            platform.clone(),
         );
         let binary_queue = BinaryTaskQueue::start(
             db.clone(),
@@ -7307,6 +7643,10 @@ impl AppService {
                     ORDER BY q.id DESC
                     LIMIT 1
                 ) AS scheduled_publish_at,
+                r.storage_provider,
+                r.storage_bucket,
+                r.storage_object_key,
+                r.storage_endpoint,
                 r.metadata
             FROM app_releases r
             JOIN apps a ON a.id = r.app_id
@@ -7383,6 +7723,10 @@ impl AppService {
                     ORDER BY q.id DESC
                     LIMIT 1
                 ) AS scheduled_publish_at,
+                r.storage_provider,
+                r.storage_bucket,
+                r.storage_object_key,
+                r.storage_endpoint,
                 r.metadata
             FROM app_releases r
             JOIN apps a ON a.id = r.app_id
@@ -7470,6 +7814,10 @@ impl AppService {
                     ORDER BY q.id DESC
                     LIMIT 1
                 ) AS scheduled_publish_at,
+                r.storage_provider,
+                r.storage_bucket,
+                r.storage_object_key,
+                r.storage_endpoint,
                 r.metadata
             FROM app_releases r
             JOIN apps a ON a.id = r.app_id
@@ -8446,6 +8794,10 @@ impl AppService {
             size_bytes,
             &published_at,
             release_status,
+            STORAGE_PROVIDER_LOCAL,
+            "",
+            "",
+            "",
             &release_metadata,
         )
         .await?;
@@ -8487,6 +8839,355 @@ impl AppService {
             queue_id,
             release_version,
             version_code,
+            package_path,
+            package_kind: package_kind.to_owned(),
+            published_at,
+            config_snapshot_id: config_snapshot.id,
+            config_revision_no: config_snapshot.revision_no,
+            queued: auto_queue_release,
+            publish_status: release_publish_mode_label(auto_queue_release).to_owned(),
+            scheduled_publish_at: None,
+        })
+    }
+
+    pub async fn create_release_package_upload(
+        &self,
+        input: CreateReleasePackageUploadInput,
+    ) -> Result<CreateReleasePackageUploadResult, AppError> {
+        let app = self.fetch_app_detail(input.app_id).await?;
+        ensure_app_enabled(&app)?;
+        self.ensure_compose_app(&app)?;
+        if app.release_source != "package_upload" {
+            return Err(AppError::InvalidInput(
+                "当前应用不是版本包发布模式，不能创建版本包上传会话".to_owned(),
+            ));
+        }
+        let file_name = normalize_package_file_name(&input.file_name)?;
+        let parsed = parse_release_package_name_for_service(
+            &file_name,
+            &app.app_key,
+            Some(&input.release_version),
+        )
+        .map_err(|err| AppError::InvalidInput(err.message()))?;
+        let version_code = match input.version_code {
+            Some(version_code) if version_code > 0 => version_code,
+            Some(_) => {
+                return Err(AppError::InvalidInput(
+                    "versionCode 必须是大于 0 的整数".to_owned(),
+                ));
+            }
+            None => parsed.version_code,
+        };
+        let published_at = normalize_published_at(&input.published_at)?.unwrap_or_default();
+        let platform_config = self.platform.config().await?;
+        if !platform_config.artifact_storage.is_aliyun_oss() {
+            return Err(AppError::InvalidInput(
+                "平台制品存储未启用阿里云 OSS，不能创建直传上传地址".to_owned(),
+            ));
+        }
+        let oss = &platform_config.artifact_storage.aliyun_oss;
+        let object_key = oss.object_key(&app.app_key, &parsed.release_version, &file_name);
+        let presigned = oss.presign_upload(&object_key)?;
+        let upload_id = generated_release_upload_id();
+        let source = upload_source(&input.source).to_owned();
+        let metadata = json!({
+            "storage_provider": STORAGE_PROVIDER_ALIYUN_OSS,
+            "upload_method": presigned.method,
+            "upload_content_type": crate::artifact_storage::ARTIFACT_UPLOAD_CONTENT_TYPE,
+        })
+        .to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO app_release_uploads(
+                id,
+                app_id,
+                release_version,
+                version_code,
+                file_name,
+                object_key,
+                bucket,
+                endpoint,
+                source,
+                published_at,
+                expires_at,
+                metadata
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "#,
+        )
+        .bind(&upload_id)
+        .bind(app.id)
+        .bind(&parsed.release_version)
+        .bind(version_code)
+        .bind(&file_name)
+        .bind(&object_key)
+        .bind(&oss.bucket)
+        .bind(&oss.endpoint)
+        .bind(&source)
+        .bind(&published_at)
+        .bind(&presigned.expires_at)
+        .bind(&metadata)
+        .execute(&self.db)
+        .await?;
+        Ok(CreateReleasePackageUploadResult {
+            upload_id: upload_id.clone(),
+            app_id: app.id,
+            app_key: app.app_key.clone(),
+            release_version: parsed.release_version,
+            version_code,
+            file_name,
+            object_key,
+            bucket: oss.bucket.clone(),
+            endpoint: oss.endpoint.clone(),
+            upload_url: presigned.url,
+            upload_method: presigned.method.to_owned(),
+            upload_headers: presigned.headers,
+            expires_at: presigned.expires_at,
+            complete_path: format!(
+                "/api/v1/services/{}/packages/uploads/{}/complete",
+                app.app_key, upload_id
+            ),
+        })
+    }
+
+    pub async fn complete_release_package_upload(
+        &self,
+        input: CompleteReleasePackageUploadInput,
+    ) -> Result<UploadReleasePackageResult, AppError> {
+        let upload_id = normalize_upload_id(&input.upload_id)?;
+        let service_key = normalize_key(&input.service_key)?;
+        let checksum = normalize_checksum_sha256(&input.checksum_sha256)?;
+        if input.size_bytes <= 0 {
+            return Err(AppError::InvalidInput(
+                "size_bytes 必须是大于 0 的整数".to_owned(),
+            ));
+        }
+        let upload = sqlx::query_as::<_, AppReleaseUploadRecord>(
+            r#"
+            SELECT
+                id,
+                app_id,
+                release_version,
+                version_code,
+                file_name,
+                object_key,
+                bucket,
+                endpoint,
+                status,
+                source,
+                published_at,
+                expires_at
+            FROM app_release_uploads
+            WHERE id = ?1
+            "#,
+        )
+        .bind(&upload_id)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or_else(|| AppError::InvalidInput("上传会话不存在".to_owned()))?;
+        if upload.status != "pending" {
+            return Err(AppError::Conflict("上传会话已经完成或不可用".to_owned()));
+        }
+        let app = self.fetch_app_detail(upload.app_id).await?;
+        if app.app_key != service_key {
+            return Err(AppError::InvalidInput(
+                "上传会话不属于当前服务标识".to_owned(),
+            ));
+        }
+        ensure_app_enabled(&app)?;
+        self.ensure_compose_app(&app)?;
+        if app.release_source != "package_upload" {
+            return Err(AppError::InvalidInput(
+                "当前应用不是版本包发布模式，不能登记版本包".to_owned(),
+            ));
+        }
+        if upload_session_expired(&upload.expires_at) {
+            sqlx::query(
+                r#"
+                UPDATE app_release_uploads
+                SET status = 'expired',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                  AND status = 'pending'
+                "#,
+            )
+            .bind(&upload.id)
+            .execute(&self.db)
+            .await?;
+            return Err(AppError::InvalidInput(
+                "上传会话已过期，请重新申请上传地址".to_owned(),
+            ));
+        }
+        let source_text = if input.source.trim().is_empty() {
+            upload.source.clone()
+        } else {
+            input.source.clone()
+        };
+        let source_detail = upload_source(&source_text).to_owned();
+        let published_at = match normalize_published_at(&input.published_at)? {
+            Some(value) => value,
+            None => match normalize_published_at(&upload.published_at)? {
+                Some(value) => value,
+                None => sqlite_now(&self.db).await?,
+            },
+        };
+        let received_at = sqlite_now(&self.db).await?;
+        let runtime_root = self.runtime_fs.app_root(&app.app_key)?;
+        let runtime_files = self.runtime_fs.load_app_config(&app.app_key).await?;
+        let auto_queue_release = app.auto_queue_release == 1;
+        let release_status = release_status_after_upload(auto_queue_release);
+        let package_path = target_work_dir_path(
+            &app.work_dir,
+            &format!("releases/{}/{}", upload.release_version, upload.file_name),
+        );
+        let extract_dir = target_work_dir_path(
+            &app.work_dir,
+            &format!("releases/{}", upload.release_version),
+        );
+        let size_bytes = input.size_bytes as u64;
+        let package_kind = artifact_kind_from_file_name(&upload.file_name);
+
+        let mut tx = self.db.begin().await?;
+        let config_snapshot = insert_runtime_config_snapshot(
+            &mut tx,
+            RuntimeConfigSnapshotInput {
+                app_id: app.id,
+                snapshot_kind: "manual",
+                compose_content: &runtime_files.compose_content,
+                env_content: &runtime_files.env_content,
+                artifact_version: &upload.release_version,
+                metadata: runtime_snapshot_metadata(
+                    "package_upload",
+                    runtime_root.to_string_lossy(),
+                    Some(&upload.release_version),
+                    Some(&runtime_files.deploy_scripts),
+                    None,
+                ),
+            },
+        )
+        .await?;
+        self.runtime_fs
+            .save_release_runtime_metadata(ReleaseRuntimeMetadata {
+                app_key: app.app_key.clone(),
+                app_id: app.id,
+                app_name: app.name.clone(),
+                release_version: upload.release_version.clone(),
+                version_code: upload.version_code,
+                package_name: upload.file_name.clone(),
+                package_path: package_path.clone(),
+                extract_dir: extract_dir.clone(),
+                checksum_sha256: checksum.clone(),
+                size_bytes,
+                published_at: published_at.clone(),
+                received_at: received_at.clone(),
+                source: artifact_channel_from_source(&source_detail).to_owned(),
+                config_snapshot_id: Some(config_snapshot.id),
+                config_revision_no: Some(config_snapshot.revision_no),
+            })
+            .await?;
+        let uploaded_path = format!("oss://{}/{}", upload.bucket, upload.object_key);
+        let release_metadata = render_artifact_metadata_with_storage(
+            ArtifactMetadataInput {
+                source: "package_upload",
+                source_detail: &source_detail,
+                unit_name: "",
+                uploaded_path: &uploaded_path,
+                original_file_name: &upload.file_name,
+                entry_file: "",
+                sha256: &checksum,
+                size_bytes,
+                config_snapshot_id: Some(config_snapshot.id),
+                config_revision_no: Some(config_snapshot.revision_no),
+            },
+            ArtifactStorageMetadataInput {
+                provider: STORAGE_PROVIDER_ALIYUN_OSS,
+                bucket: &upload.bucket,
+                object_key: &upload.object_key,
+                endpoint: &upload.endpoint,
+            },
+        );
+        let release_id = upsert_app_release(
+            &mut tx,
+            app.id,
+            &upload.release_version,
+            upload.version_code,
+            &upload.file_name,
+            &package_path,
+            &extract_dir,
+            artifact_channel_from_source(&source_detail),
+            &checksum,
+            size_bytes,
+            &published_at,
+            release_status,
+            STORAGE_PROVIDER_ALIYUN_OSS,
+            &upload.bucket,
+            &upload.object_key,
+            &upload.endpoint,
+            &release_metadata,
+        )
+        .await?;
+        let queue_id = if auto_queue_release {
+            Some(
+                enqueue_app_release(
+                    &mut tx,
+                    app.id,
+                    release_id,
+                    config_snapshot.id,
+                    &source_detail,
+                    &format!("版本 {} 已入队，等待串行发布", upload.release_version),
+                    "queued",
+                    None,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let update_result = sqlx::query(
+            r#"
+            UPDATE app_release_uploads
+            SET status = 'completed',
+                checksum_sha256 = ?2,
+                size_bytes = ?3,
+                source = ?4,
+                published_at = ?5,
+                completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+              AND status = 'pending'
+            "#,
+        )
+        .bind(&upload.id)
+        .bind(&checksum)
+        .bind(input.size_bytes)
+        .bind(&source_detail)
+        .bind(&published_at)
+        .execute(&mut *tx)
+        .await?;
+        if update_result.rows_affected() == 0 {
+            return Err(AppError::Conflict("上传会话已经完成或不可用".to_owned()));
+        }
+        sqlx::query(
+            r#"
+            UPDATE apps
+            SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+            "#,
+        )
+        .bind(app.id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if queue_id.is_some() {
+            self.enqueue_release_dispatch(app.id).await?;
+        }
+        Ok(UploadReleasePackageResult {
+            app_id: app.id,
+            app_key: app.app_key,
+            release_id,
+            queue_id,
+            release_version: upload.release_version,
+            version_code: upload.version_code,
             package_path,
             package_kind: package_kind.to_owned(),
             published_at,
@@ -8707,6 +9408,10 @@ impl AppService {
             size_bytes,
             &published_at,
             release_status,
+            STORAGE_PROVIDER_LOCAL,
+            "",
+            "",
+            "",
             &release_metadata,
         )
         .await?;
@@ -9255,6 +9960,13 @@ impl AppService {
                 environment: app.environment,
                 compose_strategy,
                 release_version: None,
+                release_package_name: None,
+                release_checksum_sha256: None,
+                release_size_bytes: None,
+                release_storage_provider: None,
+                release_storage_bucket: None,
+                release_storage_object_key: None,
+                release_storage_endpoint: None,
                 config_snapshot_id: (config_snapshot.id > 0).then_some(config_snapshot.id),
                 config_revision_no: config_snapshot.revision_no,
                 deploy_strategy,
@@ -10467,6 +11179,39 @@ fn required_text(value: &str, message: &str) -> Result<String, AppError> {
     }
 }
 
+fn normalize_package_file_name(value: &str) -> Result<String, AppError> {
+    let value = required_text(value, "请填写版本包文件名")?;
+    let file_name = value
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    if file_name.is_empty()
+        || file_name.contains(char::is_whitespace)
+        || !file_name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '@'))
+    {
+        return Err(AppError::InvalidInput(
+            "版本包文件名仅支持字母、数字、点、短横线、下划线和 @".to_owned(),
+        ));
+    }
+    Ok(file_name)
+}
+
+fn normalize_upload_id(value: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        return Err(AppError::InvalidInput("上传会话标识无效".to_owned()));
+    }
+    Ok(value.to_owned())
+}
+
 fn normalize_deploy_work_dir(value: &str) -> Result<String, AppError> {
     let value = required_text(value, "请输入部署目录")?
         .replace('\\', "/")
@@ -10844,7 +11589,14 @@ struct ArtifactMetadataInput<'a> {
     config_revision_no: Option<i64>,
 }
 
-fn render_artifact_metadata(input: ArtifactMetadataInput<'_>) -> String {
+struct ArtifactStorageMetadataInput<'a> {
+    provider: &'a str,
+    bucket: &'a str,
+    object_key: &'a str,
+    endpoint: &'a str,
+}
+
+fn artifact_metadata_value_json(input: ArtifactMetadataInput<'_>) -> JsonValue {
     let mut metadata = json!({
         "source": input.source,
         "source_detail": input.source_detail,
@@ -10861,6 +11613,22 @@ fn render_artifact_metadata(input: ArtifactMetadataInput<'_>) -> String {
     if let Some(revision_no) = input.config_revision_no {
         metadata["config_revision_no"] = json!(revision_no);
     }
+    metadata
+}
+
+fn render_artifact_metadata(input: ArtifactMetadataInput<'_>) -> String {
+    artifact_metadata_value_json(input).to_string()
+}
+
+fn render_artifact_metadata_with_storage(
+    input: ArtifactMetadataInput<'_>,
+    storage: ArtifactStorageMetadataInput<'_>,
+) -> String {
+    let mut metadata = artifact_metadata_value_json(input);
+    metadata["storage_provider"] = json!(storage.provider);
+    metadata["storage_bucket"] = json!(storage.bucket);
+    metadata["storage_object_key"] = json!(storage.object_key);
+    metadata["storage_endpoint"] = json!(storage.endpoint);
     metadata.to_string()
 }
 
@@ -11096,6 +11864,10 @@ async fn upsert_app_release(
     size_bytes: u64,
     published_at: &str,
     status: &str,
+    storage_provider: &str,
+    storage_bucket: &str,
+    storage_object_key: &str,
+    storage_endpoint: &str,
     metadata: &str,
 ) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(
@@ -11112,10 +11884,14 @@ async fn upsert_app_release(
             checksum_sha256,
             size_bytes,
             published_at,
+            storage_provider,
+            storage_bucket,
+            storage_object_key,
+            storage_endpoint,
             metadata,
             updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         ON CONFLICT(app_id, version) DO UPDATE SET
             version_code = excluded.version_code,
             package_name = excluded.package_name,
@@ -11126,6 +11902,10 @@ async fn upsert_app_release(
             checksum_sha256 = excluded.checksum_sha256,
             size_bytes = excluded.size_bytes,
             published_at = excluded.published_at,
+            storage_provider = excluded.storage_provider,
+            storage_bucket = excluded.storage_bucket,
+            storage_object_key = excluded.storage_object_key,
+            storage_endpoint = excluded.storage_endpoint,
             metadata = excluded.metadata,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         RETURNING id
@@ -11142,6 +11922,10 @@ async fn upsert_app_release(
     .bind(checksum_sha256)
     .bind(size_bytes as i64)
     .bind(published_at)
+    .bind(storage_provider)
+    .bind(storage_bucket)
+    .bind(storage_object_key)
+    .bind(storage_endpoint)
     .bind(metadata)
     .fetch_one(&mut **tx)
     .await
@@ -11267,6 +12051,33 @@ async fn sqlite_now(db: &SqlitePool) -> Result<String, AppError> {
         .fetch_one(db)
         .await
         .map_err(AppError::from)
+}
+
+fn generated_release_upload_id() -> String {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let mut random = [0_u8; 8];
+    OsRng.fill_bytes(&mut random);
+    let suffix = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("upload-{ts}-{suffix}")
+}
+
+fn upload_session_expired(expires_at: &str) -> bool {
+    DateTime::parse_from_rfc3339(expires_at)
+        .map(|expires_at| expires_at.timestamp() <= unix_timestamp_now())
+        .unwrap_or(false)
+}
+
+fn unix_timestamp_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 fn artifact_kind_from_file_name(file_name: &str) -> &'static str {

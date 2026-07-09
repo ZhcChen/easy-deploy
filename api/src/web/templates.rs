@@ -580,6 +580,15 @@ pub struct SettingsTemplate<'a> {
     pub default_app_work_dir: &'a str,
     pub default_node_work_dir: &'a str,
     pub uploaded_binary_releases_to_keep: usize,
+    pub artifact_storage_provider: &'a str,
+    pub aliyun_oss_region: &'a str,
+    pub aliyun_oss_endpoint: &'a str,
+    pub aliyun_oss_bucket: &'a str,
+    pub aliyun_oss_object_prefix: &'a str,
+    pub aliyun_oss_access_key_id: &'a str,
+    pub aliyun_oss_secret_status: &'a str,
+    pub aliyun_oss_upload_url_ttl_seconds: i64,
+    pub aliyun_oss_download_url_ttl_seconds: i64,
 }
 
 pub struct NavSection<'a> {
@@ -838,7 +847,8 @@ pub struct ArtifactPageRow {
     pub queue_status: String,
     pub queue_status_tone: &'static str,
     pub publish_mode: &'static str,
-    pub artifact_path: String,
+    pub storage: String,
+    pub storage_detail: String,
     pub sha256: String,
     pub size: String,
     pub entry_file: String,

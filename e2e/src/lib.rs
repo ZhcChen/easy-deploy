@@ -339,6 +339,8 @@ async fn run_checks(
             && settings_page.contains("name=\"default_app_work_dir\"")
             && settings_page.contains("name=\"default_node_work_dir\"")
             && settings_page.contains("name=\"uploaded_binary_releases_to_keep\"")
+            && settings_page.contains("name=\"artifact_storage_provider\"")
+            && settings_page.contains("name=\"aliyun_oss_bucket\"")
             && settings_page.contains("EASY_DEPLOY_COMMAND_TIMEOUT_SECS")
             && settings_page.contains("redis-single 6379")
             && settings_page.contains("postgres-single 5432")
@@ -354,6 +356,18 @@ async fn run_checks(
             ("default_app_work_dir", "/srv/easy/{app_key}"),
             ("default_node_work_dir", "/srv/easy"),
             ("uploaded_binary_releases_to_keep", "6"),
+            ("artifact_storage_provider", "local"),
+            ("aliyun_oss_region", "oss-cn-hangzhou"),
+            (
+                "aliyun_oss_endpoint",
+                "https://oss-cn-hangzhou.aliyuncs.com",
+            ),
+            ("aliyun_oss_bucket", ""),
+            ("aliyun_oss_object_prefix", "easy-deploy/releases"),
+            ("aliyun_oss_access_key_id", ""),
+            ("aliyun_oss_access_key_secret", ""),
+            ("aliyun_oss_upload_url_ttl_seconds", "900"),
+            ("aliyun_oss_download_url_ttl_seconds", "600"),
         ])
         .send()
         .await?;
@@ -402,6 +416,18 @@ async fn run_checks(
             ("default_app_work_dir", "/opt/easy-deploy/apps/{app_key}"),
             ("default_node_work_dir", "/opt/easy-deploy/apps"),
             ("uploaded_binary_releases_to_keep", "4"),
+            ("artifact_storage_provider", "local"),
+            ("aliyun_oss_region", "oss-cn-hangzhou"),
+            (
+                "aliyun_oss_endpoint",
+                "https://oss-cn-hangzhou.aliyuncs.com",
+            ),
+            ("aliyun_oss_bucket", ""),
+            ("aliyun_oss_object_prefix", "easy-deploy/releases"),
+            ("aliyun_oss_access_key_id", ""),
+            ("aliyun_oss_access_key_secret", ""),
+            ("aliyun_oss_upload_url_ttl_seconds", "900"),
+            ("aliyun_oss_download_url_ttl_seconds", "600"),
         ])
         .send()
         .await?;
@@ -1391,7 +1417,8 @@ async fn run_checks(
             && templates.contains("6379")
             && templates.contains("5432")
             && templates.contains("PUBLIC_PORT=8080")
-            && templates.contains("REDIS_PORT=6379")
+            && templates.contains("REDIS_PASSWORD=change-me")
+            && templates.contains("POSTGRES_PASSWORD=change-me")
             && !templates.contains("name=\"template_key\"")
             && !templates.contains("id=\"template-port\"")
             && !templates.contains("data-default-port"),

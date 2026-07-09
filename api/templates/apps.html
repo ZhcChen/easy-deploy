@@ -250,57 +250,6 @@
           <div class="form-section-heading">
             <h3 id="app-create-advanced-title">高级配置</h3>
           </div>
-          <details class="config-advanced-details form-span-all">
-            <summary>
-              <span>对象存储</span>
-              <small>阿里云 OSS，自动写入 .env</small>
-            </summary>
-            <div class="advanced-form-grid storage-config-grid">
-              <label>
-                服务商
-                <select name="provider">
-                  <option value="aliyun_oss" selected>阿里云 OSS</option>
-                </select>
-              </label>
-              <label>
-                Region
-                <input name="region" placeholder="oss-cn-hangzhou">
-              </label>
-              <label class="form-span-all">
-                Endpoint
-                <input name="endpoint" placeholder="https://oss-cn-hangzhou.aliyuncs.com">
-              </label>
-              <label>
-                私有 Bucket
-                <input name="private_bucket" placeholder="qfy-sc-private">
-              </label>
-              <label>
-                公共 Bucket
-                <input name="public_bucket" placeholder="qfy-sc-public">
-              </label>
-              <label class="form-span-all">
-                公共访问域名
-                <input name="public_base_url" placeholder="https://static.example.com">
-              </label>
-              <label>
-                上传 URL TTL（秒）
-                <input name="upload_url_ttl_seconds" type="number" min="1" value="900">
-              </label>
-              <label>
-                下载 URL TTL（秒）
-                <input name="download_url_ttl_seconds" type="number" min="1" value="600">
-              </label>
-              <label>
-                AccessKey ID
-                <input name="key_id" autocomplete="off">
-              </label>
-              <label>
-                AccessKey Secret
-                <input name="application_key" type="password" autocomplete="new-password">
-              </label>
-              <p class="field-hint form-span-all">可导入 qfy-sc worker 复制的对象存储配置；导入包不含密钥明文时，需要在这里补充。</p>
-            </div>
-          </details>
           <details class="config-advanced-details deploy-script-details form-span-all">
             <summary>
               <span>部署脚本</span>

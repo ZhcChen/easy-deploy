@@ -15,11 +15,13 @@ clap = { workspace = true, features = ["derive", "env"] }
 encoding_rs.workspace = true
 flate2.workspace = true
 fs2.workspace = true
+hmac.workspace = true
 rand_core.workspace = true
 reqwest = { workspace = true, features = ["rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
+sha1.workspace = true
 sha2.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite", "migrate"] }
 tar.workspace = true
