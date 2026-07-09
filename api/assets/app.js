@@ -886,6 +886,59 @@
     });
   };
 
+  const renderDiskRateProcesses = (panel, processes) => {
+    const container = panel.querySelector("[data-disk-rate-processes]");
+    if (!container) return;
+
+    container.replaceChildren();
+    if (!Array.isArray(processes) || processes.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "modal-empty-state";
+      appendTextElement(empty, "span", "", "暂无进程 IO 数据");
+      appendTextElement(empty, "p", "", "等待下一次采样；如果一直为空，通常是当前服务账号无权限读取其他进程。");
+      container.appendChild(empty);
+      return;
+    }
+
+    processes.slice(0, 20).forEach((process, index) => {
+      const row = document.createElement("article");
+      row.className = "disk-rate-process-row";
+
+      appendTextElement(row, "span", "disk-rate-rank", `#${index + 1}`);
+
+      const processCell = document.createElement("div");
+      processCell.className = "disk-rate-process-name";
+      appendTextElement(processCell, "strong", "", process.name);
+      const meta = document.createElement("span");
+      meta.textContent = process.container_id
+        ? `PID ${process.pid} · 容器 ${process.container_id}`
+        : `PID ${process.pid}`;
+      processCell.appendChild(meta);
+      appendTextElement(processCell, "small", "", process.command);
+      row.appendChild(processCell);
+
+      const readCell = document.createElement("div");
+      readCell.className = "disk-rate-device-value";
+      appendTextElement(readCell, "span", "", "读");
+      appendTextElement(readCell, "strong", "", process.read_label);
+      row.appendChild(readCell);
+
+      const writeCell = document.createElement("div");
+      writeCell.className = "disk-rate-device-value";
+      appendTextElement(writeCell, "span", "", "写");
+      appendTextElement(writeCell, "strong", "", process.write_label);
+      row.appendChild(writeCell);
+
+      const totalCell = document.createElement("div");
+      totalCell.className = "disk-rate-device-value";
+      appendTextElement(totalCell, "span", "", "总");
+      appendTextElement(totalCell, "strong", "", process.total_label);
+      row.appendChild(totalCell);
+
+      container.appendChild(row);
+    });
+  };
+
   const updateHostMetricsPanel = (panel, payload) => {
     const metricKeys = [
       "cpu.percent_label",
@@ -897,6 +950,7 @@
       "disk.mount_point",
       "disk_rate.detail",
       "disk_rate.utilization_label",
+      "disk_rate.process_detail",
       "network_rate.detail",
     ];
 
@@ -912,6 +966,7 @@
       setHostMetricBar(panel, key, getPathValue(payload, key));
     });
     renderDiskRateDevices(panel, getPathValue(payload, "disk_rate.devices"));
+    renderDiskRateProcesses(panel, getPathValue(payload, "disk_rate.processes"));
 
     const status = panel.querySelector("[data-host-metrics-status]");
     if (status) {

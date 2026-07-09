@@ -29,6 +29,7 @@ struct HostMetricsCollector {
     data_dir: PathBuf,
     previous_cpu: Option<CpuSample>,
     previous_disk: Option<CounterSample>,
+    previous_process_io: Option<ProcessIoSample>,
     previous_network: Option<CounterSample>,
 }
 
@@ -38,6 +39,7 @@ impl HostMetricsCollector {
             data_dir: data_dir.to_path_buf(),
             previous_cpu: read_cpu_sample(),
             previous_disk: read_disk_io_sample(),
+            previous_process_io: read_process_io_sample().map(|read| read.sample),
             previous_network: read_network_sample(),
         }
     }
@@ -46,13 +48,17 @@ impl HostMetricsCollector {
         let cpu = cpu_metric(&mut self.previous_cpu);
         let memory = memory_metric();
         let disk = disk_usage_metric(&self.data_dir);
-        let disk_rate = rate_metric(
+        let mut disk_rate = rate_metric(
             &mut self.previous_disk,
             read_disk_io_sample(),
             "读",
             "写",
             "磁盘速率暂不可用",
         );
+        let (processes, process_detail) =
+            process_rate_metric(&mut self.previous_process_io, read_process_io_sample());
+        disk_rate.processes = processes;
+        disk_rate.process_detail = process_detail;
         let network_rate = rate_metric(
             &mut self.previous_network,
             read_network_sample(),
@@ -116,6 +122,8 @@ pub struct RateMetric {
     pub utilization_percent: Option<f64>,
     pub utilization_label: String,
     pub devices: Vec<RateDeviceMetric>,
+    pub processes: Vec<RateProcessMetric>,
+    pub process_detail: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -126,6 +134,17 @@ pub struct RateDeviceMetric {
     pub total_label: String,
     pub utilization_percent: f64,
     pub utilization_label: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RateProcessMetric {
+    pub pid: u32,
+    pub name: String,
+    pub command: String,
+    pub container_id: Option<String>,
+    pub read_label: String,
+    pub write_label: String,
+    pub total_label: String,
 }
 
 #[derive(Clone, Copy)]
@@ -155,6 +174,37 @@ struct RawRateDeviceMetric {
     write_rate: f64,
     total_rate: f64,
     utilization_percent: f64,
+}
+
+#[derive(Clone)]
+struct ProcessIoSample {
+    processes: HashMap<u32, ProcessIoCounter>,
+    sampled_at: Instant,
+}
+
+struct ProcessIoRead {
+    sample: ProcessIoSample,
+    permission_denied_count: usize,
+}
+
+#[derive(Clone)]
+struct ProcessIoCounter {
+    pid: u32,
+    name: String,
+    command: String,
+    container_id: Option<String>,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+struct RawRateProcessMetric {
+    pid: u32,
+    name: String,
+    command: String,
+    container_id: Option<String>,
+    read_rate: f64,
+    write_rate: f64,
+    total_rate: f64,
 }
 
 fn cpu_metric(previous: &mut Option<CpuSample>) -> PercentMetric {
@@ -263,6 +313,8 @@ fn rate_metric(
             utilization_percent: None,
             utilization_label: "--".to_owned(),
             devices: Vec::new(),
+            processes: Vec::new(),
+            process_detail: String::new(),
         };
     };
 
@@ -310,7 +362,103 @@ fn rate_metric(
         utilization_percent,
         utilization_label,
         devices,
+        processes: Vec::new(),
+        process_detail: String::new(),
     }
+}
+
+fn process_rate_metric(
+    previous: &mut Option<ProcessIoSample>,
+    current: Option<ProcessIoRead>,
+) -> (Vec<RateProcessMetric>, String) {
+    let Some(current) = current else {
+        *previous = None;
+        return (Vec::new(), unsupported_detail());
+    };
+
+    let Some(old) = previous.as_ref() else {
+        *previous = Some(current.sample);
+        return (Vec::new(), "等待下一次进程 IO 采样".to_owned());
+    };
+
+    let elapsed = current
+        .sample
+        .sampled_at
+        .duration_since(old.sampled_at)
+        .as_secs_f64()
+        .max(0.001);
+    let mut process_rates = current
+        .sample
+        .processes
+        .iter()
+        .filter_map(|(pid, current_process)| {
+            let old_process = old.processes.get(pid)?;
+            let read_rate = current_process
+                .read_bytes
+                .saturating_sub(old_process.read_bytes) as f64
+                / elapsed;
+            let write_rate = current_process
+                .write_bytes
+                .saturating_sub(old_process.write_bytes) as f64
+                / elapsed;
+            let total_rate = read_rate + write_rate;
+            if total_rate <= 0.0 {
+                return None;
+            }
+            Some(RawRateProcessMetric {
+                pid: current_process.pid,
+                name: current_process.name.clone(),
+                command: current_process.command.clone(),
+                container_id: current_process.container_id.clone(),
+                read_rate,
+                write_rate,
+                total_rate,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    process_rates.sort_by(|left, right| {
+        right
+            .total_rate
+            .total_cmp(&left.total_rate)
+            .then_with(|| right.write_rate.total_cmp(&left.write_rate))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.pid.cmp(&right.pid))
+    });
+    process_rates.truncate(20);
+    *previous = Some(current.sample);
+
+    let detail = if process_rates.is_empty() && current.permission_denied_count > 0 {
+        format!(
+            "未采集到可读进程 IO，已跳过 {} 个无权限进程",
+            current.permission_denied_count
+        )
+    } else if process_rates.is_empty() {
+        "暂无进程读写".to_owned()
+    } else if current.permission_denied_count > 0 {
+        format!(
+            "按总读写速率排序，已跳过 {} 个无权限进程",
+            current.permission_denied_count
+        )
+    } else {
+        "按总读写速率排序".to_owned()
+    };
+
+    (
+        process_rates
+            .into_iter()
+            .map(|process| RateProcessMetric {
+                pid: process.pid,
+                name: process.name,
+                command: process.command,
+                container_id: process.container_id,
+                read_label: rate_label(process.read_rate),
+                write_label: rate_label(process.write_rate),
+                total_label: rate_label(process.total_rate),
+            })
+            .collect(),
+        detail,
+    )
 }
 
 fn disk_rate_devices(
@@ -518,6 +666,112 @@ fn read_disk_io_sample() -> Option<CounterSample> {
 }
 
 #[cfg(target_os = "linux")]
+fn read_process_io_sample() -> Option<ProcessIoRead> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let mut processes = HashMap::new();
+    let mut permission_denied_count = 0_usize;
+
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let process_dir = entry.path();
+        let io_path = process_dir.join("io");
+        let io_content = match std::fs::read_to_string(&io_path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                permission_denied_count += 1;
+                continue;
+            }
+            Err(_) => continue,
+        };
+        let Some((read_bytes, write_bytes)) = parse_process_io_bytes(&io_content) else {
+            continue;
+        };
+        let name = read_process_name(&process_dir).unwrap_or_else(|| pid.to_string());
+        let command = read_process_command(&process_dir).unwrap_or_else(|| name.clone());
+        let container_id = read_process_container_id(&process_dir);
+        processes.insert(
+            pid,
+            ProcessIoCounter {
+                pid,
+                name,
+                command,
+                container_id,
+                read_bytes,
+                write_bytes,
+            },
+        );
+    }
+
+    Some(ProcessIoRead {
+        sample: ProcessIoSample {
+            processes,
+            sampled_at: Instant::now(),
+        },
+        permission_denied_count,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_process_io_sample() -> Option<ProcessIoRead> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_process_io_bytes(content: &str) -> Option<(u64, u64)> {
+    let mut read_bytes = None;
+    let mut write_bytes = None;
+    for line in content.lines() {
+        if let Some(value) = parse_proc_io_value(line, "read_bytes:") {
+            read_bytes = Some(value);
+        } else if let Some(value) = parse_proc_io_value(line, "write_bytes:") {
+            write_bytes = Some(value);
+        }
+    }
+    Some((read_bytes?, write_bytes?))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_io_value(line: &str, key: &str) -> Option<u64> {
+    line.strip_prefix(key)?.trim().parse::<u64>().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_name(process_dir: &Path) -> Option<String> {
+    let value = std::fs::read_to_string(process_dir.join("comm")).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| truncate_chars(value, 80))
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_command(process_dir: &Path) -> Option<String> {
+    let bytes = std::fs::read(process_dir.join("cmdline")).ok()?;
+    let parts = bytes
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(&parts.join(" "), 220))
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_container_id(process_dir: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(process_dir.join("cgroup")).ok()?;
+    content.lines().find_map(short_container_id)
+}
+
+#[cfg(target_os = "linux")]
+fn short_container_id(line: &str) -> Option<String> {
+    line.split(|ch: char| !ch.is_ascii_hexdigit())
+        .find(|token| token.len() >= 64 && token.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .map(|token| token[..12].to_owned())
+}
+
+#[cfg(target_os = "linux")]
 fn linux_block_devices() -> Vec<String> {
     std::fs::read_dir("/sys/block")
         .ok()
@@ -629,6 +883,17 @@ fn truncate_two_decimals(value: f64) -> f64 {
     (value * 100.0).floor() / 100.0
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
 fn unsupported_detail() -> String {
     "当前系统不支持采集".to_owned()
 }
@@ -644,6 +909,8 @@ fn unix_epoch_millis() -> u128 {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    type ProcessIoFixture<'a> = (u32, &'a str, &'a str, Option<&'a str>, u64, u64);
 
     fn counter_sample(
         read: u64,
@@ -668,6 +935,37 @@ mod tests {
                 })
                 .collect(),
             sampled_at,
+        }
+    }
+
+    fn process_io_read(
+        processes: Vec<ProcessIoFixture<'_>>,
+        permission_denied_count: usize,
+        sampled_at: Instant,
+    ) -> ProcessIoRead {
+        ProcessIoRead {
+            sample: ProcessIoSample {
+                processes: processes
+                    .into_iter()
+                    .map(
+                        |(pid, name, command, container_id, read_bytes, write_bytes)| {
+                            (
+                                pid,
+                                ProcessIoCounter {
+                                    pid,
+                                    name: name.to_owned(),
+                                    command: command.to_owned(),
+                                    container_id: container_id.map(ToOwned::to_owned),
+                                    read_bytes,
+                                    write_bytes,
+                                },
+                            )
+                        },
+                    )
+                    .collect(),
+                sampled_at,
+            },
+            permission_denied_count,
         }
     }
 
@@ -748,6 +1046,7 @@ mod tests {
         assert_eq!(metric.detail, "unavailable");
         assert_eq!(metric.utilization_percent, None);
         assert!(metric.devices.is_empty());
+        assert!(metric.processes.is_empty());
         assert!(previous.is_none());
     }
 
@@ -831,6 +1130,111 @@ mod tests {
         assert_eq!(devices[19].name, "sd06");
     }
 
+    #[test]
+    fn process_rate_metric_waits_for_second_sample() {
+        let start = Instant::now();
+        let mut previous = None;
+        let (processes, detail) = process_rate_metric(
+            &mut previous,
+            Some(process_io_read(
+                vec![(42, "api", "easy-deploy-api", None, 1_024, 2_048)],
+                0,
+                start,
+            )),
+        );
+
+        assert!(processes.is_empty());
+        assert_eq!(detail, "等待下一次进程 IO 采样");
+        assert!(previous.is_some());
+    }
+
+    #[test]
+    fn process_rate_metric_sorts_by_total_disk_rate() {
+        let start = Instant::now();
+        let mut previous = Some(
+            process_io_read(
+                vec![
+                    (42, "api", "easy-deploy-api", None, 1_024, 2_048),
+                    (
+                        77,
+                        "worker",
+                        "worker --job",
+                        Some("abcdef123456"),
+                        4_096,
+                        4_096,
+                    ),
+                    (88, "idle", "idle", None, 0, 0),
+                ],
+                0,
+                start,
+            )
+            .sample,
+        );
+
+        let (processes, detail) = process_rate_metric(
+            &mut previous,
+            Some(process_io_read(
+                vec![
+                    (42, "api", "easy-deploy-api", None, 3_072, 4_096),
+                    (
+                        77,
+                        "worker",
+                        "worker --job",
+                        Some("abcdef123456"),
+                        4_096,
+                        12_288,
+                    ),
+                    (88, "idle", "idle", None, 0, 0),
+                ],
+                2,
+                start + std::time::Duration::from_secs(2),
+            )),
+        );
+
+        assert_eq!(detail, "按总读写速率排序，已跳过 2 个无权限进程");
+        assert_eq!(processes.len(), 2);
+        assert_eq!(processes[0].pid, 77);
+        assert_eq!(processes[0].name, "worker");
+        assert_eq!(processes[0].container_id.as_deref(), Some("abcdef123456"));
+        assert_eq!(processes[0].read_label, "0 B/s");
+        assert_eq!(processes[0].write_label, "4.00 KB/s");
+        assert_eq!(processes[0].total_label, "4.00 KB/s");
+        assert_eq!(processes[1].pid, 42);
+        assert_eq!(processes[1].total_label, "2.00 KB/s");
+    }
+
+    #[test]
+    fn process_rate_metric_reports_permission_only_result() {
+        let start = Instant::now();
+        let mut previous = Some(
+            process_io_read(
+                vec![(42, "api", "easy-deploy-api", None, 1_024, 2_048)],
+                0,
+                start,
+            )
+            .sample,
+        );
+
+        let (processes, detail) = process_rate_metric(
+            &mut previous,
+            Some(process_io_read(
+                vec![(42, "api", "easy-deploy-api", None, 1_024, 2_048)],
+                12,
+                start + std::time::Duration::from_secs(1),
+            )),
+        );
+
+        assert!(processes.is_empty());
+        assert_eq!(detail, "未采集到可读进程 IO，已跳过 12 个无权限进程");
+    }
+
+    #[test]
+    fn truncates_long_text_by_characters() {
+        assert_eq!(truncate_chars("abcdef", 3), "abc...");
+        assert_eq!(truncate_chars("中文命令", 2), "中文...");
+        assert_eq!(truncate_chars("short", 10), "short");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn parses_df_line_with_mount_point() {
@@ -838,5 +1242,19 @@ mod tests {
         assert_eq!(sample.total, 107_374_182_400);
         assert_eq!(sample.used, 32_212_254_720);
         assert_eq!(sample.mount_point, "/");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_process_io_and_container_id() {
+        let io = "rchar: 9\nwchar: 8\nread_bytes: 1024\nwrite_bytes: 2048\n";
+        assert_eq!(parse_process_io_bytes(io), Some((1_024, 2_048)));
+        assert_eq!(
+            short_container_id(
+                "0::/system.slice/docker-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.scope"
+            )
+            .as_deref(),
+            Some("0123456789ab")
+        );
     }
 }

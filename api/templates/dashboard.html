@@ -89,8 +89,8 @@
     <section class="modal-card">
       <div class="modal-header">
         <div>
-          <h2 id="disk-rate-modal-title">磁盘速率占用 Top 20</h2>
-          <p>按设备忙碌率倒序排列，忙碌率相同时按总读写速率排序。</p>
+          <h2 id="disk-rate-modal-title">磁盘 IO 占用详情</h2>
+          <p>先看磁盘设备是否忙，再看具体进程或容器的读写速率。</p>
         </div>
         <button class="modal-close" type="button" data-modal-close aria-label="关闭">×</button>
       </div>
@@ -105,11 +105,32 @@
             <strong data-host-metric="disk_rate.utilization_label">--</strong>
           </div>
         </div>
-        <div class="disk-rate-device-list" data-disk-rate-devices>
-          <div class="modal-empty-state">
-            <span>等待采集磁盘速率</span>
+        <section class="disk-rate-section" aria-labelledby="disk-rate-process-title">
+          <div class="disk-rate-section-header">
+            <div>
+              <h3 id="disk-rate-process-title">进程 / 应用读写 Top 20</h3>
+              <p data-host-metric="disk_rate.process_detail">等待采集</p>
+            </div>
           </div>
-        </div>
+          <div class="disk-rate-process-list" data-disk-rate-processes>
+            <div class="modal-empty-state">
+              <span>等待采集进程 IO</span>
+            </div>
+          </div>
+        </section>
+        <section class="disk-rate-section" aria-labelledby="disk-rate-device-title">
+          <div class="disk-rate-section-header">
+            <div>
+              <h3 id="disk-rate-device-title">磁盘设备忙碌率 Top 20</h3>
+              <p>设备名如 vda 表示整块磁盘，不代表具体应用。</p>
+            </div>
+          </div>
+          <div class="disk-rate-device-list" data-disk-rate-devices>
+            <div class="modal-empty-state">
+              <span>等待采集磁盘速率</span>
+            </div>
+          </div>
+        </section>
       </div>
     </section>
   </dialog>

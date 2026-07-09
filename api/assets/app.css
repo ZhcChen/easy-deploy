@@ -1006,7 +1006,8 @@ td span,
 .disk-rate-modal-summary span,
 .disk-rate-device-value span,
 .disk-rate-device-busy span,
-.disk-rate-device-name span {
+.disk-rate-device-name span,
+.disk-rate-process-name span {
   color: var(--text-muted);
   font-size: 12px;
   font-weight: 750;
@@ -1023,20 +1024,56 @@ td span,
   line-height: 1.3;
 }
 
-.disk-rate-device-list {
+.disk-rate-section {
+  display: grid;
+  gap: 9px;
+  margin-top: 14px;
+}
+
+.disk-rate-section-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.disk-rate-section-header h3 {
+  color: #172033;
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.disk-rate-section-header p {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
+.disk-rate-device-list,
+.disk-rate-process-list {
   display: grid;
   gap: 8px;
 }
 
-.disk-rate-device-row {
+.disk-rate-device-row,
+.disk-rate-process-row {
   display: grid;
-  grid-template-columns: 46px minmax(130px, 1fr) minmax(88px, 0.55fr) minmax(88px, 0.55fr) minmax(150px, 0.8fr);
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
   border: 1px solid rgba(217, 226, 238, 0.82);
   border-radius: 9px;
   background: #ffffff;
+}
+
+.disk-rate-device-row {
+  grid-template-columns: 46px minmax(130px, 1fr) minmax(88px, 0.55fr) minmax(88px, 0.55fr) minmax(150px, 0.8fr);
+}
+
+.disk-rate-process-row {
+  grid-template-columns: 46px minmax(220px, 1.4fr) repeat(3, minmax(88px, 0.5fr));
 }
 
 .disk-rate-rank {
@@ -1046,12 +1083,14 @@ td span,
 }
 
 .disk-rate-device-name,
+.disk-rate-process-name,
 .disk-rate-device-value,
 .disk-rate-device-busy {
   min-width: 0;
 }
 
 .disk-rate-device-name strong,
+.disk-rate-process-name strong,
 .disk-rate-device-value strong,
 .disk-rate-device-busy strong {
   display: block;
@@ -1061,6 +1100,16 @@ td span,
   color: #172033;
   font-size: 14px;
   line-height: 1.35;
+}
+
+.disk-rate-process-name small {
+  display: block;
+  min-width: 0;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  color: var(--text-soft);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .disk-rate-device-busy > div:first-child {
@@ -4307,6 +4356,7 @@ tbody tr:last-child td {
   .next-step-panel,
   .disk-rate-modal-summary,
   .disk-rate-device-row,
+  .disk-rate-process-row,
   .task-guide-grid,
   .deploy-mode-picker,
   .two-column-form-grid,
@@ -4320,7 +4370,8 @@ tbody tr:last-child td {
     align-items: flex-start;
   }
 
-  .disk-rate-device-row {
+  .disk-rate-device-row,
+  .disk-rate-process-row {
     gap: 8px;
   }
 

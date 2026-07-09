@@ -9018,6 +9018,8 @@ mod tests {
         assert!(payload["disk_rate"]["detail"].is_string());
         assert!(payload["disk_rate"]["utilization_label"].is_string());
         assert!(payload["disk_rate"]["devices"].is_array());
+        assert!(payload["disk_rate"]["processes"].is_array());
+        assert!(payload["disk_rate"]["process_detail"].is_string());
         assert!(payload["network_rate"]["detail"].is_string());
     }
 
