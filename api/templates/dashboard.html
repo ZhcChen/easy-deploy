@@ -58,13 +58,21 @@
       <p><span data-host-metric="disk.detail">等待采集</span> · <span data-host-metric="disk.mount_point">--</span></p>
     </article>
 
-    <article class="metric-card metric-card-rate">
+    <article
+      class="metric-card metric-card-rate metric-card-action"
+      role="button"
+      tabindex="0"
+      aria-haspopup="dialog"
+      aria-controls="disk-rate-modal"
+      aria-label="查看磁盘速率占用 Top 20"
+      data-modal-target="disk-rate-modal"
+    >
       <span class="metric-label">磁盘速率</span>
       <strong data-host-metric="disk_rate.detail">--</strong>
       <div class="metric-bar" aria-hidden="true">
         <span data-host-metric-bar="disk_rate.utilization_percent"></span>
       </div>
-      <p>忙碌率 <span data-host-metric="disk_rate.utilization_label">--</span></p>
+      <p>忙碌率 <span data-host-metric="disk_rate.utilization_label">--</span><span class="metric-action-hint">查看 Top 20</span></p>
     </article>
 
     <article class="metric-card metric-card-rate">
@@ -76,6 +84,35 @@
   <div class="host-metrics-footer">
     <span data-host-metrics-status>等待刷新</span>
   </div>
+
+  <dialog class="modal-dialog wide-modal" id="disk-rate-modal" aria-labelledby="disk-rate-modal-title">
+    <section class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2 id="disk-rate-modal-title">磁盘速率占用 Top 20</h2>
+          <p>按设备忙碌率倒序排列，忙碌率相同时按总读写速率排序。</p>
+        </div>
+        <button class="modal-close" type="button" data-modal-close aria-label="关闭">×</button>
+      </div>
+      <div class="host-rate-modal-body">
+        <div class="disk-rate-modal-summary">
+          <div>
+            <span>当前总速率</span>
+            <strong data-host-metric="disk_rate.detail">--</strong>
+          </div>
+          <div>
+            <span>最高忙碌率</span>
+            <strong data-host-metric="disk_rate.utilization_label">--</strong>
+          </div>
+        </div>
+        <div class="disk-rate-device-list" data-disk-rate-devices>
+          <div class="modal-empty-state">
+            <span>等待采集磁盘速率</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </dialog>
 </section>
 
 <section class="main-grid">

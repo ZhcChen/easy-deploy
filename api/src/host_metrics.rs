@@ -115,6 +115,17 @@ pub struct RateMetric {
     pub detail: String,
     pub utilization_percent: Option<f64>,
     pub utilization_label: String,
+    pub devices: Vec<RateDeviceMetric>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RateDeviceMetric {
+    pub name: String,
+    pub read_label: String,
+    pub write_label: String,
+    pub total_label: String,
+    pub utilization_percent: f64,
+    pub utilization_label: String,
 }
 
 #[derive(Clone, Copy)]
@@ -127,8 +138,23 @@ struct CpuSample {
 struct CounterSample {
     read: u64,
     write: u64,
-    busy_millis_by_device: HashMap<String, u64>,
+    devices: HashMap<String, DeviceCounterSample>,
     sampled_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct DeviceCounterSample {
+    read: u64,
+    write: u64,
+    busy_millis: u64,
+}
+
+struct RawRateDeviceMetric {
+    name: String,
+    read_rate: f64,
+    write_rate: f64,
+    total_rate: f64,
+    utilization_percent: f64,
 }
 
 fn cpu_metric(previous: &mut Option<CpuSample>) -> PercentMetric {
@@ -236,10 +262,11 @@ fn rate_metric(
             detail: unavailable_detail.to_owned(),
             utilization_percent: None,
             utilization_label: "--".to_owned(),
+            devices: Vec::new(),
         };
     };
 
-    let (read_rate, write_rate, utilization_percent) = previous
+    let (read_rate, write_rate, device_rates) = previous
         .as_ref()
         .map(|old| {
             let elapsed = current
@@ -250,45 +277,87 @@ fn rate_metric(
             (
                 current.read.saturating_sub(old.read) as f64 / elapsed,
                 current.write.saturating_sub(old.write) as f64 / elapsed,
-                disk_busy_percent(old, &current, elapsed),
+                disk_rate_devices(old, &current, elapsed),
             )
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| (0.0, 0.0, Vec::new()));
     *previous = Some(current);
 
     let read_label = rate_label(read_rate);
     let write_label = rate_label(write_rate);
+    let utilization_percent = device_rates
+        .iter()
+        .map(|device| device.utilization_percent)
+        .reduce(f64::max);
     let utilization_label = utilization_percent
         .map(percent_label)
         .unwrap_or_else(|| "--".to_owned());
+    let devices = device_rates
+        .into_iter()
+        .map(|device| RateDeviceMetric {
+            name: device.name,
+            read_label: rate_label(device.read_rate),
+            write_label: rate_label(device.write_rate),
+            total_label: rate_label(device.total_rate),
+            utilization_percent: device.utilization_percent,
+            utilization_label: percent_label(device.utilization_percent),
+        })
+        .collect();
     RateMetric {
         read_label: read_label.clone(),
         write_label: write_label.clone(),
         detail: format!("{read_label_prefix} {read_label} · {write_label_prefix} {write_label}"),
         utilization_percent,
         utilization_label,
+        devices,
     }
 }
 
-fn disk_busy_percent(
+fn disk_rate_devices(
     old: &CounterSample,
     current: &CounterSample,
     elapsed_secs: f64,
-) -> Option<f64> {
-    if current.busy_millis_by_device.is_empty() || elapsed_secs <= 0.0 {
-        return None;
+) -> Vec<RawRateDeviceMetric> {
+    if current.devices.is_empty() || elapsed_secs <= 0.0 {
+        return Vec::new();
     }
 
     let elapsed_millis = elapsed_secs * 1000.0;
-    current
-        .busy_millis_by_device
+    let mut devices = current
+        .devices
         .iter()
-        .filter_map(|(device, current_busy)| {
-            let old_busy = old.busy_millis_by_device.get(device)?;
-            Some(current_busy.saturating_sub(*old_busy) as f64 / elapsed_millis * 100.0)
+        .filter_map(|(name, current_device)| {
+            let old_device = old.devices.get(name)?;
+            let read_rate =
+                current_device.read.saturating_sub(old_device.read) as f64 / elapsed_secs;
+            let write_rate =
+                current_device.write.saturating_sub(old_device.write) as f64 / elapsed_secs;
+            let utilization_percent = truncated_percent(
+                current_device
+                    .busy_millis
+                    .saturating_sub(old_device.busy_millis) as f64
+                    / elapsed_millis
+                    * 100.0,
+            );
+            Some(RawRateDeviceMetric {
+                name: name.to_owned(),
+                read_rate,
+                write_rate,
+                total_rate: read_rate + write_rate,
+                utilization_percent,
+            })
         })
-        .reduce(f64::max)
-        .map(truncated_percent)
+        .collect::<Vec<_>>();
+
+    devices.sort_by(|left, right| {
+        right
+            .utilization_percent
+            .total_cmp(&left.utilization_percent)
+            .then_with(|| right.total_rate.total_cmp(&left.total_rate))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    devices.truncate(20);
+    devices
 }
 
 #[cfg(target_os = "linux")]
@@ -407,7 +476,7 @@ fn read_disk_io_sample() -> Option<CounterSample> {
     let content = std::fs::read_to_string("/proc/diskstats").ok()?;
     let mut read = 0_u64;
     let mut write = 0_u64;
-    let mut busy_millis_by_device = HashMap::new();
+    let mut devices = HashMap::new();
 
     for line in content.lines() {
         let parts = line.split_whitespace().collect::<Vec<_>>();
@@ -421,15 +490,24 @@ fn read_disk_io_sample() -> Option<CounterSample> {
         let sectors_read = parts[5].parse::<u64>().unwrap_or_default();
         let sectors_written = parts[9].parse::<u64>().unwrap_or_default();
         let busy_millis = parts[12].parse::<u64>().unwrap_or_default();
-        read = read.saturating_add(sectors_read.saturating_mul(512));
-        write = write.saturating_add(sectors_written.saturating_mul(512));
-        busy_millis_by_device.insert(name.to_owned(), busy_millis);
+        let device_read = sectors_read.saturating_mul(512);
+        let device_write = sectors_written.saturating_mul(512);
+        read = read.saturating_add(device_read);
+        write = write.saturating_add(device_write);
+        devices.insert(
+            name.to_owned(),
+            DeviceCounterSample {
+                read: device_read,
+                write: device_write,
+                busy_millis,
+            },
+        );
     }
 
     Some(CounterSample {
         read,
         write,
-        busy_millis_by_device,
+        devices,
         sampled_at: Instant::now(),
     })
 }
@@ -482,7 +560,7 @@ fn read_network_sample() -> Option<CounterSample> {
     Some(CounterSample {
         read,
         write,
-        busy_millis_by_device: HashMap::new(),
+        devices: HashMap::new(),
         sampled_at: Instant::now(),
     })
 }
@@ -567,6 +645,32 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn counter_sample(
+        read: u64,
+        write: u64,
+        devices: Vec<(&str, u64, u64, u64)>,
+        sampled_at: Instant,
+    ) -> CounterSample {
+        CounterSample {
+            read,
+            write,
+            devices: devices
+                .into_iter()
+                .map(|(name, read, write, busy_millis)| {
+                    (
+                        name.to_owned(),
+                        DeviceCounterSample {
+                            read,
+                            write,
+                            busy_millis,
+                        },
+                    )
+                })
+                .collect(),
+            sampled_at,
+        }
+    }
+
     #[test]
     fn formats_byte_rates() {
         assert_eq!(rate_label(0.0), "0 B/s");
@@ -601,25 +705,21 @@ mod tests {
     #[test]
     fn rate_metric_formats_delta_and_updates_previous_sample() {
         let start = Instant::now();
-        let mut old_busy = HashMap::new();
-        old_busy.insert("sda".to_owned(), 100);
-        let mut current_busy = HashMap::new();
-        current_busy.insert("sda".to_owned(), 600);
-        let mut previous = Some(CounterSample {
-            read: 1_024,
-            write: 2_048,
-            busy_millis_by_device: old_busy,
-            sampled_at: start,
-        });
+        let mut previous = Some(counter_sample(
+            1_024,
+            2_048,
+            vec![("sda", 1_024, 2_048, 100)],
+            start,
+        ));
 
         let metric = rate_metric(
             &mut previous,
-            Some(CounterSample {
-                read: 3_072,
-                write: 4_096,
-                busy_millis_by_device: current_busy,
-                sampled_at: start + std::time::Duration::from_secs(2),
-            }),
+            Some(counter_sample(
+                3_072,
+                4_096,
+                vec![("sda", 3_072, 4_096, 600)],
+                start + std::time::Duration::from_secs(2),
+            )),
             "read",
             "write",
             "unavailable",
@@ -629,6 +729,9 @@ mod tests {
         assert_eq!(metric.write_label, "1.00 KB/s");
         assert_eq!(metric.utilization_percent, Some(25.0));
         assert_eq!(metric.utilization_label, "25.00%");
+        assert_eq!(metric.devices.len(), 1);
+        assert_eq!(metric.devices[0].name, "sda");
+        assert_eq!(metric.devices[0].total_label, "2.00 KB/s");
         assert_eq!(
             previous.as_ref().map(|sample| (sample.read, sample.write)),
             Some((3_072, 4_096))
@@ -644,52 +747,88 @@ mod tests {
         assert_eq!(metric.write_label, "--");
         assert_eq!(metric.detail, "unavailable");
         assert_eq!(metric.utilization_percent, None);
+        assert!(metric.devices.is_empty());
         assert!(previous.is_none());
     }
 
     #[test]
-    fn calculates_disk_busy_percent_without_rounding_up() {
-        let mut old_busy = HashMap::new();
-        old_busy.insert("sda".to_owned(), 1_000);
-        let old = CounterSample {
-            read: 0,
-            write: 0,
-            busy_millis_by_device: old_busy,
-            sampled_at: Instant::now(),
-        };
+    fn disk_rate_devices_calculates_busy_percent_without_rounding_up() {
+        let old = counter_sample(0, 0, vec![("sda", 0, 0, 1_000)], Instant::now());
+        let current = counter_sample(0, 0, vec![("sda", 0, 0, 2_000)], Instant::now());
+        let devices = disk_rate_devices(&old, &current, 3.0);
 
-        let mut current_busy = HashMap::new();
-        current_busy.insert("sda".to_owned(), 2_000);
-        let current = CounterSample {
-            read: 0,
-            write: 0,
-            busy_millis_by_device: current_busy,
-            sampled_at: Instant::now(),
-        };
-
-        assert_eq!(disk_busy_percent(&old, &current, 3.0), Some(33.33));
+        assert_eq!(devices[0].utilization_percent, 33.33);
     }
 
     #[test]
-    fn disk_busy_percent_handles_missing_devices_and_zero_elapsed() {
-        let mut old_busy = HashMap::new();
-        old_busy.insert("sda".to_owned(), 1_000);
+    fn disk_rate_devices_handle_missing_devices_and_zero_elapsed() {
+        let old = counter_sample(0, 0, vec![("sda", 0, 0, 1_000)], Instant::now());
+        let current = counter_sample(0, 0, vec![("vdb", 0, 0, 2_000)], Instant::now());
+
+        assert!(disk_rate_devices(&old, &current, 3.0).is_empty());
+        assert!(disk_rate_devices(&old, &current, 0.0).is_empty());
+    }
+
+    #[test]
+    fn disk_rate_devices_returns_top_20_by_busy_then_total_rate() {
+        let mut old_devices = HashMap::new();
+        let mut current_devices = HashMap::new();
+        for index in 0..25 {
+            let name = format!("sd{index:02}");
+            old_devices.insert(
+                name.clone(),
+                DeviceCounterSample {
+                    read: 0,
+                    write: 0,
+                    busy_millis: 0,
+                },
+            );
+            current_devices.insert(
+                name,
+                DeviceCounterSample {
+                    read: (index + 1) * 512,
+                    write: 0,
+                    busy_millis: (index + 1) * 10,
+                },
+            );
+        }
+        old_devices.insert(
+            "fast-tie".to_owned(),
+            DeviceCounterSample {
+                read: 0,
+                write: 0,
+                busy_millis: 0,
+            },
+        );
+        current_devices.insert(
+            "fast-tie".to_owned(),
+            DeviceCounterSample {
+                read: 16_384,
+                write: 16_384,
+                busy_millis: 250,
+            },
+        );
+
         let old = CounterSample {
             read: 0,
             write: 0,
-            busy_millis_by_device: old_busy,
+            devices: old_devices,
             sampled_at: Instant::now(),
         };
-
         let current = CounterSample {
             read: 0,
             write: 0,
-            busy_millis_by_device: HashMap::from([("vdb".to_owned(), 2_000)]),
+            devices: current_devices,
             sampled_at: Instant::now(),
         };
 
-        assert_eq!(disk_busy_percent(&old, &current, 3.0), None);
-        assert_eq!(disk_busy_percent(&old, &current, 0.0), None);
+        let devices = disk_rate_devices(&old, &current, 1.0);
+
+        assert_eq!(devices.len(), 20);
+        assert_eq!(devices[0].name, "fast-tie");
+        assert_eq!(devices[0].utilization_percent, 25.0);
+        assert_eq!(devices[1].name, "sd24");
+        assert_eq!(devices[19].name, "sd06");
     }
 
     #[cfg(target_os = "linux")]

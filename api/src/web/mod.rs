@@ -9017,6 +9017,7 @@ mod tests {
         assert!(payload["disk"]["mount_point"].is_string());
         assert!(payload["disk_rate"]["detail"].is_string());
         assert!(payload["disk_rate"]["utilization_label"].is_string());
+        assert!(payload["disk_rate"]["devices"].is_array());
         assert!(payload["network_rate"]["detail"].is_string());
     }
 

@@ -819,6 +819,73 @@
     });
   };
 
+  const appendTextElement = (parent, tagName, className, text) => {
+    const element = document.createElement(tagName);
+    if (className) {
+      element.className = className;
+    }
+    element.textContent = text == null || text === "" ? "--" : String(text);
+    parent.appendChild(element);
+    return element;
+  };
+
+  const renderDiskRateDevices = (panel, devices) => {
+    const container = panel.querySelector("[data-disk-rate-devices]");
+    if (!container) return;
+
+    container.replaceChildren();
+    if (!Array.isArray(devices) || devices.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "modal-empty-state";
+      appendTextElement(empty, "span", "", "暂无磁盘速率数据");
+      appendTextElement(empty, "p", "", "等待下一次资源采样，或当前系统不支持磁盘速率采集。");
+      container.appendChild(empty);
+      return;
+    }
+
+    devices.slice(0, 20).forEach((device, index) => {
+      const row = document.createElement("article");
+      row.className = "disk-rate-device-row";
+
+      appendTextElement(row, "span", "disk-rate-rank", `#${index + 1}`);
+
+      const nameCell = document.createElement("div");
+      nameCell.className = "disk-rate-device-name";
+      appendTextElement(nameCell, "strong", "", device.name);
+      appendTextElement(nameCell, "span", "", `总 ${device.total_label || "--"}`);
+      row.appendChild(nameCell);
+
+      const readCell = document.createElement("div");
+      readCell.className = "disk-rate-device-value";
+      appendTextElement(readCell, "span", "", "读");
+      appendTextElement(readCell, "strong", "", device.read_label);
+      row.appendChild(readCell);
+
+      const writeCell = document.createElement("div");
+      writeCell.className = "disk-rate-device-value";
+      appendTextElement(writeCell, "span", "", "写");
+      appendTextElement(writeCell, "strong", "", device.write_label);
+      row.appendChild(writeCell);
+
+      const busyCell = document.createElement("div");
+      busyCell.className = "disk-rate-device-busy";
+      const busyHeader = document.createElement("div");
+      appendTextElement(busyHeader, "span", "", "忙碌率");
+      appendTextElement(busyHeader, "strong", "", device.utilization_label);
+      busyCell.appendChild(busyHeader);
+      const bar = document.createElement("div");
+      bar.className = "metric-bar mini-metric-bar";
+      const fill = document.createElement("span");
+      const busyValue = Number(device.utilization_percent);
+      fill.style.width = `${Number.isFinite(busyValue) ? Math.max(0, Math.min(100, busyValue)) : 0}%`;
+      bar.appendChild(fill);
+      busyCell.appendChild(bar);
+      row.appendChild(busyCell);
+
+      container.appendChild(row);
+    });
+  };
+
   const updateHostMetricsPanel = (panel, payload) => {
     const metricKeys = [
       "cpu.percent_label",
@@ -844,6 +911,7 @@
     ].forEach((key) => {
       setHostMetricBar(panel, key, getPathValue(payload, key));
     });
+    renderDiskRateDevices(panel, getPathValue(payload, "disk_rate.devices"));
 
     const status = panel.querySelector("[data-host-metrics-status]");
     if (status) {
@@ -980,6 +1048,16 @@
   });
 
   document.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      const target = event.target instanceof Element ? event.target : null;
+      const openButton = target?.closest('[data-modal-target][role="button"]');
+      if (openButton) {
+        event.preventDefault();
+        openModal(openButton);
+        return;
+      }
+    }
+
     if (event.key !== "Escape") return;
 
     const openSelect = document.querySelector("[data-searchable-select][open]");
