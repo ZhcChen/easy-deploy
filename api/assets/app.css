@@ -983,8 +983,11 @@ td span,
 }
 
 .host-rate-modal-body {
-  max-height: calc(86vh - 76px);
-  overflow: auto;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1.2fr) minmax(0, 0.82fr);
+  gap: 14px;
+  min-height: 0;
+  overflow: hidden;
   padding: 16px 18px 18px;
 }
 
@@ -992,7 +995,6 @@ td span,
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(160px, 0.34fr);
   gap: 10px;
-  margin-bottom: 12px;
 }
 
 .disk-rate-modal-summary > div {
@@ -1026,8 +1028,9 @@ td span,
 
 .disk-rate-section {
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 9px;
-  margin-top: 14px;
+  min-height: 0;
 }
 
 .disk-rate-section-header {
@@ -1054,7 +1057,11 @@ td span,
 .disk-rate-device-list,
 .disk-rate-process-list {
   display: grid;
+  align-content: start;
   gap: 8px;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
 }
 
 .disk-rate-device-row,
@@ -2433,6 +2440,10 @@ tbody tr:last-child td {
   width: min(1180px, calc(100vw - 32px));
 }
 
+#disk-rate-modal {
+  height: min(760px, 86vh);
+}
+
 .modal-dialog::backdrop {
   background: rgba(15, 23, 42, 0.44);
   backdrop-filter: blur(3px);
@@ -2459,6 +2470,11 @@ tbody tr:last-child td {
   border-radius: inherit;
   background: #ffffff;
   box-shadow: 0 24px 70px rgba(24, 34, 51, 0.22);
+}
+
+#disk-rate-modal .modal-card {
+  height: 100%;
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .modal-header {

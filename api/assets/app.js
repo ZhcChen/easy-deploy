@@ -914,7 +914,6 @@
         ? `PID ${process.pid} · 容器 ${process.container_id}`
         : `PID ${process.pid}`;
       processCell.appendChild(meta);
-      appendTextElement(processCell, "small", "", process.command);
       row.appendChild(processCell);
 
       const readCell = document.createElement("div");
