@@ -533,6 +533,7 @@ pub struct ArtifactsTemplate<'a> {
     pub selected_kind: &'a str,
     pub selected_source: &'a str,
     pub query: &'a str,
+    pub notice: &'a str,
     pub uploaded_binary_releases_to_keep: usize,
     pub can_upload: bool,
 }
@@ -860,6 +861,7 @@ pub struct ArtifactPageRow {
     pub queue_id: Option<i64>,
     pub task_id: Option<i64>,
     pub can_publish_now: bool,
+    pub app_deploying: bool,
     pub can_schedule: bool,
     pub can_cancel_schedule: bool,
     pub can_cancel_queue: bool,

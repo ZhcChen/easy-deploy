@@ -58,6 +58,8 @@ const OSS_RELEASE_STORAGE_INTEGRITY_VERSION_PINNED: &str = "version_pinned";
 const LOCAL_RELEASE_STORAGE_INTEGRITY: &str = "local";
 pub const RELEASE_PACKAGE_PATTERN: &str = "{service_key}_version_{x_y_z}.tar.gz";
 pub const RELEASE_PACKAGE_EXAMPLE: &str = "orders-api-prod_version_1_2_3.tar.gz";
+pub(crate) const APP_DEPLOYMENT_IN_PROGRESS_MESSAGE: &str =
+    "当前应用正在部署流程中，请等待部署完成后再发布新版本";
 pub const BINARY_PACKAGE_PATTERN: &str = RELEASE_PACKAGE_PATTERN;
 pub const BINARY_PACKAGE_EXAMPLE: &str = RELEASE_PACKAGE_EXAMPLE;
 
@@ -8247,6 +8249,16 @@ impl AppService {
         let app = self.fetch_app_detail(release.app_id).await?;
         ensure_app_enabled(&app)?;
         self.ensure_compose_app(&app)?;
+        if self
+            .tasks
+            .active_app_task(release.app_id)
+            .await?
+            .is_some_and(|task| task.status == "running")
+        {
+            return Err(AppError::Conflict(
+                APP_DEPLOYMENT_IN_PROGRESS_MESSAGE.to_owned(),
+            ));
+        }
         if matches!(release.status.as_str(), "queued" | "deploying") {
             return Err(AppError::Conflict("该发布版本已经在发布队列中".to_owned()));
         }
@@ -15074,6 +15086,38 @@ mod tests {
             .expect("legacy release queue item");
 
         assert_eq!(queue.config_snapshot_id, Some(latest_snapshot.id));
+    }
+
+    #[tokio::test]
+    async fn manual_publish_rejects_when_same_app_deployment_is_running() {
+        let (apps, _db, _data_dir) = app_service().await;
+        let app_id = create_manual_compose_app(&apps, "orders-publish-guard").await;
+        let upload = upload_manual_release(&apps, app_id, "v1.2.3").await;
+        let task_id = apps
+            .tasks
+            .create_task(CreateTaskInput {
+                task_kind: "compose.up".to_owned(),
+                title: "正在部署旧版本".to_owned(),
+                app_id: Some(app_id),
+                release_id: None,
+                node_id: None,
+                created_by: "test".to_owned(),
+            })
+            .await
+            .expect("create active deployment task");
+        apps.tasks
+            .mark_running(task_id, "docker compose up", "deploy")
+            .await
+            .expect("mark deployment running");
+
+        let err = apps
+            .publish_release_now(upload.release_id, "admin")
+            .await
+            .expect_err("running deployment should block manual publish");
+
+        assert!(matches!(err, AppError::Conflict(_)));
+        assert_eq!(err.message(), APP_DEPLOYMENT_IN_PROGRESS_MESSAGE);
+        assert!(apps.list_app_release_queue().await.unwrap().is_empty());
     }
 
     #[tokio::test]

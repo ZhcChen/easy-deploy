@@ -3,6 +3,14 @@
 {% block title %}发布版本 - {{ product_name }}{% endblock %}
 
 {% block content %}
+{% if notice != "" %}
+<section class="panel" aria-live="polite">
+  <div class="empty-state">
+    <strong>{{ notice }}</strong>
+  </div>
+</section>
+{% endif %}
+
 <section class="summary-grid" aria-label="发布版本概览">
   {% for item in summary_items %}
     <article class="summary-card tone-{{ item.tone }}">
@@ -187,6 +195,8 @@
                       <input type="hidden" name="release_id" value="{{ artifact.id }}">
                       <button class="text-button" type="submit">立即发布</button>
                     </form>
+                  {% else if artifact.app_deploying %}
+                    <span class="badge tone-warning">当前应用正在部署流程中</span>
                   {% endif %}
                   {% if artifact.can_schedule %}
                     <form method="post" action="/artifacts/schedule" class="release-schedule-form">

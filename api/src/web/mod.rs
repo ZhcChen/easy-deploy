@@ -1,7 +1,7 @@
 mod templates;
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -23,13 +23,13 @@ use tracing::warn;
 use crate::{
     Settings,
     apps::{
-        AppDeployDiffStatus, AppError, AppService, BinaryPackageNameError,
-        CompleteReleasePackageUploadInput, ComposeTaskAction, CreateAppInput,
-        CreateReleasePackageUploadInput, RELEASE_PACKAGE_EXAMPLE, RELEASE_PACKAGE_PATTERN,
-        ServiceTargetNodeItem, UpdateAppConfigInput, UpdateAppMetadataInput,
-        UploadReleasePackageInput, artifact_metadata_value, normalize_deploy_strategy,
-        normalize_release_source, parse_release_package_name_for_service,
-        release_publish_mode_label,
+        APP_DEPLOYMENT_IN_PROGRESS_MESSAGE, AppDeployDiffStatus, AppError, AppService,
+        BinaryPackageNameError, CompleteReleasePackageUploadInput, ComposeTaskAction,
+        CreateAppInput, CreateReleasePackageUploadInput, RELEASE_PACKAGE_EXAMPLE,
+        RELEASE_PACKAGE_PATTERN, ServiceTargetNodeItem, UpdateAppConfigInput,
+        UpdateAppMetadataInput, UploadReleasePackageInput, artifact_metadata_value,
+        normalize_deploy_strategy, normalize_release_source,
+        parse_release_package_name_for_service, release_publish_mode_label,
     },
     auth::{
         API_TOKENS_MANAGE, API_TOKENS_VIEW, APPS_STATUS, APPS_VIEW, ARTIFACTS_UPLOAD,
@@ -899,6 +899,7 @@ struct ArtifactsQuery {
     kind: Option<String>,
     source: Option<String>,
     q: Option<String>,
+    notice: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1713,6 +1714,9 @@ async fn artifact_publish_now_submit(
             )
             .await;
             redirect("/artifacts")
+        }
+        Err(AppError::Conflict(message)) if message == APP_DEPLOYMENT_IN_PROGRESS_MESSAGE => {
+            redirect("/artifacts?notice=app-deploying")
         }
         Err(err) => app_error_response(err),
     }
@@ -3281,6 +3285,20 @@ async fn artifacts_page(
         Ok(queue) => queue,
         Err(err) => return app_error_response(err),
     };
+    let mut deploying_app_ids = BTreeSet::new();
+    for app_id in releases
+        .iter()
+        .map(|release| release.app_id)
+        .collect::<BTreeSet<_>>()
+    {
+        match state.tasks().active_app_task(app_id).await {
+            Ok(Some(task)) if task.status == "running" => {
+                deploying_app_ids.insert(app_id);
+            }
+            Ok(_) => {}
+            Err(err) => return task_error_response(err),
+        }
+    }
     let apps = match state.apps().list_apps().await {
         Ok(apps) => apps,
         Err(err) => return app_error_response(err),
@@ -3318,7 +3336,8 @@ async fn artifacts_page(
     let selected_status = normalize_artifact_status_filter(query.status.as_deref());
     let selected_kind = normalize_artifact_kind_filter(query.kind.as_deref());
     let selected_source = normalize_artifact_source_filter(query.source.as_deref());
-    let search_query = query.q.unwrap_or_default().trim().to_owned();
+    let search_query = query.q.as_deref().unwrap_or_default().trim().to_owned();
+    let notice = artifact_notice_message(query.notice.as_deref());
     let platform_config = match state.platform().config().await {
         Ok(config) => config,
         Err(err) => return platform_error_response(err),
@@ -3377,6 +3396,7 @@ async fn artifacts_page(
     let rows = filtered_releases
         .iter()
         .map(|release| {
+            let app_deploying = deploying_app_ids.contains(&release.app_id);
             let kind = if release.package_name.ends_with(".tar.gz")
                 || release.package_name.ends_with(".tgz")
             {
@@ -3442,7 +3462,9 @@ async fn artifacts_page(
                 task_id: active_queue.and_then(|item| item.task_id),
                 can_publish_now: session.can(SERVICES_DEPLOY)
                     && active_queue.is_none()
+                    && !app_deploying
                     && !matches!(release.status.as_str(), "deploying"),
+                app_deploying,
                 can_schedule: session.can(SERVICES_DEPLOY)
                     && active_queue.is_none()
                     && !matches!(release.status.as_str(), "deploying"),
@@ -3537,6 +3559,7 @@ async fn artifacts_page(
         selected_kind,
         selected_source,
         query: &search_query,
+        notice,
         uploaded_binary_releases_to_keep: platform_config.uploaded_binary_releases_to_keep,
         can_upload: session.can(ARTIFACTS_UPLOAD),
     })
@@ -5755,6 +5778,13 @@ fn release_source_label(source: &str) -> &'static str {
     match source {
         "manual" => "手动配置发布",
         _ => "版本包上传",
+    }
+}
+
+fn artifact_notice_message(notice: Option<&str>) -> &'static str {
+    match notice {
+        Some("app-deploying") => APP_DEPLOYMENT_IN_PROGRESS_MESSAGE,
+        _ => "",
     }
 }
 
@@ -9232,6 +9262,7 @@ mod tests {
         router: Router,
         auth: AuthService,
         apps: AppService,
+        tasks: TaskService,
         platform: PlatformConfigService,
         _data_dir: TempDir,
     }
@@ -9323,6 +9354,7 @@ mod tests {
         .await
         .expect("create app service");
         let apps_for_test = apps.clone();
+        let tasks_for_test = tasks.clone();
         let platform_for_test = platform.clone();
         TestWebApp {
             router: build_router(AppState::new(
@@ -9340,6 +9372,7 @@ mod tests {
             )),
             auth: auth_for_test,
             apps: apps_for_test,
+            tasks: tasks_for_test,
             platform: platform_for_test,
             _data_dir: data_dir,
         }
@@ -10939,6 +10972,119 @@ mod tests {
         assert!(html.contains("2026-06-09 18:00:00"));
         assert!(html.contains("计划 2026-06-23 15:30:00"));
         assert!(html.contains("action=\"/artifacts/schedule/cancel\""));
+    }
+
+    #[tokio::test]
+    async fn artifacts_page_blocks_publish_while_same_app_deployment_is_running() {
+        let app = test_web_app().await;
+        let app_id =
+            create_compose_test_app_with_mode(&app.apps, "orders-publish-guard", false).await;
+        let release = app
+            .apps
+            .upload_release_package(UploadReleasePackageInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: Some(1_002_003),
+                published_at: "2026-06-09T10:00:00Z".to_owned(),
+                file_name: "orders-publish-guard".to_owned(),
+                bytes: b"release blocked by active deployment".to_vec(),
+                entry_file: String::new(),
+                source: "route-test".to_owned(),
+            })
+            .await
+            .expect("upload release");
+        let task_id = app
+            .tasks
+            .create_task(crate::tasks::CreateTaskInput {
+                task_kind: "compose.up".to_owned(),
+                title: "正在部署旧版本".to_owned(),
+                app_id: Some(app_id),
+                release_id: None,
+                node_id: None,
+                created_by: "test".to_owned(),
+            })
+            .await
+            .expect("create deployment task");
+        app.tasks
+            .mark_running(task_id, "docker compose up", "deploy")
+            .await
+            .expect("mark deployment running");
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+
+        let page = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/artifacts")
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build page request"),
+            )
+            .await
+            .expect("load artifacts page");
+        assert_eq!(page.status(), StatusCode::OK);
+        let page_body = to_bytes(page.into_body(), usize::MAX)
+            .await
+            .expect("read page body");
+        let html = String::from_utf8_lossy(&page_body);
+        assert!(html.contains("当前应用正在部署流程中"));
+        assert!(!html.contains("action=\"/artifacts/publish\""));
+
+        let publish = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/artifacts/publish")
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={}&release_id={}",
+                        login.session.csrf_token, release.release_id
+                    )))
+                    .expect("build publish request"),
+            )
+            .await
+            .expect("submit publish request");
+        assert_eq!(publish.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            publish.headers().get(header::LOCATION),
+            Some(
+                &"/artifacts?notice=app-deploying"
+                    .parse()
+                    .expect("valid location")
+            )
+        );
+        assert!(app.apps.list_app_release_queue().await.unwrap().is_empty());
+
+        let notice_page = app
+            .router
+            .oneshot(
+                Request::builder()
+                    .uri("/artifacts?notice=app-deploying")
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build notice request"),
+            )
+            .await
+            .expect("load notice page");
+        let notice_body = to_bytes(notice_page.into_body(), usize::MAX)
+            .await
+            .expect("read notice body");
+        assert!(String::from_utf8_lossy(&notice_body).contains(APP_DEPLOYMENT_IN_PROGRESS_MESSAGE));
     }
 
     #[tokio::test]
