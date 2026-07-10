@@ -26,6 +26,7 @@ pub const MAX_ARTIFACT_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 const ARTIFACT_OBJECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const ARTIFACT_OBJECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const OSS_LIST_OBJECT_VERSIONS_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const OSS_LIST_OBJECT_VERSIONS_MAX_PAGES: usize = 1_000;
 const OSS_LIST_OBJECT_VERSIONS_MAX_KEYS: usize = 999;
 
@@ -552,9 +553,7 @@ impl ArtifactObjectVerifier for AliyunOssObjectVerifier {
                     response.status()
                 )));
             }
-            let response_text = response.text().await.map_err(|err| {
-                ArtifactStorageError::Internal(format!("读取 OSS 对象版本列表响应失败: {err}"))
-            })?;
+            let response_text = read_oss_list_versions_response(response).await?;
             let page = parse_oss_object_versions_page(&response_text)?;
             listed_versions.extend(
                 page.versions
@@ -658,6 +657,56 @@ fn parse_oss_object_versions_page(
         versions: response.versions,
         delete_markers: response.delete_markers,
     })
+}
+
+async fn read_oss_list_versions_response(
+    mut response: reqwest::Response,
+) -> Result<String, ArtifactStorageError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > OSS_LIST_OBJECT_VERSIONS_MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(ArtifactStorageError::Internal(
+            "OSS 对象版本列表响应超过 8 MiB 上限".to_owned(),
+        ));
+    }
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(OSS_LIST_OBJECT_VERSIONS_MAX_RESPONSE_BYTES);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await.map_err(|err| {
+        ArtifactStorageError::Internal(format!("读取 OSS 对象版本列表响应失败: {err}"))
+    })? {
+        append_bounded_oss_response_chunk(
+            &mut body,
+            &chunk,
+            OSS_LIST_OBJECT_VERSIONS_MAX_RESPONSE_BYTES,
+        )?;
+    }
+    String::from_utf8(body).map_err(|_| {
+        ArtifactStorageError::Internal("OSS 对象版本列表响应不是有效 UTF-8".to_owned())
+    })
+}
+
+fn append_bounded_oss_response_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> Result<(), ArtifactStorageError> {
+    let next_size = body
+        .len()
+        .checked_add(chunk.len())
+        .ok_or_else(|| ArtifactStorageError::Internal("OSS 对象版本列表响应大小溢出".to_owned()))?;
+    if next_size > max_bytes {
+        return Err(ArtifactStorageError::Internal(format!(
+            "OSS 对象版本列表响应超过 {} 字节上限",
+            max_bytes
+        )));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn artifact_object_version_from_list_item(
@@ -1157,6 +1206,19 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn oss_version_list_response_enforces_streaming_size_limit() {
+        let mut body = b"abc".to_vec();
+        append_bounded_oss_response_chunk(&mut body, b"d", 4)
+            .expect("response remains within limit");
+        assert_eq!(body, b"abcd");
+
+        let err = append_bounded_oss_response_chunk(&mut body, b"e", 4)
+            .expect_err("response exceeding limit must fail");
+        assert!(err.message().contains("4"));
+        assert_eq!(body, b"abcd");
     }
 
     #[test]

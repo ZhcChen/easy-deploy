@@ -687,7 +687,7 @@ async fn cleanup_release_upload_object(
     artifact_object_verifier: &dyn ArtifactObjectVerifier,
     upload_id: &str,
 ) -> Result<(), AppError> {
-    let claimed = sqlx::query(
+    let upload = sqlx::query_as::<_, ReleaseUploadCleanupRecord>(
         r#"
         UPDATE app_release_uploads
         SET cleanup_started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
@@ -699,25 +699,15 @@ async fn cleanup_release_upload_object(
           AND cleanup_completed_at IS NULL
           AND cleanup_started_at IS NULL
           AND julianday(object_cleanup_at) <= julianday('now')
+        RETURNING id, object_key, bucket, endpoint
         "#,
     )
     .bind(upload_id)
-    .execute(db)
+    .fetch_optional(db)
     .await?;
-    if claimed.rows_affected() == 0 {
+    let Some(upload) = upload else {
         return Ok(());
-    }
-
-    let upload = sqlx::query_as::<_, ReleaseUploadCleanupRecord>(
-        r#"
-        SELECT id, object_key, bucket, endpoint
-        FROM app_release_uploads
-        WHERE id = ?1
-        "#,
-    )
-    .bind(upload_id)
-    .fetch_one(db)
-    .await?;
+    };
     let cleanup_result = async {
         let platform_config = platform.config().await?;
         let mut oss = platform_config.artifact_storage.aliyun_oss;
