@@ -159,7 +159,8 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
             .with_ssh_known_hosts_file(ssh_known_hosts_file(&settings.data_dir)),
         tasks.clone(),
         platform.clone(),
-    );
+    )
+    .await?;
     let listener = TcpListener::bind(settings.bind)
         .await
         .with_context(|| format!("bind {}", settings.bind))?;

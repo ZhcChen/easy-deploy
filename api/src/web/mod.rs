@@ -3175,8 +3175,8 @@ async fn task_cancel_submit(
         return forbidden();
     }
     match state
-        .tasks()
-        .cancel_queued(task_id, &session.account.username)
+        .apps()
+        .cancel_queued_task(task_id, &session.account.username)
         .await
     {
         Ok(()) => {
@@ -3191,7 +3191,7 @@ async fn task_cancel_submit(
             .await;
             redirect(&format!("/tasks/{task_id}"))
         }
-        Err(err) => task_error_response(err),
+        Err(err) => app_error_response(err),
     }
 }
 
@@ -9287,7 +9287,9 @@ mod tests {
                 .with_ssh_known_hosts_file(crate::deploy::ssh_known_hosts_file(data_dir.path())),
             tasks.clone(),
             platform.clone(),
-        );
+        )
+        .await
+        .expect("create app service");
         let apps_for_test = apps.clone();
         let platform_for_test = platform.clone();
         TestWebApp {

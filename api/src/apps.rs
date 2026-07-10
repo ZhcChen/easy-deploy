@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, File},
     net::TcpListener,
     path::{Path, PathBuf},
@@ -496,6 +497,19 @@ async fn release_schedule_worker(db: SqlitePool, sender: mpsc::Sender<i64>) {
 struct DueScheduledQueueRow {
     id: i64,
     app_id: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct InterruptedTaskRow {
+    id: i64,
+    app_id: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct InterruptedReleaseQueueRow {
+    id: i64,
+    app_id: i64,
+    release_id: i64,
 }
 
 async fn enqueue_due_scheduled_releases(db: &SqlitePool) -> Result<Vec<i64>, AppError> {
@@ -7092,14 +7106,14 @@ struct NormalizeBinaryConfigInput<'a> {
 }
 
 impl AppService {
-    pub fn new(
+    pub async fn new(
         db: SqlitePool,
         runtime_fs: RuntimeFs,
         compose: ComposeExecutor,
         systemd: SystemdExecutor,
         tasks: TaskService,
         platform: PlatformConfigService,
-    ) -> Self {
+    ) -> Result<Self, AppError> {
         let compose_queue = ComposeTaskQueue::start(
             db.clone(),
             runtime_fs.clone(),
@@ -7121,7 +7135,7 @@ impl AppService {
             tasks.clone(),
             compose_queue.clone(),
         );
-        Self {
+        let service = Self {
             db,
             runtime_fs,
             compose,
@@ -7131,7 +7145,141 @@ impl AppService {
             binary_queue,
             release_dispatch_queue,
             platform,
+        };
+        service.recover_interrupted_work().await?;
+        Ok(service)
+    }
+
+    async fn recover_interrupted_work(&self) -> Result<(), AppError> {
+        const RECOVERY_MESSAGE: &str =
+            "控制台重启时发现未完成任务，执行结果未知；请检查目标节点后重新发起部署";
+
+        let mut tx = self.db.begin().await?;
+        let interrupted_tasks = sqlx::query_as::<_, InterruptedTaskRow>(
+            r#"
+            SELECT id, app_id
+            FROM operation_tasks
+            WHERE status IN ('queued', 'running')
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let interrupted_queues = sqlx::query_as::<_, InterruptedReleaseQueueRow>(
+            r#"
+            SELECT q.id, q.app_id, q.release_id
+            FROM app_release_queue q
+            LEFT JOIN operation_tasks t ON t.id = q.task_id
+            WHERE q.status = 'running'
+               OR (q.status = 'queued' AND t.status IN ('queued', 'running'))
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut affected_app_ids = BTreeSet::new();
+        for task in &interrupted_tasks {
+            if let Some(app_id) = task.app_id {
+                affected_app_ids.insert(app_id);
+            }
+            sqlx::query(
+                r#"
+                UPDATE operation_tasks
+                SET status = 'failed',
+                    phase = 'failed',
+                    summary = ?2,
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                  AND status IN ('queued', 'running')
+                "#,
+            )
+            .bind(task.id)
+            .bind(RECOVERY_MESSAGE)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                UPDATE operation_task_phases
+                SET status = 'failed',
+                    summary = ?2,
+                    finished_at = COALESCE(finished_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE task_id = ?1
+                  AND status IN ('pending', 'running')
+                "#,
+            )
+            .bind(task.id)
+            .bind(RECOVERY_MESSAGE)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO operation_task_logs(task_id, stream, content) VALUES (?1, 'system', ?2)",
+            )
+            .bind(task.id)
+            .bind(RECOVERY_MESSAGE)
+            .execute(&mut *tx)
+            .await?;
         }
+
+        for queue in &interrupted_queues {
+            affected_app_ids.insert(queue.app_id);
+            sqlx::query(
+                r#"
+                UPDATE app_release_queue
+                SET status = 'failed',
+                    message = ?2,
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                  AND status IN ('queued', 'running')
+                "#,
+            )
+            .bind(queue.id)
+            .bind(RECOVERY_MESSAGE)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                UPDATE app_releases
+                SET status = 'failed',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                "#,
+            )
+            .bind(queue.release_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+
+        for app_id in affected_app_ids {
+            update_runtime_states_best_effort(RuntimeStatesUpdate {
+                db: &self.db,
+                app_id,
+                runtime_status: "unknown",
+                service_count: None,
+                active_version: None,
+                message: RECOVERY_MESSAGE,
+                task_id: None,
+                touch_deploy_time: false,
+            })
+            .await;
+        }
+
+        let queued_app_ids = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT DISTINCT app_id
+            FROM app_release_queue
+            WHERE status = 'queued'
+            ORDER BY app_id
+            "#,
+        )
+        .fetch_all(&self.db)
+        .await?;
+        for app_id in queued_app_ids {
+            self.enqueue_release_dispatch(app_id).await?;
+        }
+        Ok(())
     }
 
     pub async fn list_apps(&self) -> Result<Vec<AppListItem>, AppError> {
@@ -7960,6 +8108,70 @@ impl AppService {
         tx.commit().await?;
         self.enqueue_release_dispatch(queue.0).await?;
         Ok(queue.0)
+    }
+
+    pub async fn cancel_queued_task(&self, task_id: i64, actor: &str) -> Result<(), AppError> {
+        let task = self.tasks.task_detail(task_id).await?;
+        self.tasks.cancel_queued(task_id, actor).await?;
+
+        let cancellation_message = format!("{actor} 取消了尚未开始执行的发布任务");
+        let mut tx = self.db.begin().await?;
+        let queue = sqlx::query_as::<_, (i64, i64, i64)>(
+            r#"
+            SELECT id, app_id, release_id
+            FROM app_release_queue
+            WHERE task_id = ?1
+              AND status IN ('queued', 'running')
+            LIMIT 1
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((queue_id, _app_id, release_id)) = queue {
+            sqlx::query(
+                r#"
+                UPDATE app_release_queue
+                SET status = 'canceled',
+                    message = ?2,
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                  AND status IN ('queued', 'running')
+                "#,
+            )
+            .bind(queue_id)
+            .bind(&cancellation_message)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                UPDATE app_releases
+                SET status = 'received',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                "#,
+            )
+            .bind(release_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+
+        if let Some(app_id) = task.app_id {
+            update_runtime_states_best_effort(RuntimeStatesUpdate {
+                db: &self.db,
+                app_id,
+                runtime_status: "unknown",
+                service_count: None,
+                active_version: None,
+                message: "任务已取消，未执行部署",
+                task_id: Some(task_id),
+                touch_deploy_time: false,
+            })
+            .await;
+        }
+        Ok(())
     }
 
     async fn resolve_release_snapshot_id(
@@ -12387,7 +12599,9 @@ mod tests {
             SystemdExecutor::new(runner),
             tasks,
             platform,
-        );
+        )
+        .await
+        .expect("create app service");
         (apps, db, data_dir)
     }
 
@@ -12810,6 +13024,172 @@ mod tests {
             .expect_err("missing queue should fail");
         assert!(matches!(missing, AppError::InvalidInput(_)));
         assert!(missing.message().contains("发布队列项不存在"));
+    }
+
+    #[tokio::test]
+    async fn canceling_dispatched_release_task_cancels_its_queue_and_resets_runtime_state() {
+        let (apps, db, _data_dir) = app_service().await;
+        let app_id = create_manual_compose_app(&apps, "orders-cancel-dispatched").await;
+        let upload = upload_manual_release(&apps, app_id, "v1.2.3").await;
+        let task_id = apps
+            .tasks
+            .create_task(CreateTaskInput {
+                task_kind: "release.deploy".to_owned(),
+                title: "发布版本 orders-cancel-dispatched".to_owned(),
+                app_id: Some(app_id),
+                release_id: Some(upload.release_id),
+                node_id: None,
+                created_by: "release-queue".to_owned(),
+            })
+            .await
+            .expect("create queued release task");
+        let queue_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO app_release_queue(
+                app_id,
+                release_id,
+                config_snapshot_id,
+                queue_seq,
+                status,
+                triggered_by,
+                message,
+                task_id,
+                started_at
+            )
+            VALUES (?1, ?2, ?3, 1, 'running', 'release-queue', '已派发，等待 worker', ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            RETURNING id
+            "#,
+        )
+        .bind(app_id)
+        .bind(upload.release_id)
+        .bind(upload.config_snapshot_id)
+        .bind(task_id)
+        .fetch_one(&db)
+        .await
+        .expect("create dispatched queue item");
+        sqlx::query(
+            "UPDATE app_runtime_states SET runtime_status = 'deploying', message = '等待 worker' WHERE app_id = ?1",
+        )
+        .bind(app_id)
+        .execute(&db)
+        .await
+        .expect("mark runtime deploying");
+
+        apps.cancel_queued_task(task_id, "admin")
+            .await
+            .expect("cancel dispatched release task");
+
+        let task = apps.tasks.task_detail(task_id).await.expect("load task");
+        assert_eq!(task.status, "canceled");
+        let queue = apps
+            .list_app_release_queue()
+            .await
+            .expect("list release queue")
+            .into_iter()
+            .find(|item| item.id == queue_id)
+            .expect("canceled queue item");
+        assert_eq!(queue.status, "canceled");
+        let release = apps
+            .list_app_releases()
+            .await
+            .expect("list releases")
+            .into_iter()
+            .find(|item| item.id == upload.release_id)
+            .expect("release after cancellation");
+        assert_eq!(release.status, "received");
+        let runtime_status = sqlx::query_scalar::<_, String>(
+            "SELECT runtime_status FROM app_runtime_states WHERE app_id = ?1",
+        )
+        .bind(app_id)
+        .fetch_one(&db)
+        .await
+        .expect("load runtime state");
+        assert_eq!(runtime_status, "unknown");
+    }
+
+    #[tokio::test]
+    async fn recovery_marks_interrupted_release_work_failed_and_releases_the_app_lock() {
+        let (apps, db, _data_dir) = app_service().await;
+        let app_id = create_manual_compose_app(&apps, "orders-recovery").await;
+        let upload = upload_manual_release(&apps, app_id, "v1.2.3").await;
+        let task_id = apps
+            .tasks
+            .create_task(CreateTaskInput {
+                task_kind: "release.deploy".to_owned(),
+                title: "发布版本 orders-recovery".to_owned(),
+                app_id: Some(app_id),
+                release_id: Some(upload.release_id),
+                node_id: None,
+                created_by: "release-queue".to_owned(),
+            })
+            .await
+            .expect("create interrupted task");
+        apps.tasks
+            .mark_running(task_id, "部署前预检", "preflight")
+            .await
+            .expect("mark task running");
+        sqlx::query(
+            r#"
+            INSERT INTO app_release_queue(
+                app_id,
+                release_id,
+                config_snapshot_id,
+                queue_seq,
+                status,
+                triggered_by,
+                message,
+                task_id,
+                started_at
+            )
+            VALUES (?1, ?2, ?3, 1, 'running', 'release-queue', '执行中', ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            "#,
+        )
+        .bind(app_id)
+        .bind(upload.release_id)
+        .bind(upload.config_snapshot_id)
+        .bind(task_id)
+        .execute(&db)
+        .await
+        .expect("create interrupted queue item");
+        sqlx::query(
+            "UPDATE app_runtime_states SET runtime_status = 'deploying', message = '执行中' WHERE app_id = ?1",
+        )
+        .bind(app_id)
+        .execute(&db)
+        .await
+        .expect("mark runtime deploying");
+
+        apps.recover_interrupted_work()
+            .await
+            .expect("recover interrupted work");
+
+        let task = apps.tasks.task_detail(task_id).await.expect("load task");
+        assert_eq!(task.status, "failed");
+        assert!(task.summary.contains("控制台重启"));
+        let queue = apps
+            .list_app_release_queue()
+            .await
+            .expect("list release queue")
+            .into_iter()
+            .find(|item| item.release_id == upload.release_id)
+            .expect("interrupted queue item");
+        assert_eq!(queue.status, "failed");
+        let release = apps
+            .list_app_releases()
+            .await
+            .expect("list releases")
+            .into_iter()
+            .find(|item| item.id == upload.release_id)
+            .expect("interrupted release");
+        assert_eq!(release.status, "failed");
+        let runtime_status = sqlx::query_scalar::<_, String>(
+            "SELECT runtime_status FROM app_runtime_states WHERE app_id = ?1",
+        )
+        .bind(app_id)
+        .fetch_one(&db)
+        .await
+        .expect("load recovered runtime state");
+        assert_eq!(runtime_status, "unknown");
     }
 
     #[tokio::test]

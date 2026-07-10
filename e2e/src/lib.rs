@@ -168,7 +168,8 @@ pub async fn smoke_test() -> anyhow::Result<()> {
         SystemdExecutor::new(command_runner.clone()),
         tasks.clone(),
         platform.clone(),
-    );
+    )
+    .await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let settings = Settings {
