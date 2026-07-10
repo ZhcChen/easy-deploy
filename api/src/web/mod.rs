@@ -8076,7 +8076,7 @@ fn openapi_spec() -> serde_json::Value {
                 "post": {
                     "operationId": "createServicePackageUpload",
                     "summary": "申请版本包 OSS 直传地址",
-                    "description": "校验服务标识和包名后，返回一次性 OSS PUT 签名 URL。此接口不会创建 release，也不会触发发布；调用方必须先把文件 PUT 到返回的 upload.url，再调用 complete 接口登记。",
+                    "description": "校验服务标识和包名后，返回一次性 OSS PUT 签名 URL。调用方必须携带 upload.headers 的全部请求头；此接口不会创建 release，也不会触发发布。调用方先把文件 PUT 到 upload.url，再调用 complete 接口登记；若 OSS 返回对象版本号，平台会在完成校验后绑定该版本号，并在部署时签名下载已校验版本。",
                     "parameters": [{ "$ref": "#/components/parameters/ServiceKey" }],
                     "requestBody": {
                         "required": true,
@@ -8115,7 +8115,7 @@ fn openapi_spec() -> serde_json::Value {
                 "post": {
                     "operationId": "completeServicePackageUpload",
                     "summary": "完成版本包上传登记",
-                    "description": "调用方完成 OSS PUT 后，提交 SHA-256 和文件大小。平台登记 release、保存配置快照，并按应用的发布设置决定是否自动进入串行发布队列。",
+                    "description": "调用方完成 OSS PUT 后，提交 SHA-256 和文件大小作为断言；平台会重新读取 OSS 对象并计算 SHA-256 和字节数，只有两者一致才登记 release。当前单个对象上限为 5 GiB。断言不一致时不会消费上传会话，调用方可使用正确值重试。随后平台保存配置快照，并按应用的发布设置决定是否自动进入串行发布队列。",
                     "parameters": [
                         { "$ref": "#/components/parameters/ServiceKey" },
                         {
@@ -8266,8 +8266,8 @@ fn openapi_spec() -> serde_json::Value {
                     "type": "object",
                     "required": ["checksum_sha256", "size_bytes"],
                     "properties": {
-                        "checksum_sha256": { "type": "string", "description": "上传文件的 64 位 SHA-256 hex。兼容 checksumSha256。" },
-                        "size_bytes": { "type": "integer", "description": "上传文件字节数。兼容 sizeBytes。" },
+                        "checksum_sha256": { "type": "string", "description": "上传文件的 64 位 SHA-256 hex，作为服务端 OSS 校验结果的断言；断言不一致时可用正确值重试。兼容 checksumSha256。" },
+                        "size_bytes": { "type": "integer", "description": "上传文件字节数，作为服务端 OSS 校验结果的断言；断言不一致时可用正确值重试。兼容 sizeBytes。" },
                         "published_at": { "type": "string", "description": "可选，覆盖申请上传地址时的 published_at。兼容 publishedAt。" },
                         "source": { "type": "string", "description": "可选，覆盖申请上传地址时的来源标记。" }
                     }
@@ -8420,13 +8420,15 @@ orders-api-prod_version_v1.2.3.tar.gz</code></pre>
           <ol>
             <li>调用 <code>POST /api/v1/services/{service_key}/packages/uploads</code>，拿到 OSS <code>PUT</code> 签名 URL。</li>
             <li>按返回的 <code>upload.method</code>、<code>upload.url</code> 和 <code>upload.headers</code> 把版本包直传 OSS。</li>
-            <li>计算本地文件 SHA-256 和字节数，调用 complete 接口完成登记。</li>
+            <li>计算本地文件 SHA-256 和字节数作为断言，调用 complete 接口；平台会重新读取 OSS 对象复核。</li>
             <li>如果应用开启“自动上传即入队”，平台会把 release 加入串行发布队列；否则在发布版本页手动或定时发布。</li>
           </ol>
         </section>
         <section id="api-create">
           <h2>申请上传地址</h2>
           <div class="endpoint"><span class="method">POST</span><code>/api/v1/services/{service_key}/packages/uploads</code></div>
+          <p>若 OSS 返回可固定的对象版本号，完成登记时平台会保存它；后续部署会签名下载该已验证版本。若返回 <code>null</code>，说明 Bucket 可能处于暂停版本控制状态，平台会拒绝完成登记；请调整 Bucket 配置后重新申请并上传版本包。</p>
+          <p>平台配置的 AccessKey 需要具备对应 Bucket 的 <code>oss:PutObject</code>、<code>oss:GetObject</code>、<code>oss:DeleteObject</code> 和 <code>oss:ListObjectVersions</code> 权限；开启版本控制时还需具备 <code>oss:GetObjectVersion</code> 和 <code>oss:DeleteObjectVersion</code>，并为未完成上传路径配置版本生命周期清理。</p>
           <pre><code>Authorization: Bearer &lt;API_TOKEN&gt;
 Content-Type: application/json</code></pre>
           <div class="grid">
@@ -8444,10 +8446,10 @@ Content-Type: application/json</code></pre>
         <section id="api-complete">
           <h2>完成登记</h2>
           <div class="endpoint"><span class="method">POST</span><code>/api/v1/services/{service_key}/packages/uploads/{upload_id}/complete</code></div>
-          <p>只有 OSS PUT 成功后才调用。平台会登记 release、记录配置快照，并按应用发布策略处理入队。</p>
+          <p>只有 OSS PUT 成功后才调用。平台会重新读取对象并校验 SHA-256 和字节数一致后，才登记 release、记录配置快照，并按应用发布策略处理入队；单个对象上限为 5 GiB。断言填错时可用正确值重试同一个上传会话。</p>
           <div class="grid">
-            <div class="field"><strong><code>checksum_sha256</code> 必填</strong>64 位 SHA-256 hex。兼容 <code>checksumSha256</code>。</div>
-            <div class="field"><strong><code>size_bytes</code> 必填</strong>上传文件字节数。兼容 <code>sizeBytes</code>。</div>
+            <div class="field"><strong><code>checksum_sha256</code> 必填</strong>64 位 SHA-256 hex，作为 OSS 复核结果的断言。兼容 <code>checksumSha256</code>。</div>
+            <div class="field"><strong><code>size_bytes</code> 必填</strong>上传文件字节数，作为 OSS 复核结果的断言。兼容 <code>sizeBytes</code>。</div>
             <div class="field"><strong><code>published_at</code> 可选</strong>覆盖申请上传地址时的发布时间。</div>
             <div class="field"><strong><code>source</code> 可选</strong>覆盖申请上传地址时的来源标记。</div>
           </div>
@@ -8473,6 +8475,7 @@ UPLOAD_ID="$(printf '%s' "$CREATE_JSON" | jq -r '.data.upload_id')"
 
 curl -fsS -X PUT "$UPLOAD_URL" \
   -H "Content-Type: application/octet-stream" \
+  -H "x-oss-forbid-overwrite: true" \
   --data-binary "@$PACKAGE"
 
 curl -fsS -X POST "$EASY_DEPLOY_URL/api/v1/services/$SERVICE_KEY/packages/uploads/$UPLOAD_ID/complete" \
@@ -8483,6 +8486,7 @@ curl -fsS -X POST "$EASY_DEPLOY_URL/api/v1/services/$SERVICE_KEY/packages/upload
         <section id="legacy">
           <h2>兼容接口</h2>
           <p>旧脚本仍可使用 <code>POST /api/v1/services/{service_key}/packages</code> 以 <code>multipart/form-data</code> 直接上传到平台。新项目建议使用 OSS 直传，避免大文件经过 easy-deploy 进程。</p>
+          <p>升级前登记且未保存对象版本号的 OSS 制品会被标记为历史未绑定制品，平台会阻止其部署以避免下载被改写的对象；请使用当前直传流程重新上传相同版本或新的版本。</p>
         </section>
         <section id="errors">
           <h2>错误处理</h2>
@@ -9211,6 +9215,7 @@ mod tests {
 
     use crate::{
         apps::{AppService, CreateAppInput, UploadBinaryArtifactInput},
+        artifact_storage::{ArtifactObjectVerifier, ArtifactStorageError, VerifiedArtifactObject},
         auth::{AuthService, MemorySessionStore},
         deploy::{
             CommandResult, CommandRunner, CommandSpec, ComposeExecutor, DeployError,
@@ -9232,6 +9237,32 @@ mod tests {
     }
 
     struct WebTestCommandRunner;
+
+    struct WebTestArtifactObjectVerifier;
+
+    #[async_trait]
+    impl ArtifactObjectVerifier for WebTestArtifactObjectVerifier {
+        async fn verify(
+            &self,
+            _config: &crate::artifact_storage::AliyunOssConfig,
+            _object_key: &str,
+        ) -> Result<VerifiedArtifactObject, ArtifactStorageError> {
+            Ok(VerifiedArtifactObject {
+                checksum_sha256: "a".repeat(64),
+                size_bytes: 12,
+                version_id: Some("web-test-version".to_owned()),
+            })
+        }
+
+        async fn delete(
+            &self,
+            _config: &crate::artifact_storage::AliyunOssConfig,
+            _object_key: &str,
+            _version_id: Option<&str>,
+        ) -> Result<(), ArtifactStorageError> {
+            Ok(())
+        }
+    }
 
     #[async_trait]
     impl CommandRunner for WebTestCommandRunner {
@@ -9279,7 +9310,7 @@ mod tests {
         let nodes =
             NodeService::new_with_data_dir(db.clone(), command_runner.clone(), data_dir.path());
         let node_credentials = NodeCredentialService::new(db.clone(), data_dir.path());
-        let apps = AppService::new(
+        let apps = AppService::new_with_artifact_object_verifier(
             db.clone(),
             RuntimeFs::new(data_dir.path()),
             ComposeExecutor::new(command_runner.clone()),
@@ -9287,6 +9318,7 @@ mod tests {
                 .with_ssh_known_hosts_file(crate::deploy::ssh_known_hosts_file(data_dir.path())),
             tasks.clone(),
             platform.clone(),
+            Arc::new(WebTestArtifactObjectVerifier),
         )
         .await
         .expect("create app service");
@@ -9923,6 +9955,10 @@ mod tests {
             payload["data"]["upload"]["headers"]["Content-Type"],
             "application/octet-stream"
         );
+        assert_eq!(
+            payload["data"]["upload"]["headers"]["x-oss-forbid-overwrite"],
+            "true"
+        );
         assert!(
             payload["data"]["upload"]["url"]
                 .as_str()
@@ -9933,6 +9969,12 @@ mod tests {
             .as_str()
             .expect("upload id")
             .to_owned();
+        assert!(
+            payload["data"]["object_key"]
+                .as_str()
+                .expect("object key")
+                .contains(&format!("/uploads/{upload_id}/"))
+        );
 
         let response = app
             .router

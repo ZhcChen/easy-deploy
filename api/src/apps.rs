@@ -3,6 +3,7 @@ use std::{
     fs::{self, File},
     net::TcpListener,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -17,7 +18,7 @@ use sqlx::SqlitePool;
 use tar::Archive;
 use tokio::{
     net::TcpStream,
-    sync::mpsc,
+    sync::{Semaphore, mpsc},
     time::{self, MissedTickBehavior},
 };
 use tracing::{error, warn};
@@ -25,8 +26,9 @@ use url::Url;
 
 use crate::{
     artifact_storage::{
-        ArtifactStorageError, STORAGE_PROVIDER_ALIYUN_OSS, STORAGE_PROVIDER_LOCAL,
-        normalize_checksum_sha256,
+        AliyunOssObjectVerifier, ArtifactObjectVerifier, ArtifactStorageError,
+        STORAGE_PROVIDER_ALIYUN_OSS, STORAGE_PROVIDER_LOCAL, normalize_checksum_sha256,
+        normalize_object_version_id,
     },
     deploy::{
         ComposeCommandOutput, ComposeExecutor, DeployError, SshExecutor, SshTarget, SystemdExecutor,
@@ -38,7 +40,8 @@ use crate::{
         CLEANUP_SCRIPT_FILE_NAME, CURRENT_RELEASE_FILE_NAME, DEPLOY_STAGE_SCRIPT_FILE_NAME,
         DeployScriptSet, META_DIR_NAME, POST_DEPLOY_SCRIPT_FILE_NAME, PRE_DEPLOY_SCRIPT_FILE_NAME,
         RELEASES_DIR_NAME, ReleaseRuntimeMetadata, RuntimeFs, RuntimeFsError, SCRIPTS_DIR_NAME,
-        SWITCH_TRAFFIC_SCRIPT_FILE_NAME, SYSTEMD_DIR_NAME, TargetNodeMetadata,
+        SWITCH_TRAFFIC_SCRIPT_FILE_NAME, SYSTEMD_DIR_NAME, StagedReleasePackage,
+        TargetNodeMetadata,
     },
     tasks::{
         CreateTaskInput, RecordDeploymentRunInput, StartTaskStepInput, TaskError,
@@ -48,6 +51,11 @@ use crate::{
 
 const COMPOSE_TASK_QUEUE_CAPACITY: usize = 100;
 const MIN_COMPOSE_FREE_SPACE_BYTES: u64 = 512 * 1024 * 1024;
+const ARTIFACT_VERIFICATION_CONCURRENCY: usize = 2;
+const OSS_RELEASE_STORAGE_INTEGRITY_LEGACY: &str = "legacy";
+const OSS_RELEASE_STORAGE_INTEGRITY_UNIQUE_KEY: &str = "unique_key";
+const OSS_RELEASE_STORAGE_INTEGRITY_VERSION_PINNED: &str = "version_pinned";
+const LOCAL_RELEASE_STORAGE_INTEGRITY: &str = "local";
 pub const RELEASE_PACKAGE_PATTERN: &str = "{service_key}_version_{x_y_z}.tar.gz";
 pub const RELEASE_PACKAGE_EXAMPLE: &str = "orders-api-prod_version_1_2_3.tar.gz";
 pub const BINARY_PACKAGE_PATTERN: &str = RELEASE_PACKAGE_PATTERN;
@@ -134,7 +142,10 @@ pub struct AppService {
     compose_queue: ComposeTaskQueue,
     binary_queue: BinaryTaskQueue,
     release_dispatch_queue: ReleaseDispatchQueue,
+    release_upload_cleanup_queue: ReleaseUploadCleanupQueue,
     platform: PlatformConfigService,
+    artifact_object_verifier: Arc<dyn ArtifactObjectVerifier>,
+    artifact_verification_slots: Arc<Semaphore>,
 }
 
 #[derive(Debug)]
@@ -196,6 +207,7 @@ impl From<ArtifactStorageError> for AppError {
         match value {
             ArtifactStorageError::InvalidInput(message)
             | ArtifactStorageError::Unsupported(message) => Self::InvalidInput(message),
+            ArtifactStorageError::Internal(message) => Self::Internal(message),
         }
     }
 }
@@ -240,6 +252,11 @@ struct ReleaseDispatchQueue {
 }
 
 #[derive(Clone)]
+struct ReleaseUploadCleanupQueue {
+    sender: mpsc::Sender<String>,
+}
+
+#[derive(Clone)]
 struct ComposeWorkerContext {
     db: SqlitePool,
     runtime_fs: RuntimeFs,
@@ -267,6 +284,8 @@ struct ComposeTaskJob {
     release_storage_provider: Option<String>,
     release_storage_bucket: Option<String>,
     release_storage_object_key: Option<String>,
+    release_storage_object_version_id: Option<String>,
+    release_storage_integrity: Option<String>,
     release_storage_endpoint: Option<String>,
     config_snapshot_id: Option<i64>,
     config_revision_no: i64,
@@ -435,6 +454,32 @@ impl ReleaseDispatchQueue {
     }
 }
 
+impl ReleaseUploadCleanupQueue {
+    fn start(
+        db: SqlitePool,
+        platform: PlatformConfigService,
+        artifact_object_verifier: Arc<dyn ArtifactObjectVerifier>,
+    ) -> Self {
+        let (sender, receiver) = mpsc::channel(COMPOSE_TASK_QUEUE_CAPACITY);
+        let timer_sender = sender.clone();
+        let timer_db = db.clone();
+        let _worker = tokio::spawn(async move {
+            release_upload_cleanup_worker(receiver, db, platform, artifact_object_verifier).await;
+        });
+        let _timer = tokio::spawn(async move {
+            release_upload_cleanup_schedule_worker(timer_db, timer_sender).await;
+        });
+        Self { sender }
+    }
+
+    async fn enqueue(&self, upload_id: String) -> Result<(), AppError> {
+        self.sender
+            .send(upload_id)
+            .await
+            .map_err(|_| AppError::Internal("上传制品清理队列不可用".to_owned()))
+    }
+}
+
 async fn compose_task_worker(
     mut receiver: mpsc::Receiver<ComposeTaskJob>,
     context: ComposeWorkerContext,
@@ -493,6 +538,58 @@ async fn release_schedule_worker(db: SqlitePool, sender: mpsc::Sender<i64>) {
     }
 }
 
+async fn release_upload_cleanup_worker(
+    mut receiver: mpsc::Receiver<String>,
+    db: SqlitePool,
+    platform: PlatformConfigService,
+    artifact_object_verifier: Arc<dyn ArtifactObjectVerifier>,
+) {
+    while let Some(upload_id) = receiver.recv().await {
+        if let Err(err) = cleanup_release_upload_object(
+            &db,
+            &platform,
+            artifact_object_verifier.as_ref(),
+            &upload_id,
+        )
+        .await
+        {
+            error!(upload_id = %upload_id, error = %err, "failed to clean up OSS upload object");
+        }
+    }
+}
+
+async fn release_upload_cleanup_schedule_worker(db: SqlitePool, sender: mpsc::Sender<String>) {
+    let mut interval = time::interval(Duration::from_secs(60));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let expired_upload_ids = match expire_due_release_uploads(&db).await {
+            Ok(upload_ids) => upload_ids,
+            Err(err) => {
+                error!(error = %err, "failed to expire stale OSS upload sessions");
+                continue;
+            }
+        };
+        for upload_id in expired_upload_ids {
+            if sender.send(upload_id).await.is_err() {
+                return;
+            }
+        }
+        let upload_ids = match pending_release_upload_cleanup_ids(&db).await {
+            Ok(upload_ids) => upload_ids,
+            Err(err) => {
+                error!(error = %err, "failed to find OSS upload objects pending cleanup");
+                continue;
+            }
+        };
+        for upload_id in upload_ids {
+            if sender.send(upload_id).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
 #[derive(sqlx::FromRow)]
 struct DueScheduledQueueRow {
     id: i64,
@@ -510,6 +607,178 @@ struct InterruptedReleaseQueueRow {
     id: i64,
     app_id: i64,
     release_id: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct ReleaseUploadCleanupRecord {
+    id: String,
+    object_key: String,
+    bucket: String,
+    endpoint: String,
+}
+
+async fn expire_due_release_uploads(db: &SqlitePool) -> Result<Vec<String>, AppError> {
+    let candidates = sqlx::query_scalar(
+        r#"
+        SELECT id
+        FROM app_release_uploads
+        WHERE status = 'pending'
+          AND reservation_active = 1
+          AND verification_started_at IS NULL
+          AND julianday(expires_at) <= julianday('now')
+        ORDER BY expires_at ASC, id ASC
+        LIMIT 20
+        "#,
+    )
+    .fetch_all(db)
+    .await?;
+    let mut expired_upload_ids = Vec::new();
+    for upload_id in candidates {
+        let result = sqlx::query(
+            r#"
+            UPDATE app_release_uploads
+            SET status = 'expired',
+                reservation_active = 0,
+                verification_started_at = NULL,
+                object_cleanup_at = COALESCE(
+                    object_cleanup_at,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                ),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+              AND status = 'pending'
+              AND reservation_active = 1
+              AND verification_started_at IS NULL
+              AND julianday(expires_at) <= julianday('now')
+            "#,
+        )
+        .bind(&upload_id)
+        .execute(db)
+        .await?;
+        if result.rows_affected() > 0 {
+            expired_upload_ids.push(upload_id);
+        }
+    }
+    Ok(expired_upload_ids)
+}
+
+async fn pending_release_upload_cleanup_ids(db: &SqlitePool) -> Result<Vec<String>, AppError> {
+    sqlx::query_scalar(
+        r#"
+        SELECT id
+        FROM app_release_uploads
+        WHERE object_cleanup_at IS NOT NULL
+          AND status IN ('expired', 'canceled')
+          AND cleanup_completed_at IS NULL
+          AND cleanup_started_at IS NULL
+          AND julianday(object_cleanup_at) <= julianday('now')
+        ORDER BY object_cleanup_at ASC, id ASC
+        LIMIT 20
+        "#,
+    )
+    .fetch_all(db)
+    .await
+    .map_err(AppError::from)
+}
+
+async fn cleanup_release_upload_object(
+    db: &SqlitePool,
+    platform: &PlatformConfigService,
+    artifact_object_verifier: &dyn ArtifactObjectVerifier,
+    upload_id: &str,
+) -> Result<(), AppError> {
+    let claimed = sqlx::query(
+        r#"
+        UPDATE app_release_uploads
+        SET cleanup_started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            cleanup_attempts = cleanup_attempts + 1,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ?1
+          AND object_cleanup_at IS NOT NULL
+          AND status IN ('expired', 'canceled')
+          AND cleanup_completed_at IS NULL
+          AND cleanup_started_at IS NULL
+          AND julianday(object_cleanup_at) <= julianday('now')
+        "#,
+    )
+    .bind(upload_id)
+    .execute(db)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        return Ok(());
+    }
+
+    let upload = sqlx::query_as::<_, ReleaseUploadCleanupRecord>(
+        r#"
+        SELECT id, object_key, bucket, endpoint
+        FROM app_release_uploads
+        WHERE id = ?1
+        "#,
+    )
+    .bind(upload_id)
+    .fetch_one(db)
+    .await?;
+    let cleanup_result = async {
+        let platform_config = platform.config().await?;
+        let mut oss = platform_config.artifact_storage.aliyun_oss;
+        oss.bucket = upload.bucket.clone();
+        if !upload.endpoint.trim().is_empty() {
+            oss.endpoint = upload.endpoint.clone();
+        }
+        let oss = oss.normalize()?;
+        let versions = artifact_object_verifier
+            .list_versions(&oss, &upload.object_key)
+            .await
+            .map_err(AppError::from)?;
+        for version in versions {
+            if version.is_delete_marker && version.version_id.is_none() {
+                return Err(AppError::Internal(
+                    "OSS 删除标记缺少版本号，拒绝将上传对象标记为已清理".to_owned(),
+                ));
+            }
+            artifact_object_verifier
+                .delete(&oss, &upload.object_key, version.version_id.as_deref())
+                .await
+                .map_err(AppError::from)?;
+        }
+        Ok(())
+    }
+    .await;
+
+    match cleanup_result {
+        Ok(()) => {
+            sqlx::query(
+                r#"
+                UPDATE app_release_uploads
+                SET cleanup_started_at = NULL,
+                    cleanup_completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    cleanup_error = '',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                "#,
+            )
+            .bind(&upload.id)
+            .execute(db)
+            .await?;
+            Ok(())
+        }
+        Err(err) => {
+            sqlx::query(
+                r#"
+                UPDATE app_release_uploads
+                SET cleanup_started_at = NULL,
+                    cleanup_error = ?2,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                "#,
+            )
+            .bind(&upload.id)
+            .bind(err.message())
+            .execute(db)
+            .await?;
+            Err(err)
+        }
+    }
 }
 
 async fn enqueue_due_scheduled_releases(db: &SqlitePool) -> Result<Vec<i64>, AppError> {
@@ -588,6 +857,8 @@ async fn dispatch_next_release_for_app(
             r.storage_provider,
             r.storage_bucket,
             r.storage_object_key,
+            r.storage_object_version_id,
+            r.storage_integrity,
             r.storage_endpoint,
             r.published_at
         FROM app_release_queue q
@@ -744,6 +1015,8 @@ async fn dispatch_next_release_for_app(
         release_storage_provider: Some(queue_item.storage_provider),
         release_storage_bucket: Some(queue_item.storage_bucket),
         release_storage_object_key: Some(queue_item.storage_object_key),
+        release_storage_object_version_id: Some(queue_item.storage_object_version_id),
+        release_storage_integrity: Some(queue_item.storage_integrity),
         release_storage_endpoint: Some(queue_item.storage_endpoint),
         deploy_strategy: parse_deploy_strategy(&app.deploy_strategy),
         action: ComposeTaskAction::Up,
@@ -2172,6 +2445,17 @@ async fn download_release_package_on_node(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| AppError::Internal("OSS 发布缺少 ObjectKey".to_owned()))?;
+    let object_version_id = context
+        .job
+        .release_storage_object_version_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let storage_integrity = context
+        .job
+        .release_storage_integrity
+        .as_deref()
+        .unwrap_or(OSS_RELEASE_STORAGE_INTEGRITY_LEGACY);
+    validate_oss_release_storage_integrity(storage_integrity, object_version_id)?;
     let bucket = context
         .job
         .release_storage_bucket
@@ -2209,7 +2493,7 @@ async fn download_release_package_on_node(
             oss.endpoint = endpoint.to_owned();
         }
         let oss = oss.normalize()?;
-        let signed = oss.presign_download(object_key)?;
+        let signed = oss.presign_download_version(object_key, object_version_id)?;
         let app_dir = compose_node_runtime_dir_for_script(context, node);
         let release_dir =
             compose_script_join(&app_dir, &format!("{RELEASES_DIR_NAME}/{release_version}"));
@@ -2279,6 +2563,31 @@ async fn download_release_package_on_node(
             fail_task_step_message(context.tasks, context.task_id, step_id, err.message()).await?;
             Err(err)
         }
+    }
+}
+
+fn validate_oss_release_storage_integrity(
+    storage_integrity: &str,
+    object_version_id: Option<&str>,
+) -> Result<(), AppError> {
+    match storage_integrity {
+        OSS_RELEASE_STORAGE_INTEGRITY_VERSION_PINNED => {
+            let version_id = object_version_id.ok_or_else(|| {
+                AppError::Internal("OSS 发布缺少已校验对象版本号".to_owned())
+            })?;
+            if version_id.trim() == "null" {
+                return Err(AppError::InvalidInput(
+                    "OSS Bucket 处于暂停版本控制状态，null 版本无法固定已校验制品；请重新上传版本包"
+                        .to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        OSS_RELEASE_STORAGE_INTEGRITY_UNIQUE_KEY => Ok(()),
+        _ => Err(AppError::InvalidInput(
+            "该 OSS 历史制品未绑定对象版本，无法保证部署完整性；请通过当前 OSS 直传流程重新上传版本包"
+                .to_owned(),
+        )),
     }
 }
 
@@ -6619,6 +6928,7 @@ pub struct AppReleaseItem {
     pub storage_provider: String,
     pub storage_bucket: String,
     pub storage_object_key: String,
+    pub storage_object_version_id: String,
     pub storage_endpoint: String,
     pub metadata: String,
 }
@@ -6659,6 +6969,8 @@ struct PendingReleaseQueueItem {
     storage_provider: String,
     storage_bucket: String,
     storage_object_key: String,
+    storage_object_version_id: String,
+    storage_integrity: String,
     storage_endpoint: String,
 }
 
@@ -7114,6 +7426,27 @@ impl AppService {
         tasks: TaskService,
         platform: PlatformConfigService,
     ) -> Result<Self, AppError> {
+        Self::new_with_artifact_object_verifier(
+            db,
+            runtime_fs,
+            compose,
+            systemd,
+            tasks,
+            platform,
+            Arc::new(AliyunOssObjectVerifier::default()),
+        )
+        .await
+    }
+
+    pub(crate) async fn new_with_artifact_object_verifier(
+        db: SqlitePool,
+        runtime_fs: RuntimeFs,
+        compose: ComposeExecutor,
+        systemd: SystemdExecutor,
+        tasks: TaskService,
+        platform: PlatformConfigService,
+        artifact_object_verifier: Arc<dyn ArtifactObjectVerifier>,
+    ) -> Result<Self, AppError> {
         let compose_queue = ComposeTaskQueue::start(
             db.clone(),
             runtime_fs.clone(),
@@ -7135,6 +7468,11 @@ impl AppService {
             tasks.clone(),
             compose_queue.clone(),
         );
+        let release_upload_cleanup_queue = ReleaseUploadCleanupQueue::start(
+            db.clone(),
+            platform.clone(),
+            artifact_object_verifier.clone(),
+        );
         let service = Self {
             db,
             runtime_fs,
@@ -7144,7 +7482,12 @@ impl AppService {
             compose_queue,
             binary_queue,
             release_dispatch_queue,
+            release_upload_cleanup_queue,
             platform,
+            artifact_object_verifier,
+            artifact_verification_slots: Arc::new(Semaphore::new(
+                ARTIFACT_VERIFICATION_CONCURRENCY,
+            )),
         };
         service.recover_interrupted_work().await?;
         Ok(service)
@@ -7250,6 +7593,29 @@ impl AppService {
             .execute(&mut *tx)
             .await?;
         }
+        sqlx::query(
+            r#"
+            UPDATE app_release_uploads
+            SET verification_started_at = NULL,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE status = 'pending'
+              AND reservation_active = 1
+              AND verification_started_at IS NOT NULL
+            "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE app_release_uploads
+            SET cleanup_started_at = NULL,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE cleanup_completed_at IS NULL
+              AND cleanup_started_at IS NOT NULL
+            "#,
+        )
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
 
         for app_id in affected_app_ids {
@@ -7794,6 +8160,7 @@ impl AppService {
                 r.storage_provider,
                 r.storage_bucket,
                 r.storage_object_key,
+                r.storage_object_version_id,
                 r.storage_endpoint,
                 r.metadata
             FROM app_releases r
@@ -7874,6 +8241,7 @@ impl AppService {
                 r.storage_provider,
                 r.storage_bucket,
                 r.storage_object_key,
+                r.storage_object_version_id,
                 r.storage_endpoint,
                 r.metadata
             FROM app_releases r
@@ -7965,6 +8333,7 @@ impl AppService {
                 r.storage_provider,
                 r.storage_bucket,
                 r.storage_object_key,
+                r.storage_object_version_id,
                 r.storage_endpoint,
                 r.metadata
             FROM app_releases r
@@ -8915,13 +9284,6 @@ impl AppService {
             return Err(AppError::InvalidInput("上传文件不能为空".to_owned()));
         }
         let package_kind = artifact_kind_from_file_name(&file_name);
-        let uploaded_path = self
-            .runtime_fs
-            .save_release_package_file(&app.app_key, &release_version, &file_name, &input.bytes)
-            .await?;
-        if package_kind == "tar_gz" {
-            extract_tar_gz(&uploaded_path, &release_version)?;
-        }
         let entry_file = if input.entry_file.trim().is_empty() {
             String::new()
         } else {
@@ -8939,108 +9301,147 @@ impl AppService {
         );
         let extract_dir =
             target_work_dir_path(&app.work_dir, &format!("releases/{release_version}"));
-
-        let mut tx = self.db.begin().await?;
-        let config_snapshot = insert_runtime_config_snapshot(
-            &mut tx,
-            RuntimeConfigSnapshotInput {
-                app_id: app.id,
-                snapshot_kind: "manual",
-                compose_content: &runtime_files.compose_content,
-                env_content: &runtime_files.env_content,
-                artifact_version: &release_version,
-                metadata: runtime_snapshot_metadata(
-                    "package_upload",
-                    runtime_root.to_string_lossy(),
-                    Some(&release_version),
-                    Some(&runtime_files.deploy_scripts),
-                    None,
-                ),
-            },
-        )
-        .await?;
-        self.runtime_fs
-            .save_release_runtime_metadata(ReleaseRuntimeMetadata {
-                app_key: app.app_key.clone(),
-                app_id: app.id,
-                app_name: app.name.clone(),
-                release_version: release_version.clone(),
-                version_code,
-                package_name: file_name.clone(),
-                package_path: package_path.clone(),
-                extract_dir: extract_dir.clone(),
-                checksum_sha256: checksum.clone(),
+        ensure_release_version_available(&self.db, app.id, &release_version).await?;
+        let staged = self
+            .runtime_fs
+            .stage_release_package_file(&app.app_key, &release_version, &file_name, &input.bytes)
+            .await?;
+        if package_kind == "tar_gz"
+            && let Err(err) = extract_tar_gz(&staged.staged_package_path, &release_version)
+        {
+            if let Err(cleanup_err) = self
+                .runtime_fs
+                .discard_staged_release_package(&staged)
+                .await
+            {
+                warn!(error = %cleanup_err, "failed to clean up invalid staged release package");
+            }
+            return Err(err);
+        }
+        let uploaded_path = staged.package_path.clone();
+        let mut promoted = false;
+        let completion: Result<(i64, Option<i64>, i64, i64), AppError> = async {
+            let mut tx = self.db.begin().await?;
+            ensure_release_version_available_in_transaction(&mut tx, app.id, &release_version)
+                .await?;
+            let config_snapshot = insert_runtime_config_snapshot(
+                &mut tx,
+                RuntimeConfigSnapshotInput {
+                    app_id: app.id,
+                    snapshot_kind: "manual",
+                    compose_content: &runtime_files.compose_content,
+                    env_content: &runtime_files.env_content,
+                    artifact_version: &release_version,
+                    metadata: runtime_snapshot_metadata(
+                        "package_upload",
+                        runtime_root.to_string_lossy(),
+                        Some(&release_version),
+                        Some(&runtime_files.deploy_scripts),
+                        None,
+                    ),
+                },
+            )
+            .await?;
+            let release_metadata = render_artifact_metadata(ArtifactMetadataInput {
+                source: "package_upload",
+                source_detail: upload_source(&input.source),
+                unit_name: "",
+                uploaded_path: &uploaded_path.to_string_lossy(),
+                original_file_name: &file_name,
+                entry_file: &entry_file,
+                sha256: &checksum,
                 size_bytes,
-                published_at: published_at.clone(),
-                received_at: received_at.clone(),
-                source: artifact_channel_from_source(&input.source).to_owned(),
                 config_snapshot_id: Some(config_snapshot.id),
                 config_revision_no: Some(config_snapshot.revision_no),
-            })
-            .await?;
-        let release_metadata = render_artifact_metadata(ArtifactMetadataInput {
-            source: "package_upload",
-            source_detail: upload_source(&input.source),
-            unit_name: "",
-            uploaded_path: &uploaded_path.to_string_lossy(),
-            original_file_name: &file_name,
-            entry_file: &entry_file,
-            sha256: &checksum,
-            size_bytes,
-            config_snapshot_id: Some(config_snapshot.id),
-            config_revision_no: Some(config_snapshot.revision_no),
-        });
-        let release_id = upsert_app_release(
-            &mut tx,
-            app.id,
-            &release_version,
-            version_code,
-            &file_name,
-            &package_path,
-            &uploaded_path
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .to_string_lossy(),
-            artifact_channel_from_source(&input.source),
-            &checksum,
-            size_bytes,
-            &published_at,
-            release_status,
-            STORAGE_PROVIDER_LOCAL,
-            "",
-            "",
-            "",
-            &release_metadata,
-        )
-        .await?;
-        let queue_id = if auto_queue_release {
-            Some(
-                enqueue_app_release(
-                    &mut tx,
-                    app.id,
-                    release_id,
-                    config_snapshot.id,
-                    upload_source(&input.source),
-                    &format!("版本 {} 已入队，等待串行发布", release_version),
-                    "queued",
-                    None,
-                )
-                .await?,
+            });
+            let release_id = insert_app_release_immutable(
+                &mut tx,
+                app.id,
+                &release_version,
+                version_code,
+                &file_name,
+                &package_path,
+                &staged.release_dir.to_string_lossy(),
+                artifact_channel_from_source(&input.source),
+                &checksum,
+                size_bytes,
+                &published_at,
+                release_status,
+                STORAGE_PROVIDER_LOCAL,
+                "",
+                "",
+                "",
+                LOCAL_RELEASE_STORAGE_INTEGRITY,
+                "",
+                &release_metadata,
             )
-        } else {
-            None
+            .await?;
+            let queue_id = if auto_queue_release {
+                Some(
+                    enqueue_app_release(
+                        &mut tx,
+                        app.id,
+                        release_id,
+                        config_snapshot.id,
+                        upload_source(&input.source),
+                        &format!("版本 {} 已入队，等待串行发布", release_version),
+                        "queued",
+                        None,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            sqlx::query(
+                r#"
+                UPDATE apps
+                SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                "#,
+            )
+            .bind(app.id)
+            .execute(&mut *tx)
+            .await?;
+            self.runtime_fs
+                .promote_staged_release_package(&staged)
+                .await?;
+            promoted = true;
+            self.runtime_fs
+                .save_release_runtime_metadata(ReleaseRuntimeMetadata {
+                    app_key: app.app_key.clone(),
+                    app_id: app.id,
+                    app_name: app.name.clone(),
+                    release_version: release_version.clone(),
+                    version_code,
+                    package_name: file_name.clone(),
+                    package_path: package_path.clone(),
+                    extract_dir: extract_dir.clone(),
+                    checksum_sha256: checksum.clone(),
+                    size_bytes,
+                    published_at: published_at.clone(),
+                    received_at: received_at.clone(),
+                    source: artifact_channel_from_source(&input.source).to_owned(),
+                    config_snapshot_id: Some(config_snapshot.id),
+                    config_revision_no: Some(config_snapshot.revision_no),
+                })
+                .await?;
+            tx.commit().await?;
+            Ok((
+                release_id,
+                queue_id,
+                config_snapshot.id,
+                config_snapshot.revision_no,
+            ))
+        }
+        .await;
+        let (release_id, queue_id, config_snapshot_id, config_revision_no) = match completion {
+            Ok(result) => result,
+            Err(err) => {
+                cleanup_failed_staged_release_package(&self.runtime_fs, &staged, promoted).await;
+                return Err(err);
+            }
         };
-        sqlx::query(
-            r#"
-            UPDATE apps
-            SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE id = ?1
-            "#,
-        )
-        .bind(app.id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
         if queue_id.is_some() {
             self.enqueue_release_dispatch(app.id).await?;
         }
@@ -9054,8 +9455,8 @@ impl AppService {
             package_path,
             package_kind: package_kind.to_owned(),
             published_at,
-            config_snapshot_id: config_snapshot.id,
-            config_revision_no: config_snapshot.revision_no,
+            config_snapshot_id,
+            config_revision_no,
             queued: auto_queue_release,
             publish_status: release_publish_mode_label(auto_queue_release).to_owned(),
             scheduled_publish_at: None,
@@ -9098,17 +9499,41 @@ impl AppService {
             ));
         }
         let oss = &platform_config.artifact_storage.aliyun_oss;
-        let object_key = oss.object_key(&app.app_key, &parsed.release_version, &file_name);
-        let presigned = oss.presign_upload(&object_key)?;
         let upload_id = generated_release_upload_id();
+        let object_key = oss.upload_object_key(
+            &app.app_key,
+            &parsed.release_version,
+            &upload_id,
+            &file_name,
+        );
+        let presigned = oss.presign_upload(&object_key)?;
         let source = upload_source(&input.source).to_owned();
         let metadata = json!({
             "storage_provider": STORAGE_PROVIDER_ALIYUN_OSS,
             "upload_method": presigned.method,
             "upload_content_type": crate::artifact_storage::ARTIFACT_UPLOAD_CONTENT_TYPE,
+            "upload_precondition": format!(
+                "{}={}",
+                crate::artifact_storage::ARTIFACT_UPLOAD_FORBID_OVERWRITE_HEADER,
+                crate::artifact_storage::ARTIFACT_UPLOAD_FORBID_OVERWRITE_VALUE,
+            ),
         })
         .to_string();
-        sqlx::query(
+        let mut tx = self.db.begin().await?;
+        expire_release_upload_reservation(&mut tx, app.id, &parsed.release_version).await?;
+        let release_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM app_releases WHERE app_id = ?1 AND version = ?2)",
+        )
+        .bind(app.id)
+        .bind(&parsed.release_version)
+        .fetch_one(&mut *tx)
+        .await?;
+        if release_exists {
+            return Err(AppError::Conflict(
+                "发布版本已经存在，不能覆盖历史制品".to_owned(),
+            ));
+        }
+        let insert_result = sqlx::query(
             r#"
             INSERT INTO app_release_uploads(
                 id,
@@ -9122,9 +9547,11 @@ impl AppService {
                 source,
                 published_at,
                 expires_at,
-                metadata
+                metadata,
+                reservation_active
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)
+            ON CONFLICT DO NOTHING
             "#,
         )
         .bind(&upload_id)
@@ -9139,8 +9566,14 @@ impl AppService {
         .bind(&published_at)
         .bind(&presigned.expires_at)
         .bind(&metadata)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
+        if insert_result.rows_affected() == 0 {
+            return Err(AppError::Conflict(
+                "该发布版本已有待完成的上传会话".to_owned(),
+            ));
+        }
+        tx.commit().await?;
         Ok(CreateReleasePackageUploadResult {
             upload_id: upload_id.clone(),
             app_id: app.id,
@@ -9168,12 +9601,13 @@ impl AppService {
     ) -> Result<UploadReleasePackageResult, AppError> {
         let upload_id = normalize_upload_id(&input.upload_id)?;
         let service_key = normalize_key(&input.service_key)?;
-        let checksum = normalize_checksum_sha256(&input.checksum_sha256)?;
+        let client_checksum = normalize_checksum_sha256(&input.checksum_sha256)?;
         if input.size_bytes <= 0 {
             return Err(AppError::InvalidInput(
                 "size_bytes 必须是大于 0 的整数".to_owned(),
             ));
         }
+        let client_size_bytes = input.size_bytes as u64;
         let upload = sqlx::query_as::<_, AppReleaseUploadRecord>(
             r#"
             SELECT
@@ -9214,201 +9648,311 @@ impl AppService {
             ));
         }
         if upload_session_expired(&upload.expires_at) {
-            sqlx::query(
-                r#"
-                UPDATE app_release_uploads
-                SET status = 'expired',
-                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                WHERE id = ?1
-                  AND status = 'pending'
-                "#,
-            )
-            .bind(&upload.id)
-            .execute(&self.db)
-            .await?;
+            expire_release_upload(&self.db, &upload.id).await?;
+            if let Err(err) = self
+                .release_upload_cleanup_queue
+                .enqueue(upload.id.clone())
+                .await
+            {
+                warn!(upload_id = %upload.id, error = %err, "failed to enqueue expired upload cleanup");
+            }
             return Err(AppError::InvalidInput(
                 "上传会话已过期，请重新申请上传地址".to_owned(),
             ));
         }
-        let source_text = if input.source.trim().is_empty() {
-            upload.source.clone()
-        } else {
-            input.source.clone()
+        if !claim_release_upload_verification(&self.db, &upload.id).await? {
+            return Err(AppError::Conflict(
+                "上传会话正在完成或已经不可用".to_owned(),
+            ));
+        }
+        let verification_slot = match self.artifact_verification_slots.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(_) => {
+                clear_release_upload_verification(&self.db, &upload.id).await?;
+                return Err(AppError::Conflict(
+                    "OSS 制品校验繁忙，请稍后重试".to_owned(),
+                ));
+            }
         };
-        let source_detail = upload_source(&source_text).to_owned();
-        let published_at = match normalize_published_at(&input.published_at)? {
-            Some(value) => value,
-            None => match normalize_published_at(&upload.published_at)? {
+        let verification = async {
+            let platform_config = self.platform.config().await?;
+            let mut oss = platform_config.artifact_storage.aliyun_oss;
+            oss.bucket = upload.bucket.clone();
+            if !upload.endpoint.trim().is_empty() {
+                oss.endpoint = upload.endpoint.clone();
+            }
+            let oss = oss.normalize()?;
+            self.artifact_object_verifier
+                .verify(&oss, &upload.object_key)
+                .await
+                .map_err(AppError::from)
+        }
+        .await;
+        drop(verification_slot);
+        let verified = match verification {
+            Ok(verified) => verified,
+            Err(err) => {
+                clear_release_upload_verification(&self.db, &upload.id).await?;
+                return Err(err);
+            }
+        };
+        let checksum = match normalize_checksum_sha256(&verified.checksum_sha256) {
+            Ok(checksum) => checksum,
+            Err(err) => {
+                clear_release_upload_verification(&self.db, &upload.id).await?;
+                return Err(err.into());
+            }
+        };
+        let size_bytes = verified.size_bytes;
+        let object_version_id = match verified.version_id {
+            Some(version_id) => match normalize_object_version_id(&version_id) {
+                Ok(version_id) => version_id,
+                Err(err) => {
+                    clear_release_upload_verification(&self.db, &upload.id).await?;
+                    return Err(err.into());
+                }
+            },
+            None => String::new(),
+        };
+        let storage_integrity = if object_version_id.is_empty() {
+            OSS_RELEASE_STORAGE_INTEGRITY_UNIQUE_KEY
+        } else {
+            OSS_RELEASE_STORAGE_INTEGRITY_VERSION_PINNED
+        };
+        if let Err(err) =
+            store_release_upload_object_version(&self.db, &upload.id, &object_version_id).await
+        {
+            clear_release_upload_verification(&self.db, &upload.id).await?;
+            return Err(err);
+        }
+        if checksum != client_checksum || size_bytes != client_size_bytes {
+            clear_release_upload_verification(&self.db, &upload.id).await?;
+            return Err(AppError::InvalidInput(
+                "上传对象的 SHA-256 或大小与完成请求不一致，可使用正确值重试完成请求".to_owned(),
+            ));
+        }
+        let completion_result: Result<UploadReleasePackageResult, AppError> = async {
+            let source_text = if input.source.trim().is_empty() {
+                upload.source.clone()
+            } else {
+                input.source.clone()
+            };
+            let source_detail = upload_source(&source_text).to_owned();
+            let published_at = match normalize_published_at(&input.published_at)? {
                 Some(value) => value,
-                None => sqlite_now(&self.db).await?,
-            },
-        };
-        let received_at = sqlite_now(&self.db).await?;
-        let runtime_root = self.runtime_fs.app_root(&app.app_key)?;
-        let runtime_files = self.runtime_fs.load_app_config(&app.app_key).await?;
-        let auto_queue_release = app.auto_queue_release == 1;
-        let release_status = release_status_after_upload(auto_queue_release);
-        let package_path = target_work_dir_path(
-            &app.work_dir,
-            &format!("releases/{}/{}", upload.release_version, upload.file_name),
-        );
-        let extract_dir = target_work_dir_path(
-            &app.work_dir,
-            &format!("releases/{}", upload.release_version),
-        );
-        let size_bytes = input.size_bytes as u64;
-        let package_kind = artifact_kind_from_file_name(&upload.file_name);
+                None => match normalize_published_at(&upload.published_at)? {
+                    Some(value) => value,
+                    None => sqlite_now(&self.db).await?,
+                },
+            };
+            let received_at = sqlite_now(&self.db).await?;
+            let runtime_root = self.runtime_fs.app_root(&app.app_key)?;
+            let runtime_files = self.runtime_fs.load_app_config(&app.app_key).await?;
+            let auto_queue_release = app.auto_queue_release == 1;
+            let release_status = release_status_after_upload(auto_queue_release);
+            let package_path = target_work_dir_path(
+                &app.work_dir,
+                &format!("releases/{}/{}", upload.release_version, upload.file_name),
+            );
+            let extract_dir = target_work_dir_path(
+                &app.work_dir,
+                &format!("releases/{}", upload.release_version),
+            );
+            let package_kind = artifact_kind_from_file_name(&upload.file_name);
 
-        let mut tx = self.db.begin().await?;
-        let config_snapshot = insert_runtime_config_snapshot(
-            &mut tx,
-            RuntimeConfigSnapshotInput {
-                app_id: app.id,
-                snapshot_kind: "manual",
-                compose_content: &runtime_files.compose_content,
-                env_content: &runtime_files.env_content,
-                artifact_version: &upload.release_version,
-                metadata: runtime_snapshot_metadata(
-                    "package_upload",
-                    runtime_root.to_string_lossy(),
-                    Some(&upload.release_version),
-                    Some(&runtime_files.deploy_scripts),
-                    None,
-                ),
-            },
-        )
-        .await?;
-        self.runtime_fs
-            .save_release_runtime_metadata(ReleaseRuntimeMetadata {
-                app_key: app.app_key.clone(),
-                app_id: app.id,
-                app_name: app.name.clone(),
-                release_version: upload.release_version.clone(),
-                version_code: upload.version_code,
-                package_name: upload.file_name.clone(),
-                package_path: package_path.clone(),
-                extract_dir: extract_dir.clone(),
-                checksum_sha256: checksum.clone(),
-                size_bytes,
-                published_at: published_at.clone(),
-                received_at: received_at.clone(),
-                source: artifact_channel_from_source(&source_detail).to_owned(),
-                config_snapshot_id: Some(config_snapshot.id),
-                config_revision_no: Some(config_snapshot.revision_no),
-            })
-            .await?;
-        let uploaded_path = format!("oss://{}/{}", upload.bucket, upload.object_key);
-        let release_metadata = render_artifact_metadata_with_storage(
-            ArtifactMetadataInput {
-                source: "package_upload",
-                source_detail: &source_detail,
-                unit_name: "",
-                uploaded_path: &uploaded_path,
-                original_file_name: &upload.file_name,
-                entry_file: "",
-                sha256: &checksum,
-                size_bytes,
-                config_snapshot_id: Some(config_snapshot.id),
-                config_revision_no: Some(config_snapshot.revision_no),
-            },
-            ArtifactStorageMetadataInput {
-                provider: STORAGE_PROVIDER_ALIYUN_OSS,
-                bucket: &upload.bucket,
-                object_key: &upload.object_key,
-                endpoint: &upload.endpoint,
-            },
-        );
-        let release_id = upsert_app_release(
-            &mut tx,
-            app.id,
-            &upload.release_version,
-            upload.version_code,
-            &upload.file_name,
-            &package_path,
-            &extract_dir,
-            artifact_channel_from_source(&source_detail),
-            &checksum,
-            size_bytes,
-            &published_at,
-            release_status,
-            STORAGE_PROVIDER_ALIYUN_OSS,
-            &upload.bucket,
-            &upload.object_key,
-            &upload.endpoint,
-            &release_metadata,
-        )
-        .await?;
-        let queue_id = if auto_queue_release {
-            Some(
-                enqueue_app_release(
-                    &mut tx,
-                    app.id,
-                    release_id,
-                    config_snapshot.id,
-                    &source_detail,
-                    &format!("版本 {} 已入队，等待串行发布", upload.release_version),
-                    "queued",
-                    None,
-                )
-                .await?,
+            let mut tx = self.db.begin().await?;
+            let config_snapshot = insert_runtime_config_snapshot(
+                &mut tx,
+                RuntimeConfigSnapshotInput {
+                    app_id: app.id,
+                    snapshot_kind: "manual",
+                    compose_content: &runtime_files.compose_content,
+                    env_content: &runtime_files.env_content,
+                    artifact_version: &upload.release_version,
+                    metadata: runtime_snapshot_metadata(
+                        "package_upload",
+                        runtime_root.to_string_lossy(),
+                        Some(&upload.release_version),
+                        Some(&runtime_files.deploy_scripts),
+                        None,
+                    ),
+                },
             )
-        } else {
-            None
-        };
-        let update_result = sqlx::query(
-            r#"
+            .await?;
+            let uploaded_path = format!("oss://{}/{}", upload.bucket, upload.object_key);
+            let release_metadata = render_artifact_metadata_with_storage(
+                ArtifactMetadataInput {
+                    source: "package_upload",
+                    source_detail: &source_detail,
+                    unit_name: "",
+                    uploaded_path: &uploaded_path,
+                    original_file_name: &upload.file_name,
+                    entry_file: "",
+                    sha256: &checksum,
+                    size_bytes,
+                    config_snapshot_id: Some(config_snapshot.id),
+                    config_revision_no: Some(config_snapshot.revision_no),
+                },
+                ArtifactStorageMetadataInput {
+                    provider: STORAGE_PROVIDER_ALIYUN_OSS,
+                    bucket: &upload.bucket,
+                    object_key: &upload.object_key,
+                    object_version_id: &object_version_id,
+                    integrity: storage_integrity,
+                    endpoint: &upload.endpoint,
+                },
+            );
+            let release_id = insert_app_release_immutable(
+                &mut tx,
+                app.id,
+                &upload.release_version,
+                upload.version_code,
+                &upload.file_name,
+                &package_path,
+                &extract_dir,
+                artifact_channel_from_source(&source_detail),
+                &checksum,
+                size_bytes,
+                &published_at,
+                release_status,
+                STORAGE_PROVIDER_ALIYUN_OSS,
+                &upload.bucket,
+                &upload.object_key,
+                &object_version_id,
+                storage_integrity,
+                &upload.endpoint,
+                &release_metadata,
+            )
+            .await?;
+            self.runtime_fs
+                .save_release_runtime_metadata(ReleaseRuntimeMetadata {
+                    app_key: app.app_key.clone(),
+                    app_id: app.id,
+                    app_name: app.name.clone(),
+                    release_version: upload.release_version.clone(),
+                    version_code: upload.version_code,
+                    package_name: upload.file_name.clone(),
+                    package_path: package_path.clone(),
+                    extract_dir: extract_dir.clone(),
+                    checksum_sha256: checksum.clone(),
+                    size_bytes,
+                    published_at: published_at.clone(),
+                    received_at: received_at.clone(),
+                    source: artifact_channel_from_source(&source_detail).to_owned(),
+                    config_snapshot_id: Some(config_snapshot.id),
+                    config_revision_no: Some(config_snapshot.revision_no),
+                })
+                .await?;
+            let queue_id = if auto_queue_release {
+                Some(
+                    enqueue_app_release(
+                        &mut tx,
+                        app.id,
+                        release_id,
+                        config_snapshot.id,
+                        &source_detail,
+                        &format!("版本 {} 已入队，等待串行发布", upload.release_version),
+                        "queued",
+                        None,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let update_result = sqlx::query(
+                r#"
             UPDATE app_release_uploads
             SET status = 'completed',
+                reservation_active = 0,
+                verification_started_at = NULL,
                 checksum_sha256 = ?2,
                 size_bytes = ?3,
                 source = ?4,
                 published_at = ?5,
+                object_version_id = ?6,
                 completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE id = ?1
               AND status = 'pending'
+              AND reservation_active = 1
+              AND verification_started_at IS NOT NULL
             "#,
-        )
-        .bind(&upload.id)
-        .bind(&checksum)
-        .bind(input.size_bytes)
-        .bind(&source_detail)
-        .bind(&published_at)
-        .execute(&mut *tx)
-        .await?;
-        if update_result.rows_affected() == 0 {
-            return Err(AppError::Conflict("上传会话已经完成或不可用".to_owned()));
-        }
-        sqlx::query(
-            r#"
+            )
+            .bind(&upload.id)
+            .bind(&checksum)
+            .bind(size_bytes as i64)
+            .bind(&source_detail)
+            .bind(&published_at)
+            .bind(&object_version_id)
+            .execute(&mut *tx)
+            .await?;
+            if update_result.rows_affected() == 0 {
+                Err(AppError::Conflict("上传会话已经完成或不可用".to_owned()))?;
+            }
+            sqlx::query(
+                r#"
             UPDATE apps
             SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE id = ?1
             "#,
-        )
-        .bind(app.id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        if queue_id.is_some() {
-            self.enqueue_release_dispatch(app.id).await?;
+            )
+            .bind(app.id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(UploadReleasePackageResult {
+                app_id: app.id,
+                app_key: app.app_key,
+                release_id,
+                queue_id,
+                release_version: upload.release_version,
+                version_code: upload.version_code,
+                package_path,
+                package_kind: package_kind.to_owned(),
+                published_at,
+                config_snapshot_id: config_snapshot.id,
+                config_revision_no: config_snapshot.revision_no,
+                queued: auto_queue_release,
+                publish_status: release_publish_mode_label(auto_queue_release).to_owned(),
+                scheduled_publish_at: None,
+            })
         }
-        Ok(UploadReleasePackageResult {
-            app_id: app.id,
-            app_key: app.app_key,
-            release_id,
-            queue_id,
-            release_version: upload.release_version,
-            version_code: upload.version_code,
-            package_path,
-            package_kind: package_kind.to_owned(),
-            published_at,
-            config_snapshot_id: config_snapshot.id,
-            config_revision_no: config_snapshot.revision_no,
-            queued: auto_queue_release,
-            publish_status: release_publish_mode_label(auto_queue_release).to_owned(),
-            scheduled_publish_at: None,
-        })
+        .await;
+        let result = match completion_result {
+            Ok(result) => result,
+            Err(err) => {
+                let cleanup = if matches!(&err, AppError::Conflict(_)) {
+                    cancel_release_upload(&self.db, &upload.id, "release_registration_conflict")
+                        .await
+                } else {
+                    clear_release_upload_verification(&self.db, &upload.id).await
+                };
+                if let Err(cleanup_err) = cleanup {
+                    warn!(
+                        upload_id = %upload.id,
+                        error = %cleanup_err,
+                        "failed to release upload verification claim"
+                    );
+                } else if matches!(&err, AppError::Conflict(_))
+                    && let Err(cleanup_err) = self
+                        .release_upload_cleanup_queue
+                        .enqueue(upload.id.clone())
+                        .await
+                {
+                    warn!(
+                        upload_id = %upload.id,
+                        error = %cleanup_err,
+                        "failed to enqueue canceled upload cleanup"
+                    );
+                }
+                return Err(err);
+            }
+        };
+        if result.queue_id.is_some() {
+            self.enqueue_release_dispatch(result.app_id).await?;
+        }
+        Ok(result)
     }
 
     pub async fn register_binary_artifact_from_task(
@@ -9623,6 +10167,8 @@ impl AppService {
             STORAGE_PROVIDER_LOCAL,
             "",
             "",
+            "",
+            LOCAL_RELEASE_STORAGE_INTEGRITY,
             "",
             &release_metadata,
         )
@@ -10178,6 +10724,8 @@ impl AppService {
                 release_storage_provider: None,
                 release_storage_bucket: None,
                 release_storage_object_key: None,
+                release_storage_object_version_id: None,
+                release_storage_integrity: None,
                 release_storage_endpoint: None,
                 config_snapshot_id: (config_snapshot.id > 0).then_some(config_snapshot.id),
                 config_revision_no: config_snapshot.revision_no,
@@ -11113,6 +11661,19 @@ impl AppTargetNode {
     }
 }
 
+async fn cleanup_failed_staged_release_package(
+    runtime_fs: &RuntimeFs,
+    staged: &StagedReleasePackage,
+    promoted: bool,
+) {
+    if let Err(cleanup_err) = runtime_fs.discard_staged_release_package(staged).await {
+        warn!(error = %cleanup_err, "failed to clean up staged release package");
+    }
+    if promoted && let Err(cleanup_err) = runtime_fs.remove_promoted_release_package(staged).await {
+        warn!(error = %cleanup_err, "failed to clean up promoted release package");
+    }
+}
+
 fn normalize_key(value: &str) -> Result<String, AppError> {
     let key = value.trim().to_ascii_lowercase();
     if key.is_empty() {
@@ -11805,6 +12366,8 @@ struct ArtifactStorageMetadataInput<'a> {
     provider: &'a str,
     bucket: &'a str,
     object_key: &'a str,
+    object_version_id: &'a str,
+    integrity: &'a str,
     endpoint: &'a str,
 }
 
@@ -11840,6 +12403,8 @@ fn render_artifact_metadata_with_storage(
     metadata["storage_provider"] = json!(storage.provider);
     metadata["storage_bucket"] = json!(storage.bucket);
     metadata["storage_object_key"] = json!(storage.object_key);
+    metadata["storage_object_version_id"] = json!(storage.object_version_id);
+    metadata["storage_integrity"] = json!(storage.integrity);
     metadata["storage_endpoint"] = json!(storage.endpoint);
     metadata.to_string()
 }
@@ -12079,6 +12644,8 @@ async fn upsert_app_release(
     storage_provider: &str,
     storage_bucket: &str,
     storage_object_key: &str,
+    storage_object_version_id: &str,
+    storage_integrity: &str,
     storage_endpoint: &str,
     metadata: &str,
 ) -> Result<i64, sqlx::Error> {
@@ -12099,11 +12666,13 @@ async fn upsert_app_release(
             storage_provider,
             storage_bucket,
             storage_object_key,
+            storage_object_version_id,
+            storage_integrity,
             storage_endpoint,
             metadata,
             updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         ON CONFLICT(app_id, version) DO UPDATE SET
             version_code = excluded.version_code,
             package_name = excluded.package_name,
@@ -12117,6 +12686,8 @@ async fn upsert_app_release(
             storage_provider = excluded.storage_provider,
             storage_bucket = excluded.storage_bucket,
             storage_object_key = excluded.storage_object_key,
+            storage_object_version_id = excluded.storage_object_version_id,
+            storage_integrity = excluded.storage_integrity,
             storage_endpoint = excluded.storage_endpoint,
             metadata = excluded.metadata,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -12137,10 +12708,289 @@ async fn upsert_app_release(
     .bind(storage_provider)
     .bind(storage_bucket)
     .bind(storage_object_key)
+    .bind(storage_object_version_id)
+    .bind(storage_integrity)
     .bind(storage_endpoint)
     .bind(metadata)
     .fetch_one(&mut **tx)
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_app_release_immutable(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    app_id: i64,
+    version: &str,
+    version_code: i64,
+    package_name: &str,
+    package_path: &str,
+    extract_dir: &str,
+    source: &str,
+    checksum_sha256: &str,
+    size_bytes: u64,
+    published_at: &str,
+    status: &str,
+    storage_provider: &str,
+    storage_bucket: &str,
+    storage_object_key: &str,
+    storage_object_version_id: &str,
+    storage_integrity: &str,
+    storage_endpoint: &str,
+    metadata: &str,
+) -> Result<i64, AppError> {
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        INSERT INTO app_releases(
+            app_id,
+            version,
+            version_code,
+            package_name,
+            package_path,
+            extract_dir,
+            status,
+            source,
+            checksum_sha256,
+            size_bytes,
+            published_at,
+            storage_provider,
+            storage_bucket,
+            storage_object_key,
+            storage_object_version_id,
+            storage_integrity,
+            storage_endpoint,
+            metadata,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        ON CONFLICT(app_id, version) DO NOTHING
+        RETURNING id
+        "#,
+    )
+    .bind(app_id)
+    .bind(version)
+    .bind(version_code)
+    .bind(package_name)
+    .bind(package_path)
+    .bind(extract_dir)
+    .bind(status)
+    .bind(source)
+    .bind(checksum_sha256)
+    .bind(size_bytes as i64)
+    .bind(published_at)
+    .bind(storage_provider)
+    .bind(storage_bucket)
+    .bind(storage_object_key)
+    .bind(storage_object_version_id)
+    .bind(storage_integrity)
+    .bind(storage_endpoint)
+    .bind(metadata)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| AppError::Conflict("发布版本已经存在，不能覆盖历史制品".to_owned()))
+}
+
+async fn ensure_release_version_available(
+    db: &SqlitePool,
+    app_id: i64,
+    release_version: &str,
+) -> Result<(), AppError> {
+    let mut tx = db.begin().await?;
+    let availability =
+        ensure_release_version_available_in_transaction(&mut tx, app_id, release_version).await;
+    tx.commit().await?;
+    availability
+}
+
+async fn ensure_release_version_available_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    app_id: i64,
+    release_version: &str,
+) -> Result<(), AppError> {
+    expire_release_upload_reservation(tx, app_id, release_version).await?;
+    let release_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM app_releases WHERE app_id = ?1 AND version = ?2)",
+    )
+    .bind(app_id)
+    .bind(release_version)
+    .fetch_one(&mut **tx)
+    .await?;
+    let upload_reserved = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM app_release_uploads
+            WHERE app_id = ?1
+              AND release_version = ?2
+              AND reservation_active = 1
+        )
+        "#,
+    )
+    .bind(app_id)
+    .bind(release_version)
+    .fetch_one(&mut **tx)
+    .await?;
+    if release_exists {
+        return Err(AppError::Conflict(
+            "发布版本已经存在，不能覆盖历史制品".to_owned(),
+        ));
+    }
+    if upload_reserved {
+        return Err(AppError::Conflict(
+            "该发布版本已有待完成的 OSS 上传会话".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn expire_release_upload_reservation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    app_id: i64,
+    release_version: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE app_release_uploads
+        SET status = 'expired',
+            reservation_active = 0,
+            verification_started_at = NULL,
+            object_cleanup_at = COALESCE(
+                object_cleanup_at,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE app_id = ?1
+          AND release_version = ?2
+          AND status = 'pending'
+          AND reservation_active = 1
+          AND verification_started_at IS NULL
+          AND julianday(expires_at) <= julianday('now')
+        "#,
+    )
+    .bind(app_id)
+    .bind(release_version)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn expire_release_upload(db: &SqlitePool, upload_id: &str) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        UPDATE app_release_uploads
+        SET status = 'expired',
+            reservation_active = 0,
+            verification_started_at = NULL,
+            object_cleanup_at = COALESCE(
+                object_cleanup_at,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ?1
+          AND status = 'pending'
+        "#,
+    )
+    .bind(upload_id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn claim_release_upload_verification(
+    db: &SqlitePool,
+    upload_id: &str,
+) -> Result<bool, AppError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE app_release_uploads
+        SET verification_started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ?1
+          AND status = 'pending'
+          AND reservation_active = 1
+          AND verification_started_at IS NULL
+        "#,
+    )
+    .bind(upload_id)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+async fn clear_release_upload_verification(
+    db: &SqlitePool,
+    upload_id: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        UPDATE app_release_uploads
+        SET verification_started_at = NULL,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ?1
+          AND status = 'pending'
+          AND reservation_active = 1
+        "#,
+    )
+    .bind(upload_id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn store_release_upload_object_version(
+    db: &SqlitePool,
+    upload_id: &str,
+    object_version_id: &str,
+) -> Result<(), AppError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE app_release_uploads
+        SET object_version_id = ?2,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ?1
+          AND status = 'pending'
+          AND reservation_active = 1
+          AND verification_started_at IS NOT NULL
+        "#,
+    )
+    .bind(upload_id)
+    .bind(object_version_id)
+    .execute(db)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::Conflict("上传会话已经完成或不可用".to_owned()));
+    }
+    Ok(())
+}
+
+async fn cancel_release_upload(
+    db: &SqlitePool,
+    upload_id: &str,
+    cleanup_error: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        UPDATE app_release_uploads
+        SET status = 'canceled',
+            reservation_active = 0,
+            verification_started_at = NULL,
+            object_cleanup_at = COALESCE(
+                object_cleanup_at,
+                CASE
+                    WHEN julianday(expires_at) > julianday('now') THEN expires_at
+                    ELSE strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                END
+            ),
+            cleanup_error = ?2,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ?1
+          AND status = 'pending'
+        "#,
+    )
+    .bind(upload_id)
+    .bind(cleanup_error)
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12481,17 +13331,24 @@ fn dedupe_strings(values: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        borrow::Cow,
+        sync::{Arc, Mutex},
+    };
 
     use crate::{
+        artifact_storage::{ArtifactObjectVerifier, ArtifactObjectVersion, VerifiedArtifactObject},
         deploy::{CommandResult, CommandRunner, CommandSpec, DynCommandRunner},
+        platform::UpdatePlatformConfigInput,
         runtimefs::RELEASE_META_FILE_NAME,
     };
     use async_trait::async_trait;
-    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::{migrate::Migrator, sqlite::SqliteConnectOptions};
     use tempfile::{TempDir, tempdir};
 
     use super::*;
+
+    type ReleaseUploadMigrationRow = (String, String, i64, Option<String>, i64, Option<String>);
 
     #[derive(Default)]
     struct NoopCommandRunner;
@@ -12510,6 +13367,129 @@ mod tests {
     #[derive(Default)]
     struct RecordingCommandRunner {
         specs: Mutex<Vec<CommandSpec>>,
+    }
+
+    struct RecordingArtifactObjectVerifier {
+        verified: VerifiedArtifactObject,
+        requested_object_keys: Mutex<Vec<String>>,
+        deleted_objects: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    #[async_trait]
+    impl ArtifactObjectVerifier for RecordingArtifactObjectVerifier {
+        async fn verify(
+            &self,
+            _config: &crate::artifact_storage::AliyunOssConfig,
+            object_key: &str,
+        ) -> Result<VerifiedArtifactObject, ArtifactStorageError> {
+            self.requested_object_keys
+                .lock()
+                .expect("lock artifact object keys")
+                .push(object_key.to_owned());
+            Ok(self.verified.clone())
+        }
+
+        async fn delete(
+            &self,
+            _config: &crate::artifact_storage::AliyunOssConfig,
+            object_key: &str,
+            version_id: Option<&str>,
+        ) -> Result<(), ArtifactStorageError> {
+            self.deleted_objects
+                .lock()
+                .expect("lock deleted artifact objects")
+                .push((object_key.to_owned(), version_id.map(ToOwned::to_owned)));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailOnceDeleteArtifactObjectVerifier {
+        delete_attempts: Mutex<usize>,
+        deleted_objects: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    #[async_trait]
+    impl ArtifactObjectVerifier for FailOnceDeleteArtifactObjectVerifier {
+        async fn verify(
+            &self,
+            _config: &crate::artifact_storage::AliyunOssConfig,
+            _object_key: &str,
+        ) -> Result<VerifiedArtifactObject, ArtifactStorageError> {
+            Err(ArtifactStorageError::Internal(
+                "verification is not used by this cleanup test".to_owned(),
+            ))
+        }
+
+        async fn delete(
+            &self,
+            _config: &crate::artifact_storage::AliyunOssConfig,
+            object_key: &str,
+            version_id: Option<&str>,
+        ) -> Result<(), ArtifactStorageError> {
+            let mut attempts = self.delete_attempts.lock().expect("lock delete attempts");
+            *attempts += 1;
+            if *attempts == 1 {
+                return Err(ArtifactStorageError::Internal(
+                    "temporary OSS delete failure".to_owned(),
+                ));
+            }
+            self.deleted_objects
+                .lock()
+                .expect("lock deleted artifact objects")
+                .push((object_key.to_owned(), version_id.map(ToOwned::to_owned)));
+            Ok(())
+        }
+
+        async fn list_versions(
+            &self,
+            _config: &crate::artifact_storage::AliyunOssConfig,
+            _object_key: &str,
+        ) -> Result<Vec<ArtifactObjectVersion>, ArtifactStorageError> {
+            Ok(vec![ArtifactObjectVersion {
+                version_id: Some("version-to-delete".to_owned()),
+                is_delete_marker: false,
+            }])
+        }
+    }
+
+    struct ListingArtifactObjectVerifier {
+        listed_versions: Vec<ArtifactObjectVersion>,
+        deleted_objects: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    #[async_trait]
+    impl ArtifactObjectVerifier for ListingArtifactObjectVerifier {
+        async fn verify(
+            &self,
+            _config: &crate::artifact_storage::AliyunOssConfig,
+            _object_key: &str,
+        ) -> Result<VerifiedArtifactObject, ArtifactStorageError> {
+            Err(ArtifactStorageError::Internal(
+                "verification is not used by this cleanup test".to_owned(),
+            ))
+        }
+
+        async fn delete(
+            &self,
+            _config: &crate::artifact_storage::AliyunOssConfig,
+            object_key: &str,
+            version_id: Option<&str>,
+        ) -> Result<(), ArtifactStorageError> {
+            self.deleted_objects
+                .lock()
+                .expect("lock deleted artifact objects")
+                .push((object_key.to_owned(), version_id.map(ToOwned::to_owned)));
+            Ok(())
+        }
+
+        async fn list_versions(
+            &self,
+            _config: &crate::artifact_storage::AliyunOssConfig,
+            _object_key: &str,
+        ) -> Result<Vec<ArtifactObjectVersion>, ArtifactStorageError> {
+            Ok(self.listed_versions.clone())
+        }
     }
 
     #[async_trait]
@@ -12570,12 +13550,174 @@ mod tests {
         TaskService::new(db)
     }
 
+    #[tokio::test]
+    async fn release_upload_reservation_migrations_upgrade_existing_0043_rows() {
+        let db = sqlx::SqlitePool::connect_with(
+            "sqlite::memory:"
+                .parse::<SqliteConnectOptions>()
+                .expect("valid in-memory sqlite url")
+                .foreign_keys(true),
+        )
+        .await
+        .expect("connect in-memory sqlite");
+        let all_migrations = sqlx::migrate!("./migrations");
+        let legacy_migrations = Migrator {
+            migrations: Cow::Owned(
+                all_migrations
+                    .iter()
+                    .filter(|migration| migration.version <= 43)
+                    .cloned()
+                    .collect(),
+            ),
+            ..Migrator::DEFAULT
+        };
+        legacy_migrations
+            .run(&db)
+            .await
+            .expect("apply migrations through 0043");
+        let app_id = sqlx::query(
+            r#"
+            INSERT INTO apps(app_key, name, app_type, deploy_mode, work_dir, status)
+            VALUES ('legacy-upload-app', 'Legacy Upload App', 'compose', 'compose', '/tmp/legacy-upload-app', 'ready')
+            "#,
+        )
+        .execute(&db)
+        .await
+        .expect("insert legacy app")
+        .last_insert_rowid();
+        sqlx::query(
+            r#"
+            INSERT INTO app_releases(
+                app_id, version, version_code, package_name,
+                storage_provider, storage_bucket, storage_object_key
+            )
+            VALUES (
+                ?1, 'v0.9.0', 9000, 'legacy.tar.gz',
+                'aliyun_oss', 'legacy-bucket', 'legacy/legacy.tar.gz'
+            )
+            "#,
+        )
+        .bind(app_id)
+        .execute(&db)
+        .await
+        .expect("insert legacy oss release");
+        for (id, created_at) in [
+            ("legacy-upload-old", "2026-07-01T00:00:00.000Z"),
+            ("legacy-upload-new", "2026-07-02T00:00:00.000Z"),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO app_release_uploads(
+                    id, app_id, release_version, version_code, file_name, object_key,
+                    bucket, endpoint, status, expires_at, created_at
+                )
+                VALUES (?1, ?2, 'v1.2.3', 1002003, 'legacy.tar.gz', ?3,
+                        'legacy-bucket', 'https://oss-cn-hangzhou.aliyuncs.com',
+                        'pending', '2030-01-01T00:00:00Z', ?4)
+                "#,
+            )
+            .bind(id)
+            .bind(app_id)
+            .bind(format!("legacy/{id}.tar.gz"))
+            .bind(created_at)
+            .execute(&db)
+            .await
+            .expect("insert legacy upload session");
+        }
+
+        all_migrations
+            .run(&db)
+            .await
+            .expect("upgrade legacy uploads through current migration");
+
+        let rows: Vec<ReleaseUploadMigrationRow> = sqlx::query_as(
+            r#"
+                SELECT id, status, reservation_active, object_cleanup_at,
+                       cleanup_attempts, cleanup_completed_at
+                FROM app_release_uploads
+                WHERE app_id = ?1
+                ORDER BY id ASC
+                "#,
+        )
+        .bind(app_id)
+        .fetch_all(&db)
+        .await
+        .expect("load upgraded upload sessions");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "legacy-upload-new");
+        assert_eq!(rows[0].1, "pending");
+        assert_eq!(rows[0].2, 1);
+        assert!(rows[0].3.is_none());
+        assert_eq!(rows[0].4, 0);
+        assert!(rows[0].5.is_none());
+        assert_eq!(rows[1].0, "legacy-upload-old");
+        assert_eq!(rows[1].1, "canceled");
+        assert_eq!(rows[1].2, 0);
+        assert!(rows[1].3.is_some());
+        assert_eq!(rows[1].4, 0);
+        assert!(rows[1].5.is_none());
+        let storage_integrity: String = sqlx::query_scalar(
+            "SELECT storage_integrity FROM app_releases WHERE app_id = ?1 AND version = 'v0.9.0'",
+        )
+        .bind(app_id)
+        .fetch_one(&db)
+        .await
+        .expect("load upgraded legacy oss release");
+        assert_eq!(storage_integrity, OSS_RELEASE_STORAGE_INTEGRITY_LEGACY);
+    }
+
+    #[test]
+    fn oss_release_storage_integrity_blocks_unbound_legacy_objects() {
+        assert!(
+            validate_oss_release_storage_integrity(OSS_RELEASE_STORAGE_INTEGRITY_LEGACY, None,)
+                .is_err()
+        );
+        assert!(
+            validate_oss_release_storage_integrity(OSS_RELEASE_STORAGE_INTEGRITY_UNIQUE_KEY, None,)
+                .is_ok()
+        );
+        assert!(
+            validate_oss_release_storage_integrity(
+                OSS_RELEASE_STORAGE_INTEGRITY_VERSION_PINNED,
+                Some("version-verified"),
+            )
+            .is_ok()
+        );
+        let err = validate_oss_release_storage_integrity(
+            OSS_RELEASE_STORAGE_INTEGRITY_VERSION_PINNED,
+            Some("null"),
+        )
+        .expect_err("null version cannot bind a release");
+        assert!(err.message().contains("null"));
+    }
+
     async fn app_service() -> (AppService, SqlitePool, TempDir) {
         app_service_with_runner(Arc::new(NoopCommandRunner)).await
     }
 
     async fn app_service_with_runner(
         runner: DynCommandRunner,
+    ) -> (AppService, SqlitePool, TempDir) {
+        app_service_with_runner_and_artifact_verifier(
+            runner,
+            Arc::new(AliyunOssObjectVerifier::default()),
+        )
+        .await
+    }
+
+    async fn app_service_with_artifact_verifier(
+        artifact_object_verifier: Arc<dyn ArtifactObjectVerifier>,
+    ) -> (AppService, SqlitePool, TempDir) {
+        app_service_with_runner_and_artifact_verifier(
+            Arc::new(NoopCommandRunner),
+            artifact_object_verifier,
+        )
+        .await
+    }
+
+    async fn app_service_with_runner_and_artifact_verifier(
+        runner: DynCommandRunner,
+        artifact_object_verifier: Arc<dyn ArtifactObjectVerifier>,
     ) -> (AppService, SqlitePool, TempDir) {
         let db = sqlx::SqlitePool::connect_with(
             "sqlite::memory:"
@@ -12592,17 +13734,41 @@ mod tests {
         let data_dir = tempdir().expect("create app data dir");
         let tasks = TaskService::new(db.clone());
         let platform = PlatformConfigService::new(db.clone());
-        let apps = AppService::new(
+        let apps = AppService::new_with_artifact_object_verifier(
             db.clone(),
             RuntimeFs::new(data_dir.path()),
             ComposeExecutor::new(runner.clone()),
             SystemdExecutor::new(runner),
             tasks,
             platform,
+            artifact_object_verifier,
         )
         .await
         .expect("create app service");
         (apps, db, data_dir)
+    }
+
+    async fn enable_oss_storage(db: &SqlitePool) {
+        PlatformConfigService::new(db.clone())
+            .update_config(
+                UpdatePlatformConfigInput {
+                    default_app_work_dir: "/opt/easy-deploy/apps/{app_key}".to_owned(),
+                    default_node_work_dir: "/opt/easy-deploy/apps".to_owned(),
+                    uploaded_binary_releases_to_keep: 4,
+                    artifact_storage_provider: "aliyun_oss".to_owned(),
+                    aliyun_oss_region: "oss-cn-hangzhou".to_owned(),
+                    aliyun_oss_endpoint: "https://oss-cn-hangzhou.aliyuncs.com".to_owned(),
+                    aliyun_oss_bucket: "easy-deploy-test".to_owned(),
+                    aliyun_oss_object_prefix: "easy-deploy/releases".to_owned(),
+                    aliyun_oss_access_key_id: "test-key".to_owned(),
+                    aliyun_oss_access_key_secret: "test-secret".to_owned(),
+                    aliyun_oss_upload_url_ttl_seconds: 900,
+                    aliyun_oss_download_url_ttl_seconds: 600,
+                },
+                "test",
+            )
+            .await
+            .expect("enable oss storage");
     }
 
     async fn create_manual_compose_app(apps: &AppService, app_key: &str) -> i64 {
@@ -12902,6 +14068,668 @@ mod tests {
             .expect("canceled release");
         assert_eq!(release.status, "received");
         assert_eq!(release.scheduled_publish_at, None);
+    }
+
+    #[tokio::test]
+    async fn package_release_version_cannot_overwrite_existing_artifact() {
+        let (apps, _db, _data_dir) = app_service().await;
+        let app_id = create_manual_compose_app(&apps, "orders-api-immutable").await;
+        let first = apps
+            .upload_release_package(UploadReleasePackageInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: None,
+                published_at: "2026-06-23T10:00:00Z".to_owned(),
+                file_name: "package-v1.2.3.bin".to_owned(),
+                bytes: b"first artifact".to_vec(),
+                entry_file: String::new(),
+                source: "web".to_owned(),
+            })
+            .await
+            .expect("upload first package");
+
+        let err = apps
+            .upload_release_package(UploadReleasePackageInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: None,
+                published_at: "2026-06-24T10:00:00Z".to_owned(),
+                file_name: "package-v1.2.3.bin".to_owned(),
+                bytes: b"replacement artifact".to_vec(),
+                entry_file: String::new(),
+                source: "web".to_owned(),
+            })
+            .await
+            .expect_err("same release version must be immutable");
+        assert!(matches!(err, AppError::Conflict(_)));
+
+        let release = apps
+            .list_app_releases()
+            .await
+            .expect("list releases")
+            .into_iter()
+            .find(|release| release.id == first.release_id)
+            .expect("first release remains available");
+        assert_eq!(release.checksum_sha256, sha256_hex(b"first artifact"));
+        assert_eq!(release.size_bytes, b"first artifact".len() as i64);
+    }
+
+    #[tokio::test]
+    async fn failed_local_package_preparation_leaves_version_available_for_retry() {
+        let (apps, _db, data_dir) = app_service().await;
+        let app_key = "orders-api-local-retry";
+        let app_id = create_manual_compose_app(&apps, app_key).await;
+
+        let err = apps
+            .upload_release_package(UploadReleasePackageInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: None,
+                published_at: String::new(),
+                file_name: "orders-api-local-retry_version_1_2_3.tar.gz".to_owned(),
+                bytes: b"not a gzip archive".to_vec(),
+                entry_file: String::new(),
+                source: "web".to_owned(),
+            })
+            .await
+            .expect_err("invalid tar.gz must fail before registering the release");
+        assert!(matches!(err, AppError::InvalidInput(_)));
+        assert!(
+            apps.list_app_releases()
+                .await
+                .expect("list releases")
+                .is_empty()
+        );
+        assert!(
+            !data_dir
+                .path()
+                .join("apps")
+                .join(app_key)
+                .join(RELEASES_DIR_NAME)
+                .join("v1.2.3")
+                .exists()
+        );
+
+        apps.upload_release_package(UploadReleasePackageInput {
+            app_id,
+            release_version: "v1.2.3".to_owned(),
+            version_code: None,
+            published_at: String::new(),
+            file_name: "orders-api-local-retry-v1.2.3.bin".to_owned(),
+            bytes: b"valid artifact".to_vec(),
+            entry_file: String::new(),
+            source: "web".to_owned(),
+        })
+        .await
+        .expect("same version can retry after staged preparation failure");
+    }
+
+    #[tokio::test]
+    async fn unpromoted_local_upload_cleanup_preserves_existing_release_package() {
+        let data_dir = tempdir().expect("create runtime data dir");
+        let runtime_fs = RuntimeFs::new(data_dir.path());
+        let committed = runtime_fs
+            .stage_release_package_file(
+                "orders-api-local-concurrent",
+                "v1.2.3",
+                "orders-api-local-concurrent_version_1_2_3.bin",
+                b"first artifact",
+            )
+            .await
+            .expect("stage committed package");
+        runtime_fs
+            .promote_staged_release_package(&committed)
+            .await
+            .expect("promote committed package");
+        let conflicting = runtime_fs
+            .stage_release_package_file(
+                "orders-api-local-concurrent",
+                "v1.2.3",
+                "orders-api-local-concurrent_version_1_2_3.bin",
+                b"conflicting artifact",
+            )
+            .await
+            .expect("stage conflicting package");
+
+        cleanup_failed_staged_release_package(&runtime_fs, &conflicting, false).await;
+
+        assert!(committed.package_path.is_file());
+        assert_eq!(
+            fs::read(&committed.package_path).expect("read committed package"),
+            b"first artifact"
+        );
+        assert!(!conflicting.staging_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn oss_upload_reserves_release_version_and_uses_unique_object_key() {
+        let verifier = Arc::new(RecordingArtifactObjectVerifier {
+            verified: VerifiedArtifactObject {
+                checksum_sha256: sha256_hex(b"verified artifact"),
+                size_bytes: b"verified artifact".len() as u64,
+                version_id: Some("version-verified".to_owned()),
+            },
+            requested_object_keys: Mutex::new(Vec::new()),
+            deleted_objects: Mutex::new(Vec::new()),
+        });
+        let (apps, db, _data_dir) = app_service_with_artifact_verifier(verifier).await;
+        enable_oss_storage(&db).await;
+        let app_id = create_manual_compose_app(&apps, "orders-api-oss-reservation").await;
+
+        let first = apps
+            .create_release_package_upload(CreateReleasePackageUploadInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: None,
+                published_at: String::new(),
+                file_name: "orders-api-oss-reservation_version_1_2_3.tar.gz".to_owned(),
+                source: "openapi".to_owned(),
+            })
+            .await
+            .expect("create first oss upload");
+        assert!(
+            first
+                .object_key
+                .contains(&format!("/uploads/{}/", first.upload_id))
+        );
+        assert!(first.upload_headers.iter().any(|(name, value)| {
+            name == crate::artifact_storage::ARTIFACT_UPLOAD_FORBID_OVERWRITE_HEADER
+                && value == crate::artifact_storage::ARTIFACT_UPLOAD_FORBID_OVERWRITE_VALUE
+        }));
+
+        let local_upload_err = apps
+            .upload_release_package(UploadReleasePackageInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: None,
+                published_at: String::new(),
+                file_name: "local-v1.2.3.bin".to_owned(),
+                bytes: b"local artifact".to_vec(),
+                entry_file: String::new(),
+                source: "web".to_owned(),
+            })
+            .await
+            .expect_err("an active oss upload must also block local upload");
+        assert!(matches!(local_upload_err, AppError::Conflict(_)));
+
+        let err = apps
+            .create_release_package_upload(CreateReleasePackageUploadInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: None,
+                published_at: String::new(),
+                file_name: "orders-api-oss-reservation_version_1_2_3.tar.gz".to_owned(),
+                source: "openapi".to_owned(),
+            })
+            .await
+            .expect_err("an active upload must reserve its release version");
+        assert!(matches!(err, AppError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn oss_completion_rejects_wrong_client_metadata_without_consuming_upload() {
+        let verifier = Arc::new(RecordingArtifactObjectVerifier {
+            verified: VerifiedArtifactObject {
+                checksum_sha256: sha256_hex(b"verified artifact"),
+                size_bytes: b"verified artifact".len() as u64,
+                version_id: Some("version-verified".to_owned()),
+            },
+            requested_object_keys: Mutex::new(Vec::new()),
+            deleted_objects: Mutex::new(Vec::new()),
+        });
+        let (apps, db, _data_dir) = app_service_with_artifact_verifier(verifier.clone()).await;
+        enable_oss_storage(&db).await;
+        let app_id = create_manual_compose_app(&apps, "orders-api-oss-verified").await;
+        let upload = apps
+            .create_release_package_upload(CreateReleasePackageUploadInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: None,
+                published_at: String::new(),
+                file_name: "orders-api-oss-verified_version_1_2_3.tar.gz".to_owned(),
+                source: "openapi".to_owned(),
+            })
+            .await
+            .expect("create oss upload");
+
+        let err = apps
+            .complete_release_package_upload(CompleteReleasePackageUploadInput {
+                upload_id: upload.upload_id.clone(),
+                service_key: "orders-api-oss-verified".to_owned(),
+                checksum_sha256: "a".repeat(64),
+                size_bytes: 1,
+                published_at: String::new(),
+                source: "openapi".to_owned(),
+            })
+            .await
+            .expect_err("client metadata cannot replace server verification");
+        assert!(matches!(err, AppError::InvalidInput(_)));
+        assert_eq!(
+            verifier
+                .requested_object_keys
+                .lock()
+                .expect("lock artifact object keys")
+                .as_slice(),
+            [upload.object_key]
+        );
+
+        let (status, reservation_active, object_version_id): (String, i64, String) = sqlx::query_as(
+            "SELECT status, reservation_active, object_version_id FROM app_release_uploads WHERE id = ?1",
+        )
+            .bind(&upload.upload_id)
+            .fetch_one(&db)
+            .await
+            .expect("load rejected upload");
+        assert_eq!(status, "pending");
+        assert_eq!(reservation_active, 1);
+        assert_eq!(object_version_id, "version-verified");
+        let releases = apps.list_app_releases().await.expect("list releases");
+        assert!(releases.is_empty());
+
+        let completed = apps
+            .complete_release_package_upload(CompleteReleasePackageUploadInput {
+                upload_id: upload.upload_id,
+                service_key: "orders-api-oss-verified".to_owned(),
+                checksum_sha256: sha256_hex(b"verified artifact"),
+                size_bytes: b"verified artifact".len() as i64,
+                published_at: String::new(),
+                source: "openapi".to_owned(),
+            })
+            .await
+            .expect("correct metadata can retry the same upload");
+        let release = apps
+            .list_app_releases()
+            .await
+            .expect("list releases")
+            .into_iter()
+            .find(|release| release.id == completed.release_id)
+            .expect("registered oss release");
+        assert_eq!(release.storage_object_version_id, "version-verified");
+        let storage_integrity: String =
+            sqlx::query_scalar("SELECT storage_integrity FROM app_releases WHERE id = ?1")
+                .bind(completed.release_id)
+                .fetch_one(&db)
+                .await
+                .expect("load release storage integrity");
+        assert_eq!(
+            storage_integrity,
+            OSS_RELEASE_STORAGE_INTEGRITY_VERSION_PINNED
+        );
+    }
+
+    #[tokio::test]
+    async fn oss_completion_without_version_marks_unique_object_key_integrity() {
+        let verifier = Arc::new(RecordingArtifactObjectVerifier {
+            verified: VerifiedArtifactObject {
+                checksum_sha256: sha256_hex(b"verified artifact"),
+                size_bytes: b"verified artifact".len() as u64,
+                version_id: None,
+            },
+            requested_object_keys: Mutex::new(Vec::new()),
+            deleted_objects: Mutex::new(Vec::new()),
+        });
+        let (apps, db, _data_dir) = app_service_with_artifact_verifier(verifier).await;
+        enable_oss_storage(&db).await;
+        let app_id = create_manual_compose_app(&apps, "orders-api-oss-unique-key").await;
+        let upload = apps
+            .create_release_package_upload(CreateReleasePackageUploadInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: None,
+                published_at: String::new(),
+                file_name: "orders-api-oss-unique-key_version_1_2_3.tar.gz".to_owned(),
+                source: "openapi".to_owned(),
+            })
+            .await
+            .expect("create oss upload");
+
+        let completed = apps
+            .complete_release_package_upload(CompleteReleasePackageUploadInput {
+                upload_id: upload.upload_id,
+                service_key: "orders-api-oss-unique-key".to_owned(),
+                checksum_sha256: sha256_hex(b"verified artifact"),
+                size_bytes: b"verified artifact".len() as i64,
+                published_at: String::new(),
+                source: "openapi".to_owned(),
+            })
+            .await
+            .expect("complete non-versioned oss upload");
+        let (storage_integrity, object_version_id): (String, String) = sqlx::query_as(
+            "SELECT storage_integrity, storage_object_version_id FROM app_releases WHERE id = ?1",
+        )
+        .bind(completed.release_id)
+        .fetch_one(&db)
+        .await
+        .expect("load release storage integrity");
+        assert_eq!(storage_integrity, OSS_RELEASE_STORAGE_INTEGRITY_UNIQUE_KEY);
+        assert!(object_version_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn oss_completion_rejects_null_object_version_without_consuming_upload() {
+        let verifier = Arc::new(RecordingArtifactObjectVerifier {
+            verified: VerifiedArtifactObject {
+                checksum_sha256: sha256_hex(b"verified artifact"),
+                size_bytes: b"verified artifact".len() as u64,
+                version_id: Some("null".to_owned()),
+            },
+            requested_object_keys: Mutex::new(Vec::new()),
+            deleted_objects: Mutex::new(Vec::new()),
+        });
+        let (apps, db, _data_dir) = app_service_with_artifact_verifier(verifier).await;
+        enable_oss_storage(&db).await;
+        let app_id = create_manual_compose_app(&apps, "orders-api-oss-null-version").await;
+        let upload = apps
+            .create_release_package_upload(CreateReleasePackageUploadInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: None,
+                published_at: String::new(),
+                file_name: "orders-api-oss-null-version_version_1_2_3.tar.gz".to_owned(),
+                source: "openapi".to_owned(),
+            })
+            .await
+            .expect("create oss upload");
+
+        let err = apps
+            .complete_release_package_upload(CompleteReleasePackageUploadInput {
+                upload_id: upload.upload_id.clone(),
+                service_key: "orders-api-oss-null-version".to_owned(),
+                checksum_sha256: sha256_hex(b"verified artifact"),
+                size_bytes: b"verified artifact".len() as i64,
+                published_at: String::new(),
+                source: "openapi".to_owned(),
+            })
+            .await
+            .expect_err("null version must not be accepted as an immutable object version");
+        assert!(matches!(err, AppError::InvalidInput(_)));
+        assert!(err.message().contains("null"));
+
+        let (status, reservation_active, object_version_id): (String, i64, String) =
+            sqlx::query_as(
+                "SELECT status, reservation_active, object_version_id FROM app_release_uploads WHERE id = ?1",
+            )
+            .bind(&upload.upload_id)
+            .fetch_one(&db)
+            .await
+            .expect("load rejected upload");
+        assert_eq!(status, "pending");
+        assert_eq!(reservation_active, 1);
+        assert!(object_version_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn canceled_oss_upload_cleanup_retries_and_deletes_verified_object_version() {
+        let verifier = Arc::new(FailOnceDeleteArtifactObjectVerifier::default());
+        let (apps, db, _data_dir) = app_service_with_artifact_verifier(verifier.clone()).await;
+        enable_oss_storage(&db).await;
+        let app_id = create_manual_compose_app(&apps, "orders-api-oss-cleanup").await;
+        let upload = apps
+            .create_release_package_upload(CreateReleasePackageUploadInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: None,
+                published_at: String::new(),
+                file_name: "orders-api-oss-cleanup_version_1_2_3.tar.gz".to_owned(),
+                source: "openapi".to_owned(),
+            })
+            .await
+            .expect("create oss upload");
+        sqlx::query(
+            "UPDATE app_release_uploads SET object_version_id = 'version-to-delete', expires_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+        )
+        .bind(&upload.upload_id)
+        .execute(&db)
+        .await
+        .expect("store object version");
+        cancel_release_upload(&db, &upload.upload_id, "test cleanup")
+            .await
+            .expect("cancel upload");
+
+        let platform = PlatformConfigService::new(db.clone());
+        cleanup_release_upload_object(&db, &platform, verifier.as_ref(), &upload.upload_id)
+            .await
+            .expect_err("first cleanup attempt fails");
+        let (attempts, started_at, completed_at, cleanup_error):
+            (i64, Option<String>, Option<String>, String) = sqlx::query_as(
+            "SELECT cleanup_attempts, cleanup_started_at, cleanup_completed_at, cleanup_error FROM app_release_uploads WHERE id = ?1",
+        )
+        .bind(&upload.upload_id)
+        .fetch_one(&db)
+        .await
+        .expect("load failed cleanup state");
+        assert_eq!(attempts, 1);
+        assert!(started_at.is_none());
+        assert!(completed_at.is_none());
+        assert!(cleanup_error.contains("temporary OSS delete failure"));
+
+        cleanup_release_upload_object(&db, &platform, verifier.as_ref(), &upload.upload_id)
+            .await
+            .expect("second cleanup attempt succeeds");
+        let (attempts, completed_at, cleanup_error): (i64, Option<String>, String) =
+            sqlx::query_as(
+                "SELECT cleanup_attempts, cleanup_completed_at, cleanup_error FROM app_release_uploads WHERE id = ?1",
+            )
+            .bind(&upload.upload_id)
+            .fetch_one(&db)
+            .await
+            .expect("load completed cleanup state");
+        assert_eq!(attempts, 2);
+        assert!(completed_at.is_some());
+        assert!(cleanup_error.is_empty());
+        assert_eq!(
+            verifier
+                .deleted_objects
+                .lock()
+                .expect("lock deleted objects")
+                .as_slice(),
+            [(upload.object_key, Some("version-to-delete".to_owned()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_oss_upload_waits_for_presigned_url_expiration_before_cleanup() {
+        let verifier = Arc::new(RecordingArtifactObjectVerifier {
+            verified: VerifiedArtifactObject {
+                checksum_sha256: sha256_hex(b"unused"),
+                size_bytes: b"unused".len() as u64,
+                version_id: None,
+            },
+            requested_object_keys: Mutex::new(Vec::new()),
+            deleted_objects: Mutex::new(Vec::new()),
+        });
+        let (apps, db, _data_dir) = app_service_with_artifact_verifier(verifier.clone()).await;
+        enable_oss_storage(&db).await;
+        let app_id = create_manual_compose_app(&apps, "orders-api-oss-delayed-cleanup").await;
+        let upload = apps
+            .create_release_package_upload(CreateReleasePackageUploadInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: None,
+                published_at: String::new(),
+                file_name: "orders-api-oss-delayed-cleanup_version_1_2_3.tar.gz".to_owned(),
+                source: "openapi".to_owned(),
+            })
+            .await
+            .expect("create oss upload");
+        cancel_release_upload(&db, &upload.upload_id, "test delayed cleanup")
+            .await
+            .expect("cancel upload");
+
+        let (object_cleanup_at, expires_at): (Option<String>, String) = sqlx::query_as(
+            "SELECT object_cleanup_at, expires_at FROM app_release_uploads WHERE id = ?1",
+        )
+        .bind(&upload.upload_id)
+        .fetch_one(&db)
+        .await
+        .expect("load canceled upload");
+        assert_eq!(object_cleanup_at.as_deref(), Some(expires_at.as_str()));
+        assert!(
+            !pending_release_upload_cleanup_ids(&db)
+                .await
+                .expect("find due cleanup ids")
+                .contains(&upload.upload_id)
+        );
+
+        let platform = PlatformConfigService::new(db.clone());
+        cleanup_release_upload_object(&db, &platform, verifier.as_ref(), &upload.upload_id)
+            .await
+            .expect("future cleanup must not be claimed");
+        let cleanup_completed_at: Option<String> = sqlx::query_scalar(
+            "SELECT cleanup_completed_at FROM app_release_uploads WHERE id = ?1",
+        )
+        .bind(&upload.upload_id)
+        .fetch_one(&db)
+        .await
+        .expect("load cleanup state");
+        assert!(cleanup_completed_at.is_none());
+        assert!(
+            verifier
+                .deleted_objects
+                .lock()
+                .expect("lock deleted object list")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_uncompleted_oss_upload_deletes_every_object_version_and_marker() {
+        let verifier = Arc::new(ListingArtifactObjectVerifier {
+            listed_versions: vec![
+                ArtifactObjectVersion {
+                    version_id: Some("version-current".to_owned()),
+                    is_delete_marker: false,
+                },
+                ArtifactObjectVersion {
+                    version_id: Some("version-previous".to_owned()),
+                    is_delete_marker: false,
+                },
+                ArtifactObjectVersion {
+                    version_id: Some("delete-marker".to_owned()),
+                    is_delete_marker: true,
+                },
+            ],
+            deleted_objects: Mutex::new(Vec::new()),
+        });
+        let (apps, db, _data_dir) = app_service_with_artifact_verifier(verifier.clone()).await;
+        enable_oss_storage(&db).await;
+        let app_id = create_manual_compose_app(&apps, "orders-api-oss-versioned-cleanup").await;
+        let upload = apps
+            .create_release_package_upload(CreateReleasePackageUploadInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: None,
+                published_at: String::new(),
+                file_name: "orders-api-oss-versioned-cleanup_version_1_2_3.tar.gz".to_owned(),
+                source: "openapi".to_owned(),
+            })
+            .await
+            .expect("create oss upload");
+        sqlx::query(
+            "UPDATE app_release_uploads SET expires_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+        )
+        .bind(&upload.upload_id)
+        .execute(&db)
+        .await
+        .expect("expire upload session");
+        assert_eq!(
+            expire_due_release_uploads(&db)
+                .await
+                .expect("expire upload"),
+            vec![upload.upload_id.clone()]
+        );
+        let object_version_id: String =
+            sqlx::query_scalar("SELECT object_version_id FROM app_release_uploads WHERE id = ?1")
+                .bind(&upload.upload_id)
+                .fetch_one(&db)
+                .await
+                .expect("load uncompleted upload version id");
+        assert!(object_version_id.is_empty());
+
+        let platform = PlatformConfigService::new(db.clone());
+        cleanup_release_upload_object(&db, &platform, verifier.as_ref(), &upload.upload_id)
+            .await
+            .expect("clean all object versions");
+        assert_eq!(
+            verifier
+                .deleted_objects
+                .lock()
+                .expect("lock deleted object versions")
+                .as_slice(),
+            [
+                (
+                    upload.object_key.clone(),
+                    Some("version-current".to_owned())
+                ),
+                (
+                    upload.object_key.clone(),
+                    Some("version-previous".to_owned())
+                ),
+                (upload.object_key, Some("delete-marker".to_owned())),
+            ]
+        );
+        let cleanup_completed_at: Option<String> = sqlx::query_scalar(
+            "SELECT cleanup_completed_at FROM app_release_uploads WHERE id = ?1",
+        )
+        .bind(&upload.upload_id)
+        .fetch_one(&db)
+        .await
+        .expect("load cleanup state");
+        assert!(cleanup_completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_oss_upload_sessions_expire_without_a_followup_request() {
+        let (apps, db, _data_dir) = app_service().await;
+        enable_oss_storage(&db).await;
+        let app_id = create_manual_compose_app(&apps, "orders-api-oss-expire").await;
+        let upload = apps
+            .create_release_package_upload(CreateReleasePackageUploadInput {
+                app_id,
+                release_version: "v1.2.3".to_owned(),
+                version_code: None,
+                published_at: String::new(),
+                file_name: "orders-api-oss-expire_version_1_2_3.tar.gz".to_owned(),
+                source: "openapi".to_owned(),
+            })
+            .await
+            .expect("create oss upload");
+        sqlx::query(
+            "UPDATE app_release_uploads SET expires_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+        )
+        .bind(&upload.upload_id)
+        .execute(&db)
+        .await
+        .expect("expire upload session");
+
+        assert_eq!(
+            expire_due_release_uploads(&db)
+                .await
+                .expect("expire stale sessions"),
+            vec![upload.upload_id.clone()]
+        );
+        let (status, reservation_active, object_cleanup_at): (String, i64, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, reservation_active, object_cleanup_at FROM app_release_uploads WHERE id = ?1",
+            )
+            .bind(&upload.upload_id)
+            .fetch_one(&db)
+            .await
+            .expect("load expired upload state");
+        assert_eq!(status, "expired");
+        assert_eq!(reservation_active, 0);
+        assert!(object_cleanup_at.is_some());
+
+        apps.create_release_package_upload(CreateReleasePackageUploadInput {
+            app_id,
+            release_version: "v1.2.3".to_owned(),
+            version_code: None,
+            published_at: String::new(),
+            file_name: "orders-api-oss-expire_version_1_2_3.tar.gz".to_owned(),
+            source: "openapi".to_owned(),
+        })
+        .await
+        .expect("expired reservation no longer blocks a new upload session");
     }
 
     #[tokio::test]

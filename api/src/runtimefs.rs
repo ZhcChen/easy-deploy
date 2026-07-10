@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -18,6 +21,8 @@ pub const RELEASES_DIR_NAME: &str = "releases";
 pub const CURRENT_RELEASE_FILE_NAME: &str = "current";
 pub const SYSTEMD_DIR_NAME: &str = "systemd";
 pub const RELEASE_META_FILE_NAME: &str = "release.yaml";
+
+static RELEASE_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct RuntimeFs {
@@ -191,6 +196,14 @@ pub struct ReleaseRuntimeWriteResult {
     pub release_dir: PathBuf,
     pub release_file: PathBuf,
     pub content: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct StagedReleasePackage {
+    pub staging_dir: PathBuf,
+    pub staged_package_path: PathBuf,
+    pub release_dir: PathBuf,
+    pub package_path: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -378,6 +391,108 @@ impl RuntimeFs {
         let artifact_path = release_dir.join(file_name);
         write_file(artifact_path.clone(), bytes).await?;
         Ok(artifact_path)
+    }
+
+    pub async fn stage_release_package_file(
+        &self,
+        app_key: &str,
+        release_version: &str,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<StagedReleasePackage, RuntimeFsError> {
+        validate_key(app_key)?;
+        validate_release_id(release_version)?;
+        let file_name = sanitize_file_name(file_name)?;
+        let root_dir = self.app_root(app_key)?;
+        let releases_dir = root_dir.join(RELEASES_DIR_NAME);
+        let release_dir = releases_dir.join(release_version);
+        let staging_name = format!(
+            ".staging-{release_version}-{}-{}",
+            std::process::id(),
+            RELEASE_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        );
+        let staging_dir = releases_dir.join(staging_name);
+        let staged_package_path = staging_dir.join(&file_name);
+        let package_path = release_dir.join(&file_name);
+        let releases_dir_for_write = releases_dir.clone();
+        let staging_dir_for_write = staging_dir.clone();
+        let staged_package_path_for_write = staged_package_path.clone();
+        let content = bytes.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&releases_dir_for_write)
+                .map_err(|err| io_error("创建发布版本目录", &releases_dir_for_write, err))?;
+            std::fs::create_dir(&staging_dir_for_write)
+                .map_err(|err| io_error("创建发布版本临时目录", &staging_dir_for_write, err))?;
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staged_package_path_for_write)
+            {
+                Ok(file) => file,
+                Err(err) => {
+                    let _ = std::fs::remove_dir_all(&staging_dir_for_write);
+                    return Err(io_error(
+                        "创建发布版本临时包",
+                        &staged_package_path_for_write,
+                        err,
+                    ));
+                }
+            };
+            if let Err(err) = std::io::Write::write_all(&mut file, &content) {
+                let _ = std::fs::remove_dir_all(&staging_dir_for_write);
+                return Err(io_error(
+                    "写入发布版本临时包",
+                    &staged_package_path_for_write,
+                    err,
+                ));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|err| RuntimeFsError::Io(format!("写入发布版本临时包任务失败: {err}")))??;
+
+        Ok(StagedReleasePackage {
+            staging_dir,
+            staged_package_path,
+            release_dir,
+            package_path,
+        })
+    }
+
+    pub async fn promote_staged_release_package(
+        &self,
+        staged: &StagedReleasePackage,
+    ) -> Result<PathBuf, RuntimeFsError> {
+        let staging_dir = staged.staging_dir.clone();
+        let release_dir = staged.release_dir.clone();
+        let package_path = staged.package_path.clone();
+        tokio::task::spawn_blocking(move || {
+            if release_dir.exists() {
+                return Err(RuntimeFsError::InvalidInput(
+                    "发布版本目录已经存在，不能覆盖".to_owned(),
+                ));
+            }
+            std::fs::rename(&staging_dir, &release_dir)
+                .map_err(|err| io_error("提升发布版本临时目录", &staging_dir, err))?;
+            Ok(package_path)
+        })
+        .await
+        .map_err(|err| RuntimeFsError::Io(format!("提升发布版本临时目录任务失败: {err}")))?
+    }
+
+    pub async fn discard_staged_release_package(
+        &self,
+        staged: &StagedReleasePackage,
+    ) -> Result<(), RuntimeFsError> {
+        remove_release_package_dir(&staged.staging_dir).await
+    }
+
+    pub async fn remove_promoted_release_package(
+        &self,
+        staged: &StagedReleasePackage,
+    ) -> Result<(), RuntimeFsError> {
+        remove_release_package_dir(&staged.release_dir).await
     }
 
     pub async fn save_release_runtime_metadata(
@@ -1063,6 +1178,14 @@ fn sanitize_file_name(value: &str) -> Result<String, RuntimeFsError> {
 
 fn io_error(action: &str, path: &Path, err: std::io::Error) -> RuntimeFsError {
     RuntimeFsError::Io(format!("{action} {} 失败: {err}", path.to_string_lossy()))
+}
+
+async fn remove_release_package_dir(path: &Path) -> Result<(), RuntimeFsError> {
+    match fs::remove_dir_all(path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(io_error("清理发布版本目录", path, err)),
+    }
 }
 
 #[cfg(test)]
