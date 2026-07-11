@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+aes-gcm.workspace = true
 askama = { workspace = true, features = ["derive"] }
 axum = { workspace = true, features = ["multipart"] }
 argon2.workspace = true

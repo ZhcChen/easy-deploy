@@ -179,6 +179,8 @@ pub async fn smoke_test() -> anyhow::Result<()> {
         cookie_secure: false,
         uploaded_binary_releases_to_keep: 4,
         command_timeout_secs: 120,
+        config_active_key_id: "v1".to_owned(),
+        config_master_keys: String::new(),
     };
     let app = build_router(AppState::new(
         settings,
@@ -191,6 +193,7 @@ pub async fn smoke_test() -> anyhow::Result<()> {
             tasks,
             platform,
             events,
+            application_config: None,
         },
     ));
 

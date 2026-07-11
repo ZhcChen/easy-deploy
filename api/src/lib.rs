@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+pub mod application_config;
 pub mod apps;
 pub mod artifact_storage;
 pub mod auth;
@@ -14,6 +15,7 @@ pub mod node_credentials;
 pub mod nodes;
 pub mod platform;
 pub mod runtimefs;
+pub mod secret_config;
 pub mod settings;
 pub mod tasks;
 pub mod text;

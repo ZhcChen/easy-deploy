@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use api::{
     AppState, AppStateServices, Settings,
+    application_config::ApplicationConfigService,
     apps::AppService,
     auth::{AuthService, MemorySessionStore},
     build_router,
@@ -14,6 +15,7 @@ use api::{
     nodes::NodeService,
     platform::PlatformConfigService,
     runtimefs::RuntimeFs,
+    secret_config::SecretConfigCipher,
     tasks::TaskService,
 };
 use clap::{Parser, Subcommand};
@@ -151,6 +153,16 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
     let tasks = TaskService::new(db.clone());
     let platform = PlatformConfigService::new(db.clone());
     let events = EventLogService::new(db.clone());
+    let application_config = if settings.config_master_keys.trim().is_empty() {
+        None
+    } else {
+        let cipher = SecretConfigCipher::from_key_spec(
+            settings.config_active_key_id.clone(),
+            &settings.config_master_keys,
+        )
+        .context("load config encryption key ring")?;
+        Some(ApplicationConfigService::new(db.clone(), cipher))
+    };
     let apps = AppService::new(
         db.clone(),
         RuntimeFs::new(settings.data_dir.clone()),
@@ -176,6 +188,7 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
             tasks,
             platform,
             events,
+            application_config,
         },
     ));
 
@@ -218,6 +231,8 @@ mod tests {
             cookie_secure: false,
             uploaded_binary_releases_to_keep: 4,
             command_timeout_secs: 120,
+            config_active_key_id: "v1".to_owned(),
+            config_master_keys: String::new(),
         };
         (settings, temp_dir)
     }

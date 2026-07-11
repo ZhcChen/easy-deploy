@@ -8,6 +8,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1"
+aes-gcm = "0.10"
 askama = "0.14"
 axum = "0.8"
 argon2 = "0.5"

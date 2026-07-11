@@ -22,6 +22,7 @@ use tracing::warn;
 
 use crate::{
     Settings,
+    application_config::ApplicationConfigService,
     apps::{
         APP_DEPLOYMENT_IN_PROGRESS_MESSAGE, AppDeployDiffStatus, AppError, AppService,
         BinaryPackageNameError, CompleteReleasePackageUploadInput, ComposeTaskAction,
@@ -89,6 +90,7 @@ pub struct AppStateServices {
     pub tasks: TaskService,
     pub platform: PlatformConfigService,
     pub events: EventLogService,
+    pub application_config: Option<ApplicationConfigService>,
 }
 
 struct AppStateInner {
@@ -101,6 +103,7 @@ struct AppStateInner {
     tasks: TaskService,
     platform: PlatformConfigService,
     events: EventLogService,
+    application_config: Option<ApplicationConfigService>,
     host_metrics: HostMetricsService,
     api_token_flashes: Mutex<HashMap<String, crate::auth::CreatedApiToken>>,
 }
@@ -119,6 +122,7 @@ impl AppState {
                 tasks: services.tasks,
                 platform: services.platform,
                 events: services.events,
+                application_config: services.application_config,
                 api_token_flashes: Mutex::new(HashMap::new()),
             }),
         }
@@ -158,6 +162,10 @@ impl AppState {
 
     pub fn events(&self) -> &EventLogService {
         &self.inner.events
+    }
+
+    pub fn application_config(&self) -> Option<&ApplicationConfigService> {
+        self.inner.application_config.as_ref()
     }
 
     pub fn host_metrics(&self) -> &HostMetricsService {
@@ -9332,6 +9340,8 @@ mod tests {
             cookie_secure: false,
             uploaded_binary_releases_to_keep: 4,
             command_timeout_secs: 120,
+            config_active_key_id: "v1".to_owned(),
+            config_master_keys: String::new(),
         };
 
         let tasks = TaskService::new(db.clone());
@@ -9368,6 +9378,7 @@ mod tests {
                     tasks,
                     platform,
                     events,
+                    application_config: None,
                 },
             )),
             auth: auth_for_test,

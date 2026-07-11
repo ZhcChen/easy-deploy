@@ -37,4 +37,10 @@ pub struct Settings {
         default_value_t = DEFAULT_COMMAND_TIMEOUT_SECS
     )]
     pub command_timeout_secs: u64,
+
+    #[arg(long, env = "EASY_DEPLOY_CONFIG_ACTIVE_KEY_ID", default_value = "v1")]
+    pub config_active_key_id: String,
+
+    #[arg(long, env = "EASY_DEPLOY_CONFIG_MASTER_KEYS", default_value = "")]
+    pub config_master_keys: String,
 }
