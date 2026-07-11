@@ -74,7 +74,7 @@ use templates::{
 
 const LOGO_SVG: &str = include_str!("../../assets/logo.svg");
 const APP_JS: &str = include_str!("../../assets/app.js");
-const ASSET_VERSION: &str = "20260703-template-import";
+const ASSET_VERSION: &str = "20260711-auth-redirect";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -9774,6 +9774,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_host_metrics_redirects_revoked_session_to_login() {
+        let app = test_web_app().await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+        app.auth
+            .logout(&login.session)
+            .await
+            .expect("revoke session");
+
+        let response = app
+            .router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard/host-metrics")
+                    .header(header::COOKIE, cookie_value)
+                    .header(header::ACCEPT, "application/json")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION),
+            Some(&"/login?notice=expired".parse().expect("valid location"))
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn login_page_renders_session_notice() {
         let response = test_app()
             .await
@@ -9791,6 +9839,18 @@ mod tests {
             .await
             .expect("read body");
         assert!(String::from_utf8_lossy(&body).contains("登录状态已失效，请重新登录。"));
+    }
+
+    #[test]
+    fn background_fetches_redirect_top_level_when_login_is_required() {
+        assert!(APP_JS.contains("const redirectToLoginIfNeeded = (response) =>"));
+        assert_eq!(
+            APP_JS
+                .matches("if (redirectToLoginIfNeeded(response)) return;")
+                .count(),
+            APP_JS.matches("await fetch(").count(),
+            "all authenticated background fetch paths must redirect the top-level page"
+        );
     }
 
     #[tokio::test]

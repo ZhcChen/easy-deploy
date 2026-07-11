@@ -53,6 +53,23 @@
     "script, style, textarea, input, select, option, code, pre, kbd, samp";
   const configStatusTimers = new WeakMap();
 
+  const redirectToLoginIfNeeded = (response) => {
+    if (!response.redirected) return false;
+
+    let responseUrl;
+    try {
+      responseUrl = new URL(response.url, window.location.href);
+    } catch (_err) {
+      return false;
+    }
+    if (responseUrl.origin !== window.location.origin || responseUrl.pathname !== "/login") {
+      return false;
+    }
+
+    window.location.replace(`${responseUrl.pathname}${responseUrl.search}${responseUrl.hash}`);
+    return true;
+  };
+
   const padTimePart = (value) => String(value).padStart(2, "0");
 
   const formatEast8Timestamp = (value) => {
@@ -704,6 +721,7 @@
           "X-Requested-With": "easy-deploy-node-check",
         },
       });
+      if (redirectToLoginIfNeeded(response)) return;
 
       if (!response.ok) {
         throw new Error((await response.text()).trim() || "探测失败");
@@ -1002,6 +1020,7 @@
           credentials: "same-origin",
           headers: { Accept: "application/json" },
         });
+        if (redirectToLoginIfNeeded(response)) return;
         if (!response.ok) {
           throw new Error(`status ${response.status}`);
         }
