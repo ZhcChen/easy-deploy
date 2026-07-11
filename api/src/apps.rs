@@ -13668,6 +13668,194 @@ mod tests {
         assert_eq!(storage_integrity, OSS_RELEASE_STORAGE_INTEGRITY_LEGACY);
     }
 
+    #[tokio::test]
+    async fn multi_unit_migrations_backfill_existing_compose_application() {
+        let db = sqlx::SqlitePool::connect_with(
+            "sqlite::memory:"
+                .parse::<SqliteConnectOptions>()
+                .expect("valid in-memory sqlite url")
+                .foreign_keys(true),
+        )
+        .await
+        .expect("connect in-memory sqlite");
+        let all_migrations = sqlx::migrate!("./migrations");
+        let legacy_migrations = Migrator {
+            migrations: Cow::Owned(
+                all_migrations
+                    .iter()
+                    .filter(|migration| migration.version <= 46)
+                    .cloned()
+                    .collect(),
+            ),
+            ..Migrator::DEFAULT
+        };
+        legacy_migrations
+            .run(&db)
+            .await
+            .expect("apply migrations through 0046");
+
+        let app_id = sqlx::query(
+            r#"
+            INSERT INTO apps(
+                app_key, name, app_type, deploy_mode, work_dir, status,
+                environment, release_source
+            )
+            VALUES (
+                'legacy-compose-app', 'Legacy Compose App', 'compose', 'compose',
+                '/opt/apps/legacy-compose-app', 'running', 'production', 'package_upload'
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .expect("insert legacy app")
+        .last_insert_rowid();
+        let node_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO nodes(
+                node_key, name, node_type, address, ssh_port, ssh_user, work_dir, status
+            )
+            VALUES (
+                'legacy-node', 'Legacy Node', 'local', '127.0.0.1', 22,
+                'deploy', '/opt/apps', 'online'
+            )
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&db)
+        .await
+        .expect("insert legacy node");
+        sqlx::query("INSERT INTO app_targets(app_id, node_id) VALUES (?1, ?2)")
+            .bind(app_id)
+            .bind(node_id)
+            .execute(&db)
+            .await
+            .expect("insert legacy target");
+        sqlx::query(
+            r#"
+            INSERT INTO app_config_snapshots(
+                app_id, snapshot_kind, compose_content, env_content, metadata,
+                revision_no, artifact_version, config_hash
+            )
+            VALUES (
+                ?1, 'deploy', 'services: {}', 'APP_SECRET=legacy', '{}',
+                1, '1.2.3', 'legacy-config-hash'
+            )
+            "#,
+        )
+        .bind(app_id)
+        .execute(&db)
+        .await
+        .expect("insert legacy config snapshot");
+        let release_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO app_releases(
+                app_id, version, version_code, package_name, package_path,
+                status, source, checksum_sha256, size_bytes, storage_provider,
+                storage_integrity
+            )
+            VALUES (
+                ?1, '1.2.3', 123, 'legacy-compose-app.tar.gz',
+                '/tmp/legacy-compose-app.tar.gz', 'deployed', 'openapi',
+                'legacy-sha256', 42, 'local', 'local'
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(app_id)
+        .fetch_one(&db)
+        .await
+        .expect("insert legacy release");
+
+        all_migrations
+            .run(&db)
+            .await
+            .expect("upgrade legacy application through current migration");
+
+        let environment: (i64, String, Option<i64>, Option<i64>) = sqlx::query_as(
+            r#"
+            SELECT id, environment_key, current_app_release_id, current_config_revision_id
+            FROM app_environments
+            WHERE app_id = ?1
+            "#,
+        )
+        .bind(app_id)
+        .fetch_one(&db)
+        .await
+        .expect("load backfilled environment");
+        assert_eq!(environment.1, "production");
+        assert_eq!(environment.2, Some(release_id));
+        assert!(environment.3.is_some());
+
+        let unit: (i64, String, String) =
+            sqlx::query_as("SELECT id, unit_key, work_dir FROM deployment_units WHERE app_id = ?1")
+                .bind(app_id)
+                .fetch_one(&db)
+                .await
+                .expect("load default unit");
+        assert_eq!(unit.1, "default");
+        assert_eq!(unit.2, "/opt/apps/legacy-compose-app");
+
+        let target_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM app_environment_targets WHERE environment_id = ?1 AND node_id = ?2",
+        )
+        .bind(environment.0)
+        .bind(node_id)
+        .fetch_one(&db)
+        .await
+        .expect("count backfilled targets");
+        assert_eq!(target_count, 1);
+
+        let unit_release: (String, i64, String) = sqlx::query_as(
+            r#"
+            SELECT version, version_code, checksum_sha256
+            FROM deployment_unit_releases
+            WHERE unit_id = ?1
+            "#,
+        )
+        .bind(unit.0)
+        .fetch_one(&db)
+        .await
+        .expect("load backfilled unit release");
+        assert_eq!(
+            unit_release,
+            ("1.2.3".to_owned(), 123, "legacy-sha256".to_owned())
+        );
+
+        let release_unit_id: Option<i64> = sqlx::query_scalar(
+            "SELECT unit_release_id FROM app_release_units WHERE app_release_id = ?1 AND unit_id = ?2",
+        )
+        .bind(release_id)
+        .bind(unit.0)
+        .fetch_one(&db)
+        .await
+        .expect("load application release unit");
+        assert!(release_unit_id.is_some());
+
+        let manifest_status: String = sqlx::query_scalar(
+            "SELECT immutable_status FROM application_release_manifests WHERE app_release_id = ?1",
+        )
+        .bind(release_id)
+        .fetch_one(&db)
+        .await
+        .expect("load application manifest");
+        assert_eq!(manifest_status, "ready");
+
+        let pipeline_unit_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM deployment_pipeline_stage_units stage_units
+            JOIN deployment_pipeline_stages stages ON stages.id = stage_units.stage_id
+            WHERE stages.app_id = ?1 AND stages.stage_no = 1
+            "#,
+        )
+        .bind(app_id)
+        .fetch_one(&db)
+        .await
+        .expect("count default pipeline unit");
+        assert_eq!(pipeline_unit_count, 1);
+    }
+
     #[test]
     fn oss_release_storage_integrity_blocks_unbound_legacy_objects() {
         assert!(

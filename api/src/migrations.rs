@@ -806,6 +806,20 @@ mod tests {
     }
 
     #[test]
+    fn embedded_migrator_includes_multi_unit_schema() {
+        let versions = MIGRATOR
+            .iter()
+            .filter(|migration| migration.migration_type.is_up_migration())
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>();
+
+        assert!(versions.contains(&47));
+        assert!(versions.contains(&48));
+        assert!(versions.contains(&49));
+        assert!(versions.contains(&50));
+    }
+
+    #[test]
     fn read_migration_file_names_lists_directory_entries() {
         let dir = tempdir().expect("create temp dir");
         fs::write(dir.path().join("0001_init.sql"), "-- init\n").expect("write migration");
