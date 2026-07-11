@@ -9,6 +9,7 @@ use api::{
     build_router,
     deploy::{ComposeExecutor, SystemdExecutor, TokioCommandRunner, ssh_known_hosts_file},
     deployment_orchestrator::DeploymentOrchestratorService,
+    deployment_retention::{DeploymentLogService, DeploymentRetentionService},
     events::EventLogService,
     maintenance::{CleanDemoDataOptions, clean_demo_data},
     migrations::{self, MigrationCommand},
@@ -155,6 +156,8 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
     let platform = PlatformConfigService::new(db.clone());
     let events = EventLogService::new(db.clone());
     let deployment_orchestrator = DeploymentOrchestratorService::new(db.clone());
+    let deployment_logs = DeploymentLogService::new(db.clone());
+    let deployment_retention = DeploymentRetentionService::new(db.clone());
     let reconciled_runs = deployment_orchestrator
         .reconcile_interrupted_runs()
         .await
@@ -202,6 +205,8 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
             events,
             application_config,
             deployment_orchestrator,
+            deployment_logs,
+            deployment_retention,
         },
     ));
 

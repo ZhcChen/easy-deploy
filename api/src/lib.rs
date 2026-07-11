@@ -8,6 +8,7 @@ pub mod auth;
 pub mod catalog;
 pub mod deploy;
 pub mod deployment_orchestrator;
+pub mod deployment_retention;
 pub mod events;
 pub mod health;
 pub mod host_metrics;

@@ -42,6 +42,7 @@ use crate::{
     },
     catalog::compose_templates,
     deployment_orchestrator::DeploymentOrchestratorService,
+    deployment_retention::{DeploymentLogService, DeploymentRetentionService},
     events::{EventLogError, EventLogFilter, EventLogService},
     health::{HealthCheckKind, normalize_health_config},
     host_metrics::HostMetricsService,
@@ -93,6 +94,8 @@ pub struct AppStateServices {
     pub events: EventLogService,
     pub application_config: Option<ApplicationConfigService>,
     pub deployment_orchestrator: DeploymentOrchestratorService,
+    pub deployment_logs: DeploymentLogService,
+    pub deployment_retention: DeploymentRetentionService,
 }
 
 struct AppStateInner {
@@ -107,6 +110,8 @@ struct AppStateInner {
     events: EventLogService,
     application_config: Option<ApplicationConfigService>,
     deployment_orchestrator: DeploymentOrchestratorService,
+    deployment_logs: DeploymentLogService,
+    deployment_retention: DeploymentRetentionService,
     host_metrics: HostMetricsService,
     api_token_flashes: Mutex<HashMap<String, crate::auth::CreatedApiToken>>,
 }
@@ -127,6 +132,8 @@ impl AppState {
                 events: services.events,
                 application_config: services.application_config,
                 deployment_orchestrator: services.deployment_orchestrator,
+                deployment_logs: services.deployment_logs,
+                deployment_retention: services.deployment_retention,
                 api_token_flashes: Mutex::new(HashMap::new()),
             }),
         }
@@ -174,6 +181,14 @@ impl AppState {
 
     pub fn deployment_orchestrator(&self) -> &DeploymentOrchestratorService {
         &self.inner.deployment_orchestrator
+    }
+
+    pub fn deployment_logs(&self) -> &DeploymentLogService {
+        &self.inner.deployment_logs
+    }
+
+    pub fn deployment_retention(&self) -> &DeploymentRetentionService {
+        &self.inner.deployment_retention
     }
 
     pub fn host_metrics(&self) -> &HostMetricsService {
@@ -9388,6 +9403,8 @@ mod tests {
                     events,
                     application_config: None,
                     deployment_orchestrator: DeploymentOrchestratorService::new(db.clone()),
+                    deployment_logs: DeploymentLogService::new(db.clone()),
+                    deployment_retention: DeploymentRetentionService::new(db.clone()),
                 },
             )),
             auth: auth_for_test,
