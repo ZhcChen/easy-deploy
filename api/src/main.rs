@@ -8,6 +8,7 @@ use api::{
     auth::{AuthService, MemorySessionStore},
     build_router,
     deploy::{ComposeExecutor, SystemdExecutor, TokioCommandRunner, ssh_known_hosts_file},
+    deployment_orchestrator::DeploymentOrchestratorService,
     events::EventLogService,
     maintenance::{CleanDemoDataOptions, clean_demo_data},
     migrations::{self, MigrationCommand},
@@ -153,6 +154,17 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
     let tasks = TaskService::new(db.clone());
     let platform = PlatformConfigService::new(db.clone());
     let events = EventLogService::new(db.clone());
+    let deployment_orchestrator = DeploymentOrchestratorService::new(db.clone());
+    let reconciled_runs = deployment_orchestrator
+        .reconcile_interrupted_runs()
+        .await
+        .context("reconcile interrupted environment deployments")?;
+    if reconciled_runs > 0 {
+        tracing::warn!(
+            reconciled_runs,
+            "environment deployments require operator reconciliation after restart"
+        );
+    }
     let application_config = if settings.config_master_keys.trim().is_empty() {
         None
     } else {
@@ -189,6 +201,7 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
             platform,
             events,
             application_config,
+            deployment_orchestrator,
         },
     ));
 

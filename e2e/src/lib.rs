@@ -10,6 +10,7 @@ use api::{
     deploy::{
         CommandResult, CommandRunner, CommandSpec, ComposeExecutor, DeployError, SystemdExecutor,
     },
+    deployment_orchestrator::DeploymentOrchestratorService,
     events::EventLogService,
     migrations::connect_database,
     node_credentials::NodeCredentialService,
@@ -194,6 +195,7 @@ pub async fn smoke_test() -> anyhow::Result<()> {
             platform,
             events,
             application_config: None,
+            deployment_orchestrator: DeploymentOrchestratorService::new(db.clone()),
         },
     ));
 

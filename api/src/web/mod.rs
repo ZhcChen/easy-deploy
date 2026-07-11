@@ -41,6 +41,7 @@ use crate::{
         TEMPLATES_VIEW, nav_permission, permission_dependencies,
     },
     catalog::compose_templates,
+    deployment_orchestrator::DeploymentOrchestratorService,
     events::{EventLogError, EventLogFilter, EventLogService},
     health::{HealthCheckKind, normalize_health_config},
     host_metrics::HostMetricsService,
@@ -91,6 +92,7 @@ pub struct AppStateServices {
     pub platform: PlatformConfigService,
     pub events: EventLogService,
     pub application_config: Option<ApplicationConfigService>,
+    pub deployment_orchestrator: DeploymentOrchestratorService,
 }
 
 struct AppStateInner {
@@ -104,6 +106,7 @@ struct AppStateInner {
     platform: PlatformConfigService,
     events: EventLogService,
     application_config: Option<ApplicationConfigService>,
+    deployment_orchestrator: DeploymentOrchestratorService,
     host_metrics: HostMetricsService,
     api_token_flashes: Mutex<HashMap<String, crate::auth::CreatedApiToken>>,
 }
@@ -123,6 +126,7 @@ impl AppState {
                 platform: services.platform,
                 events: services.events,
                 application_config: services.application_config,
+                deployment_orchestrator: services.deployment_orchestrator,
                 api_token_flashes: Mutex::new(HashMap::new()),
             }),
         }
@@ -166,6 +170,10 @@ impl AppState {
 
     pub fn application_config(&self) -> Option<&ApplicationConfigService> {
         self.inner.application_config.as_ref()
+    }
+
+    pub fn deployment_orchestrator(&self) -> &DeploymentOrchestratorService {
+        &self.inner.deployment_orchestrator
     }
 
     pub fn host_metrics(&self) -> &HostMetricsService {
@@ -9369,7 +9377,7 @@ mod tests {
         TestWebApp {
             router: build_router(AppState::new(
                 settings,
-                db,
+                db.clone(),
                 AppStateServices {
                     auth,
                     nodes,
@@ -9379,6 +9387,7 @@ mod tests {
                     platform,
                     events,
                     application_config: None,
+                    deployment_orchestrator: DeploymentOrchestratorService::new(db.clone()),
                 },
             )),
             auth: auth_for_test,
