@@ -1622,6 +1622,12 @@ async fn application_deploy_submit(
     tokio::spawn(async move {
         if let Err(error) = orchestrator.execute_run(deployment_run_id, executor).await {
             tracing::error!(deployment_run_id, error = %error, "environment deployment execution failed");
+            if let Err(finalize_error) = orchestrator
+                .fail_run_on_internal_error(deployment_run_id, &error.to_string())
+                .await
+            {
+                tracing::error!(deployment_run_id, error = %finalize_error, "failed to finalize broken environment deployment");
+            }
         }
     });
     redirect(&format!("/tasks/{task_id}"))

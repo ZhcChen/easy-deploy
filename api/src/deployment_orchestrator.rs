@@ -506,6 +506,120 @@ impl DeploymentOrchestratorService {
         tx.commit().await?;
         Ok(run_ids.len() as u64)
     }
+
+    pub async fn fail_run_on_internal_error(
+        &self,
+        deployment_run_id: i64,
+        error_message: &str,
+    ) -> Result<bool, DeploymentOrchestratorError> {
+        let summary = format!(
+            "部署编排异常终止：{}",
+            error_message.trim().chars().take(1000).collect::<String>()
+        );
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let run: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT task_id, environment_id FROM environment_deployment_runs WHERE id = ?1 AND status IN ('queued', 'running')",
+        )
+        .bind(deployment_run_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((task_id, environment_id)) = run else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        sqlx::query(
+            r#"
+            UPDATE deployment_unit_run_results
+            SET status = CASE WHEN status = 'running' THEN 'canceled_unknown' ELSE 'not_started' END,
+                failure_kind = 'orchestrator_internal_error', failure_summary = ?2,
+                finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE deployment_run_id = ?1 AND status IN ('pending', 'running')
+            "#,
+        )
+        .bind(deployment_run_id)
+        .bind(&summary)
+        .execute(&mut *tx)
+        .await?;
+        let succeeded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM deployment_unit_run_results WHERE deployment_run_id = ?1 AND status IN ('success', 'skipped')",
+        )
+        .bind(deployment_run_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let run_status = if succeeded > 0 {
+            "partial_failed"
+        } else {
+            "all_failed"
+        };
+        sqlx::query(
+            r#"
+            UPDATE environment_deployment_runs
+            SET status = ?2, summary = ?3,
+                finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1 AND status IN ('queued', 'running')
+            "#,
+        )
+        .bind(deployment_run_id)
+        .bind(run_status)
+        .bind(&summary)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE operation_task_steps
+            SET status = 'failed', exit_code = 1,
+                finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE task_id = ?1 AND status = 'running'
+            "#,
+        )
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE operation_task_phases
+            SET status = CASE WHEN status = 'running' THEN 'failed' ELSE 'skipped' END,
+                finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE task_id = ?1 AND status IN ('pending', 'running')
+            "#,
+        )
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE operation_tasks
+            SET status = 'failed', phase = 'failed', summary = ?2, exit_code = 1,
+                finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1 AND status IN ('queued', 'running')
+            "#,
+        )
+        .bind(task_id)
+        .bind(&summary)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE app_environments
+            SET runtime_status = CASE WHEN ?2 > 0 THEN 'partial_unhealthy' ELSE 'unknown' END,
+                last_deployment_status = ?3,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+            "#,
+        )
+        .bind(environment_id)
+        .bind(succeeded)
+        .bind(run_status)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
 }
 
 async fn claim_deployment_run(
@@ -1565,6 +1679,71 @@ mod tests {
             .await
             .expect_err("stale plan hash must fail");
         assert!(matches!(stale, DeploymentOrchestratorError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn internal_execution_error_finalizes_run_and_releases_environment_lock() {
+        let db = database().await;
+        let fixture = DatabaseFixture::create(&db).await;
+        let service = DeploymentOrchestratorService::new(db.clone());
+        let preview = service
+            .preview(
+                fixture.environment_id,
+                fixture.app_release_id,
+                DeploymentMode::Normal,
+            )
+            .await
+            .expect("preview deployment");
+        let run = service
+            .create_run(CreateDeploymentRunInput {
+                environment_id: fixture.environment_id,
+                app_release_id: fixture.app_release_id,
+                mode: DeploymentMode::Normal,
+                expected_plan_hash: preview.plan_hash,
+                created_by: "operator".to_owned(),
+            })
+            .await
+            .expect("create run");
+        sqlx::query("UPDATE environment_deployment_runs SET plan_json = '{broken' WHERE id = ?1")
+            .bind(run.deployment_run_id)
+            .execute(&db)
+            .await
+            .expect("corrupt plan snapshot");
+
+        let error = service
+            .execute_run(
+                run.deployment_run_id,
+                Arc::new(RecordingExecutor::new(None)),
+            )
+            .await
+            .expect_err("broken plan must fail execution");
+        assert!(
+            service
+                .fail_run_on_internal_error(run.deployment_run_id, &error.to_string())
+                .await
+                .expect("finalize broken run")
+        );
+        let run_status: String =
+            sqlx::query_scalar("SELECT status FROM environment_deployment_runs WHERE id = ?1")
+                .bind(run.deployment_run_id)
+                .fetch_one(&db)
+                .await
+                .expect("load finalized run");
+        assert_eq!(run_status, "all_failed");
+        let active_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM environment_deployment_runs WHERE environment_id = ?1 AND status IN ('queued', 'running', 'reconciling')",
+        )
+        .bind(fixture.environment_id)
+        .fetch_one(&db)
+        .await
+        .expect("count active runs");
+        assert_eq!(active_count, 0);
+        assert!(
+            !service
+                .fail_run_on_internal_error(run.deployment_run_id, "duplicate callback")
+                .await
+                .expect("repeat finalization is idempotent")
+        );
     }
 
     #[tokio::test]

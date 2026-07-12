@@ -369,8 +369,25 @@ impl ComposeDeploymentUnitExecutor {
         context: &UnitExecutionContext,
     ) -> Result<String, DeploymentRuntimeError> {
         let mut spec = self.runtime.load_unit_spec(context).await?;
-        self.materialize_oss_release(context, &mut spec).await?;
-        let prepared = prepare_unit_runtime(&spec, &self.staging_root).await?;
+        let result = self.execute_spec(context, &mut spec).await;
+        let cleanup = cleanup_execution_staging(&self.staging_root, context, &spec).await;
+        match (result, cleanup) {
+            (Ok(summary), Ok(())) => Ok(summary),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(cleanup_error)) => Err(DeploymentRuntimeError::Database(format!(
+                "deployment failed: {error}; staging cleanup failed: {cleanup_error}"
+            ))),
+        }
+    }
+
+    async fn execute_spec(
+        &self,
+        context: &UnitExecutionContext,
+        spec: &mut UnitExecutionSpec,
+    ) -> Result<String, DeploymentRuntimeError> {
+        self.materialize_oss_release(context, spec).await?;
+        let prepared = prepare_unit_runtime(spec, &self.staging_root).await?;
         let secrets = spec
             .environment_variables
             .values()
@@ -379,7 +396,7 @@ impl ComposeDeploymentUnitExecutor {
         let mut summaries = Vec::new();
         for node in &spec.target_nodes {
             let result =
-                execute_prepared_unit_on_node(&spec, &prepared, node, &self.compose, &self.ssh)
+                execute_prepared_unit_on_node(spec, &prepared, node, &self.compose, &self.ssh)
                     .await?;
             summaries.push(result.summary.clone());
             for output in &result.outputs {
@@ -505,6 +522,35 @@ impl ComposeDeploymentUnitExecutor {
         release.storage_provider = "local".to_owned();
         Ok(())
     }
+}
+
+async fn cleanup_execution_staging(
+    staging_root: &Path,
+    context: &UnitExecutionContext,
+    spec: &UnitExecutionSpec,
+) -> Result<(), DeploymentRuntimeError> {
+    let unit_root = staging_root
+        .join(spec.app_id.to_string())
+        .join(spec.environment_id.to_string())
+        .join(spec.unit_id.to_string());
+    let download_root = staging_root
+        .join("downloads")
+        .join(context.deployment_run_id.to_string())
+        .join(context.item.unit_id.to_string());
+    for path in [unit_root, download_root] {
+        if fs::try_exists(&path)
+            .await
+            .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?
+        {
+            fs::remove_dir_all(&path).await.map_err(|error| {
+                DeploymentRuntimeError::Database(format!(
+                    "remove deployment staging {} failed: {error}",
+                    path.to_string_lossy()
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -817,6 +863,58 @@ async fn run_node_health_check(
             message: "未配置健康检查".to_owned(),
             output: None,
         });
+    }
+    if let Some(target) = target {
+        let output = match config.kind {
+            HealthCheckKind::Http => {
+                ssh.http_health_check(
+                    target,
+                    prepared.root.clone(),
+                    &config.endpoint,
+                    config.timeout_secs,
+                )
+                .await
+            }
+            HealthCheckKind::Tcp => {
+                ssh.tcp_health_check(
+                    target,
+                    prepared.root.clone(),
+                    &config.endpoint,
+                    config.timeout_secs,
+                )
+                .await
+            }
+            HealthCheckKind::SystemdActive => {
+                return Err(DeploymentRuntimeError::Validation(
+                    "systemd health checks are not supported for Compose deployment units"
+                        .to_owned(),
+                ));
+            }
+            HealthCheckKind::None | HealthCheckKind::ComposeRunning => unreachable!(),
+        }
+        .map_err(|error| DeploymentRuntimeError::Validation(error.to_string()))?;
+        let healthy = match config.kind {
+            HealthCheckKind::Http => {
+                output.success && output.output.trim() == config.expected_status.to_string()
+            }
+            HealthCheckKind::Tcp => output.success,
+            _ => false,
+        };
+        let message = if healthy {
+            format!("{} 健康检查通过", config.kind.label())
+        } else {
+            command_summary(&output, &format!("{} 健康检查失败", config.kind.label()))
+        };
+        return Ok(NodeHealthResult {
+            healthy,
+            message,
+            output: Some(output),
+        });
+    }
+    if config.kind == HealthCheckKind::SystemdActive {
+        return Err(DeploymentRuntimeError::Validation(
+            "systemd health checks are not supported for Compose deployment units".to_owned(),
+        ));
     }
     let systemd =
         crate::deploy::SystemdExecutor::new(std::sync::Arc::new(UnsupportedHealthCommandRunner));
@@ -1219,7 +1317,7 @@ mod tests {
             self.commands.lock().expect("command lock").push(spec);
             Ok(crate::deploy::CommandResult {
                 status_code: Some(0),
-                stdout: "ok".to_owned(),
+                stdout: "200".to_owned(),
                 stderr: String::new(),
             })
         }
@@ -1370,5 +1468,122 @@ mod tests {
         assert!(script_file_name("unknown").is_err());
         assert!(safe_package_name("../package.tar.gz").is_err());
         assert!(safe_package_name("package.tar.gz").is_ok());
+    }
+
+    #[tokio::test]
+    async fn removes_secret_staging_and_downloaded_release_after_execution() {
+        let temp = tempdir().expect("create temp dir");
+        let staging_root = temp.path().join("staging");
+        let context = UnitExecutionContext {
+            deployment_run_id: 21,
+            task_id: 22,
+            step_id: 23,
+            environment_id: 2,
+            target_node_ids: vec![7],
+            item: crate::deployment_orchestrator::DeploymentPlanItem {
+                unit_id: 4,
+                unit_key: "api".to_owned(),
+                unit_release_id: Some(5),
+                release_version: Some("1.0.0".to_owned()),
+                stage_no: 1,
+                unit_order: 1,
+                removal_order: 1,
+                action: DeploymentAction::Deploy,
+                reason: "test".to_owned(),
+                target_fingerprint: "target".to_owned(),
+                previous_fingerprint: String::new(),
+            },
+        };
+        let spec = UnitExecutionSpec {
+            app_id: 1,
+            app_key: "orders".to_owned(),
+            environment_id: 2,
+            environment_key: "production".to_owned(),
+            config_revision_id: 3,
+            config_hash: "config-hash".to_owned(),
+            unit_id: 4,
+            unit_key: "api".to_owned(),
+            unit: ConfigUnit {
+                key: "api".to_owned(),
+                name: "API".to_owned(),
+                required: true,
+                status: "active".to_owned(),
+                work_dir: "/srv/orders/api".to_owned(),
+                compose_content: "services: {}".to_owned(),
+                scripts: BTreeMap::new(),
+                health_check: serde_json::json!({}),
+            },
+            action: DeploymentAction::Deploy,
+            release: None,
+            target_nodes: Vec::new(),
+            environment_variables: BTreeMap::from([(
+                "APP_SECRET".to_owned(),
+                "plain-text-secret".to_owned(),
+            )]),
+        };
+        let unit_root = staging_root.join("1").join("2").join("4");
+        let download_root = staging_root.join("downloads").join("21").join("4");
+        fs::create_dir_all(&unit_root)
+            .await
+            .expect("create unit staging");
+        fs::create_dir_all(&download_root)
+            .await
+            .expect("create download staging");
+        fs::write(unit_root.join(".env"), b"APP_SECRET=plain-text-secret\n")
+            .await
+            .expect("write environment file");
+        fs::write(download_root.join("api.tar.gz"), b"release")
+            .await
+            .expect("write downloaded release");
+
+        cleanup_execution_staging(&staging_root, &context, &spec)
+            .await
+            .expect("cleanup execution staging");
+
+        assert!(
+            !fs::try_exists(unit_root)
+                .await
+                .expect("inspect unit staging")
+        );
+        assert!(
+            !fs::try_exists(download_root)
+                .await
+                .expect("inspect download staging")
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_http_health_check_runs_on_target_node() {
+        let temp = tempdir().expect("create temp dir");
+        let runner = Arc::new(RecordingCommandRunner::default());
+        let compose = ComposeExecutor::new(runner.clone());
+        let ssh = SshExecutor::new(runner.clone());
+        let target = SshTarget::new("deploy", "10.0.0.8", 22).expect("create SSH target");
+        let prepared = PreparedUnitRuntime {
+            root: temp.path().to_path_buf(),
+            compose_path: temp.path().join("compose.yaml"),
+            env_path: temp.path().join(".env"),
+            package_path: None,
+            script_paths: BTreeMap::new(),
+        };
+        let config = normalize_health_config("http", "http://127.0.0.1:8080/healthz", 5, 200)
+            .expect("normalize health check");
+
+        let result = run_node_health_check(
+            &config,
+            &prepared,
+            Some(&target),
+            &compose,
+            &ssh,
+            "/srv/app",
+        )
+        .await
+        .expect("run remote health check");
+
+        assert!(result.healthy);
+        let commands = runner.commands.lock().expect("command lock");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].program, "ssh");
+        assert!(commands[0].args.iter().any(|arg| arg == "curl"));
     }
 }
