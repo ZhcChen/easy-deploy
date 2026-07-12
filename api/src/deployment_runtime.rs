@@ -14,7 +14,9 @@ use tokio::fs;
 use crate::{
     application_config::{ApplicationConfigService, ConfigUnit},
     deploy::{ComposeCommandOutput, ComposeExecutor, SshExecutor, SshTarget},
-    deployment_orchestrator::{DeploymentAction, UnitExecutionContext},
+    deployment_orchestrator::{
+        DeploymentAction, DeploymentUnitExecutor, UnitExecutionContext, UnitExecutionOutcome,
+    },
     health::{HealthCheckKind, normalize_health_config},
 };
 
@@ -22,6 +24,14 @@ use crate::{
 pub struct DeploymentRuntimeService {
     db: SqlitePool,
     configs: ApplicationConfigService,
+}
+
+#[derive(Clone)]
+pub struct ComposeDeploymentUnitExecutor {
+    runtime: DeploymentRuntimeService,
+    compose: ComposeExecutor,
+    ssh: SshExecutor,
+    staging_root: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +335,64 @@ impl DeploymentRuntimeService {
 
     fn not_found(message: &str) -> DeploymentRuntimeError {
         DeploymentRuntimeError::NotFound(message.to_owned())
+    }
+}
+
+impl ComposeDeploymentUnitExecutor {
+    pub fn new(
+        runtime: DeploymentRuntimeService,
+        compose: ComposeExecutor,
+        ssh: SshExecutor,
+        staging_root: PathBuf,
+    ) -> Self {
+        Self {
+            runtime,
+            compose,
+            ssh,
+            staging_root,
+        }
+    }
+
+    async fn execute_inner(
+        &self,
+        context: &UnitExecutionContext,
+    ) -> Result<String, DeploymentRuntimeError> {
+        let spec = self.runtime.load_unit_spec(context).await?;
+        let prepared = prepare_unit_runtime(&spec, &self.staging_root).await?;
+        let mut summaries = Vec::new();
+        for node in &spec.target_nodes {
+            let result =
+                execute_prepared_unit_on_node(&spec, &prepared, node, &self.compose, &self.ssh)
+                    .await?;
+            summaries.push(result.summary.clone());
+            if !result.success {
+                return Err(DeploymentRuntimeError::Validation(format!(
+                    "节点 {} 执行失败：{}",
+                    node.node_key, result.summary
+                )));
+            }
+        }
+        Ok(summaries.join("；"))
+    }
+}
+
+#[async_trait::async_trait]
+impl DeploymentUnitExecutor for ComposeDeploymentUnitExecutor {
+    async fn execute(&self, context: UnitExecutionContext) -> UnitExecutionOutcome {
+        match self.execute_inner(&context).await {
+            Ok(summary) => UnitExecutionOutcome::Success { summary },
+            Err(error) => UnitExecutionOutcome::Failed {
+                failure_kind: match error {
+                    DeploymentRuntimeError::Validation(_) => "validation",
+                    DeploymentRuntimeError::NotFound(_) => "resource_not_found",
+                    DeploymentRuntimeError::Config(_) => "config_error",
+                    DeploymentRuntimeError::Database(_) => "database_error",
+                }
+                .to_owned(),
+                summary: error.to_string(),
+                exit_code: None,
+            },
+        }
     }
 }
 

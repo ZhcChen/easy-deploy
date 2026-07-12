@@ -48,6 +48,7 @@ use crate::{
     },
     catalog::compose_templates,
     deployment_console::DeploymentConsoleService,
+    deployment_orchestrator::{CreateDeploymentRunInput, DeploymentUnitExecutor},
     deployment_orchestrator::{DeploymentAction, DeploymentMode, DeploymentOrchestratorService},
     deployment_retention::{DeploymentLogService, DeploymentRetentionService},
     events::{EventLogError, EventLogFilter, EventLogService},
@@ -106,6 +107,7 @@ pub struct AppStateServices {
     pub application_releases: ApplicationReleaseService,
     pub deployment_orchestrator: DeploymentOrchestratorService,
     pub deployment_console: DeploymentConsoleService,
+    pub deployment_executor: Option<Arc<dyn DeploymentUnitExecutor>>,
     pub deployment_logs: DeploymentLogService,
     pub deployment_retention: DeploymentRetentionService,
 }
@@ -124,6 +126,7 @@ struct AppStateInner {
     application_releases: ApplicationReleaseService,
     deployment_orchestrator: DeploymentOrchestratorService,
     deployment_console: DeploymentConsoleService,
+    deployment_executor: Option<Arc<dyn DeploymentUnitExecutor>>,
     deployment_logs: DeploymentLogService,
     deployment_retention: DeploymentRetentionService,
     host_metrics: HostMetricsService,
@@ -148,6 +151,7 @@ impl AppState {
                 application_releases: services.application_releases,
                 deployment_orchestrator: services.deployment_orchestrator,
                 deployment_console: services.deployment_console,
+                deployment_executor: services.deployment_executor,
                 deployment_logs: services.deployment_logs,
                 deployment_retention: services.deployment_retention,
                 api_token_flashes: Mutex::new(HashMap::new()),
@@ -207,6 +211,10 @@ impl AppState {
         &self.inner.deployment_console
     }
 
+    pub fn deployment_executor(&self) -> Option<&Arc<dyn DeploymentUnitExecutor>> {
+        self.inner.deployment_executor.as_ref()
+    }
+
     pub fn deployment_logs(&self) -> &DeploymentLogService {
         &self.inner.deployment_logs
     }
@@ -231,7 +239,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/apps", get(apps_page))
         .route("/apps", post(create_app_submit))
         .route("/apps/{app_id}", get(app_detail_page))
-        .route("/apps/{app_id}/deploy", get(application_deploy_page))
+        .route(
+            "/apps/{app_id}/deploy",
+            get(application_deploy_page).post(application_deploy_submit),
+        )
         .route("/apps/{app_id}/status", post(app_status_submit))
         .route("/apps/{app_id}/metadata", post(app_metadata_submit))
         .route("/apps/{app_id}/config", post(app_config_submit))
@@ -909,6 +920,15 @@ struct ApplicationDeployQuery {
     mode: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct ApplicationDeployForm {
+    csrf_token: String,
+    environment_id: i64,
+    app_release_id: i64,
+    mode: String,
+    expected_plan_hash: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 struct NodesQuery {
     r#type: Option<String>,
@@ -1536,7 +1556,72 @@ async fn application_deploy_page(
         stop_count,
         has_active_run: environment.active_run_id.is_some(),
         active_run_id: environment.active_run_id.unwrap_or_default(),
+        executor_available: state.deployment_executor().is_some(),
     })
+}
+
+async fn application_deploy_submit(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Path(app_id): Path<i64>,
+    Form(form): Form<ApplicationDeployForm>,
+) -> Response {
+    if !valid_csrf(&session, &form.csrf_token) {
+        return forbidden();
+    }
+    if !session.can(SERVICES_DEPLOY) {
+        return forbidden();
+    }
+    let Some(executor) = state.deployment_executor().cloned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "部署执行器不可用，请检查配置主密钥",
+        )
+            .into_response();
+    };
+    let mode = match form.mode.as_str() {
+        "normal" => DeploymentMode::Normal,
+        "force" => DeploymentMode::Force,
+        _ => return bad_request("部署模式必须是 normal 或 force".to_owned()),
+    };
+    let environment_app_id: Option<i64> = match sqlx::query_scalar(
+        "SELECT app_id FROM app_environments WHERE id = ?1 AND status = 'ready'",
+    )
+    .bind(form.environment_id)
+    .fetch_optional(state.db())
+    .await
+    {
+        Ok(app_id) => app_id,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    if environment_app_id != Some(app_id) {
+        return bad_request("应用环境不存在或尚未就绪".to_owned());
+    }
+    let created = match state
+        .deployment_orchestrator()
+        .create_run(CreateDeploymentRunInput {
+            environment_id: form.environment_id,
+            app_release_id: form.app_release_id,
+            mode,
+            expected_plan_hash: form.expected_plan_hash,
+            created_by: session.account.username.clone(),
+        })
+        .await
+    {
+        Ok(created) => created,
+        Err(error) => return deployment_orchestrator_error_response(error),
+    };
+    let deployment_run_id = created.deployment_run_id;
+    let task_id = created.task_id;
+    let orchestrator = state.deployment_orchestrator().clone();
+    tokio::spawn(async move {
+        if let Err(error) = orchestrator.execute_run(deployment_run_id, executor).await {
+            tracing::error!(deployment_run_id, error = %error, "environment deployment execution failed");
+        }
+    });
+    redirect(&format!("/tasks/{task_id}"))
 }
 
 async fn render_app_detail(
@@ -7295,6 +7380,19 @@ fn console_deployment_status_label(status: &str) -> &'static str {
     }
 }
 
+fn deployment_orchestrator_error_response(
+    error: crate::deployment_orchestrator::DeploymentOrchestratorError,
+) -> Response {
+    use crate::deployment_orchestrator::DeploymentOrchestratorError;
+    let status = match &error {
+        DeploymentOrchestratorError::Validation(_) => StatusCode::BAD_REQUEST,
+        DeploymentOrchestratorError::Conflict(_) => StatusCode::CONFLICT,
+        DeploymentOrchestratorError::NotFound(_) => StatusCode::NOT_FOUND,
+        DeploymentOrchestratorError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, error.to_string()).into_response()
+}
+
 fn console_deployment_status_tone(status: &str) -> &'static str {
     match status {
         "success" => "success",
@@ -10380,6 +10478,20 @@ mod tests {
 
     struct WebTestArtifactObjectVerifier;
 
+    struct WebTestDeploymentExecutor;
+
+    #[async_trait]
+    impl DeploymentUnitExecutor for WebTestDeploymentExecutor {
+        async fn execute(
+            &self,
+            context: crate::deployment_orchestrator::UnitExecutionContext,
+        ) -> crate::deployment_orchestrator::UnitExecutionOutcome {
+            crate::deployment_orchestrator::UnitExecutionOutcome::Success {
+                summary: format!("{} deployed", context.item.unit_key),
+            }
+        }
+    }
+
     #[async_trait]
     impl ArtifactObjectVerifier for WebTestArtifactObjectVerifier {
         async fn verify(
@@ -10483,6 +10595,7 @@ mod tests {
                     application_releases: ApplicationReleaseService::new(db.clone()),
                     deployment_orchestrator: DeploymentOrchestratorService::new(db.clone()),
                     deployment_console: DeploymentConsoleService::new(db.clone()),
+                    deployment_executor: Some(Arc::new(WebTestDeploymentExecutor)),
                     deployment_logs: DeploymentLogService::new(db.clone()),
                     deployment_retention: DeploymentRetentionService::new(db.clone()),
                 },
@@ -10585,6 +10698,73 @@ mod tests {
         create_compose_test_app_with_mode(apps, app_key, true).await
     }
 
+    async fn seed_deployable_application_release(db: &SqlitePool, app_id: i64) -> (i64, i64) {
+        let environment_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM app_environments WHERE app_id = ?1 ORDER BY id LIMIT 1",
+        )
+        .bind(app_id)
+        .fetch_one(db)
+        .await
+        .expect("load environment");
+        sqlx::query("UPDATE app_environments SET status = 'ready' WHERE id = ?1")
+            .bind(environment_id)
+            .execute(db)
+            .await
+            .expect("ready environment");
+        let unit_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM deployment_units WHERE app_id = ?1 ORDER BY id LIMIT 1",
+        )
+        .bind(app_id)
+        .fetch_one(db)
+        .await
+        .expect("load unit");
+        let config_revision_id = sqlx::query(
+            "INSERT INTO app_config_revisions(app_id, revision_no, config_json, public_config_json, secret_ciphertext, config_hash) VALUES (?1, 100, '{}', '{}', '{}', 'web-deploy-config')",
+        )
+        .bind(app_id)
+        .execute(db)
+        .await
+        .expect("insert config revision")
+        .last_insert_rowid();
+        let unit_release_id = sqlx::query(
+            "INSERT INTO deployment_unit_releases(unit_id, version, version_code, package_name, package_path, checksum_sha256) VALUES (?1, '1.0.0', 100, 'default.tar.gz', '/tmp/default.tar.gz', 'unit-checksum')",
+        )
+        .bind(unit_id)
+        .execute(db)
+        .await
+        .expect("insert unit release")
+        .last_insert_rowid();
+        let app_release_id = sqlx::query(
+            "INSERT INTO app_releases(app_id, version, version_code, status, source) VALUES (?1, '1.0.0', 100, 'received', 'openapi')",
+        )
+        .bind(app_id)
+        .execute(db)
+        .await
+        .expect("insert app release")
+        .last_insert_rowid();
+        sqlx::query("INSERT INTO application_release_manifests(app_release_id, manifest_hash, manifest_json) VALUES (?1, ?2, '{}')")
+            .bind(app_release_id)
+            .bind(format!("web-deploy-manifest-{app_id}"))
+            .execute(db)
+            .await
+            .expect("insert manifest");
+        sqlx::query("INSERT INTO app_release_units(app_release_id, unit_id, unit_release_id, target_fingerprint) VALUES (?1, ?2, ?3, 'web-target')")
+            .bind(app_release_id)
+            .bind(unit_id)
+            .bind(unit_release_id)
+            .execute(db)
+            .await
+            .expect("insert release unit");
+        sqlx::query("INSERT INTO app_release_environment_configs(app_release_id, environment_id, config_revision_id) VALUES (?1, ?2, ?3)")
+            .bind(app_release_id)
+            .bind(environment_id)
+            .bind(config_revision_id)
+            .execute(db)
+            .await
+            .expect("bind environment config");
+        (environment_id, app_release_id)
+    }
+
     async fn create_compose_test_app_with_mode(
         apps: &AppService,
         app_key: &str,
@@ -10666,6 +10846,101 @@ mod tests {
         assert!(!html.contains("qfy-sc worker"));
         assert!(!html.contains("二进制直部署"));
         assert!(!html.contains("systemd 管理"));
+    }
+
+    #[tokio::test]
+    async fn deployment_confirmation_creates_and_executes_environment_run() {
+        let app = test_web_app().await;
+        let app_id = create_compose_test_app(&app.apps, "deploy-console-app").await;
+        let (environment_id, app_release_id) =
+            seed_deployable_application_release(&app.db, app_id).await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+        let plan = DeploymentOrchestratorService::new(app.db.clone())
+            .preview(environment_id, app_release_id, DeploymentMode::Normal)
+            .await
+            .expect("preview deployment");
+
+        let preview_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/apps/{app_id}/deploy?environment_id={environment_id}&app_release_id={app_release_id}&mode=normal"
+                    ))
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build preview request"),
+            )
+            .await
+            .expect("send preview request");
+        assert_eq!(preview_response.status(), StatusCode::OK);
+        let preview_html = String::from_utf8_lossy(
+            &to_bytes(preview_response.into_body(), usize::MAX)
+                .await
+                .expect("read preview body"),
+        )
+        .into_owned();
+        assert!(preview_html.contains("确认部署"));
+        assert!(preview_html.contains(&plan.plan_hash));
+
+        let form = format!(
+            "csrf_token={}&environment_id={environment_id}&app_release_id={app_release_id}&mode=normal&expected_plan_hash={}",
+            login.session.csrf_token, plan.plan_hash
+        );
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/apps/{app_id}/deploy"))
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .expect("build deploy request"),
+            )
+            .await
+            .expect("send deploy request");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let mut status = String::new();
+        for _ in 0..50 {
+            status = sqlx::query_scalar(
+                "SELECT status FROM environment_deployment_runs WHERE environment_id = ?1 ORDER BY id DESC LIMIT 1",
+            )
+            .bind(environment_id)
+            .fetch_one(&app.db)
+            .await
+            .expect("load run status");
+            if status == "success" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(status, "success");
+        let environment_status: (String, String) = sqlx::query_as(
+            "SELECT runtime_status, last_deployment_status FROM app_environments WHERE id = ?1",
+        )
+        .bind(environment_id)
+        .fetch_one(&app.db)
+        .await
+        .expect("load environment status");
+        assert_eq!(
+            environment_status,
+            ("running".to_owned(), "success".to_owned())
+        );
     }
 
     #[tokio::test]

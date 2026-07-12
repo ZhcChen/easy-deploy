@@ -21,6 +21,18 @@
   <div class="table-wrap"><table><thead><tr><th>阶段</th><th>部署单元</th><th>目标版本</th><th>动作</th><th>原因</th></tr></thead><tbody>
     {% for row in plan_rows %}<tr><td>{{ row.stage_no }}</td><td><strong>{{ row.unit_key }}</strong></td><td>{{ row.version }}</td><td><span class="badge tone-{{ row.action_tone }}">{{ row.action }}</span></td><td>{{ row.reason }}</td></tr>{% endfor %}
   </tbody></table></div>
-  <div class="deploy-preview-footer"><span>计划 hash：<code>{{ plan_hash }}</code></span></div>
+  <div class="deploy-preview-footer">
+    <span>计划 hash：<code>{{ plan_hash }}</code></span>
+    {% if !has_active_run && executor_available %}
+      <form method="post" action="/apps/{{ app_id }}/deploy" data-submit-once>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="environment_id" value="{{ environment_id }}">
+        <input type="hidden" name="app_release_id" value="{{ selected_release_id }}">
+        <input type="hidden" name="mode" value="{{ mode }}">
+        <input type="hidden" name="expected_plan_hash" value="{{ plan_hash }}">
+        <button class="primary-button compact-button" type="submit">确认部署</button>
+      </form>
+    {% endif %}
+  </div>
 </section>
 {% endblock %}

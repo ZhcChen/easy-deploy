@@ -201,6 +201,7 @@ pub async fn smoke_test() -> anyhow::Result<()> {
             application_releases: ApplicationReleaseService::new(db.clone()),
             deployment_orchestrator: DeploymentOrchestratorService::new(db.clone()),
             deployment_console: DeploymentConsoleService::new(db.clone()),
+            deployment_executor: None,
             deployment_logs: DeploymentLogService::new(db.clone()),
             deployment_retention: DeploymentRetentionService::new(db.clone()),
         },

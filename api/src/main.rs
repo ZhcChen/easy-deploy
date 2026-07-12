@@ -12,6 +12,7 @@ use api::{
     deployment_console::DeploymentConsoleService,
     deployment_orchestrator::DeploymentOrchestratorService,
     deployment_retention::{DeploymentLogService, DeploymentRetentionService},
+    deployment_runtime::{ComposeDeploymentUnitExecutor, DeploymentRuntimeService},
     events::EventLogService,
     maintenance::{CleanDemoDataOptions, clean_demo_data},
     migrations::{self, MigrationCommand},
@@ -182,6 +183,15 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
     };
     let application_releases = ApplicationReleaseService::new(db.clone());
     let deployment_console = DeploymentConsoleService::new(db.clone());
+    let deployment_executor = application_config.clone().map(|configs| {
+        Arc::new(ComposeDeploymentUnitExecutor::new(
+            DeploymentRuntimeService::new(db.clone(), configs),
+            ComposeExecutor::new(command_runner.clone()),
+            api::deploy::SshExecutor::new(command_runner.clone())
+                .with_known_hosts_file(ssh_known_hosts_file(&settings.data_dir)),
+            settings.data_dir.join("deployment-staging"),
+        )) as Arc<dyn api::deployment_orchestrator::DeploymentUnitExecutor>
+    });
     let apps = AppService::new(
         db.clone(),
         RuntimeFs::new(settings.data_dir.clone()),
@@ -211,6 +221,7 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
             application_releases,
             deployment_orchestrator,
             deployment_console,
+            deployment_executor,
             deployment_logs,
             deployment_retention,
         },

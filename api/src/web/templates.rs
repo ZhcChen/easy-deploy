@@ -622,6 +622,7 @@ pub struct ApplicationDeployTemplate<'a> {
     pub stop_count: usize,
     pub has_active_run: bool,
     pub active_run_id: i64,
+    pub executor_available: bool,
 }
 
 pub struct ApplicationDeployPlanRow {
