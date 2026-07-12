@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
 use tar::Archive;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 use crate::{
     application_config::{ApplicationConfigService, ConfigUnit},
@@ -19,6 +20,7 @@ use crate::{
     },
     deployment_retention::DeploymentLogService,
     health::{HealthCheckKind, normalize_health_config},
+    platform::PlatformConfigService,
 };
 
 #[derive(Clone)]
@@ -34,6 +36,8 @@ pub struct ComposeDeploymentUnitExecutor {
     ssh: SshExecutor,
     staging_root: PathBuf,
     logs: DeploymentLogService,
+    platform: PlatformConfigService,
+    http: reqwest::Client,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,6 +351,7 @@ impl ComposeDeploymentUnitExecutor {
         ssh: SshExecutor,
         staging_root: PathBuf,
         logs: DeploymentLogService,
+        platform: PlatformConfigService,
     ) -> Self {
         Self {
             runtime,
@@ -354,6 +359,8 @@ impl ComposeDeploymentUnitExecutor {
             ssh,
             staging_root,
             logs,
+            platform,
+            http: reqwest::Client::new(),
         }
     }
 
@@ -361,7 +368,8 @@ impl ComposeDeploymentUnitExecutor {
         &self,
         context: &UnitExecutionContext,
     ) -> Result<String, DeploymentRuntimeError> {
-        let spec = self.runtime.load_unit_spec(context).await?;
+        let mut spec = self.runtime.load_unit_spec(context).await?;
+        self.materialize_oss_release(context, &mut spec).await?;
         let prepared = prepare_unit_runtime(&spec, &self.staging_root).await?;
         let secrets = spec
             .environment_variables
@@ -402,6 +410,100 @@ impl ComposeDeploymentUnitExecutor {
             .await
             .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
         Ok(summaries.join("；"))
+    }
+
+    async fn materialize_oss_release(
+        &self,
+        context: &UnitExecutionContext,
+        spec: &mut UnitExecutionSpec,
+    ) -> Result<(), DeploymentRuntimeError> {
+        let Some(release) = spec.release.as_mut() else {
+            return Ok(());
+        };
+        if release.storage_provider != "aliyun_oss" {
+            return Ok(());
+        }
+        let platform = self
+            .platform
+            .config()
+            .await
+            .map_err(|error| DeploymentRuntimeError::Config(error.to_string()))?;
+        if platform.artifact_storage.provider != "aliyun_oss" {
+            return Err(DeploymentRuntimeError::Config(
+                "unit release uses OSS but platform OSS storage is disabled".to_owned(),
+            ));
+        }
+        let oss = &platform.artifact_storage.aliyun_oss;
+        if oss.bucket != release.storage_bucket
+            || oss.endpoint.trim_end_matches('/') != release.storage_endpoint.trim_end_matches('/')
+        {
+            return Err(DeploymentRuntimeError::Config(
+                "unit release OSS location does not match current platform storage".to_owned(),
+            ));
+        }
+        let download = oss
+            .presign_download_version(
+                &release.storage_object_key,
+                (!release.storage_object_version_id.trim().is_empty())
+                    .then_some(release.storage_object_version_id.as_str()),
+            )
+            .map_err(|error| DeploymentRuntimeError::Config(error.to_string()))?;
+        let package_name = safe_package_name(&release.package_name)?;
+        let destination = self
+            .staging_root
+            .join("downloads")
+            .join(context.deployment_run_id.to_string())
+            .join(context.item.unit_id.to_string())
+            .join(package_name);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
+        }
+        let mut response = self.http.get(download.url).send().await.map_err(|error| {
+            DeploymentRuntimeError::NotFound(format!("download OSS unit release failed: {error}"))
+        })?;
+        if !response.status().is_success() {
+            return Err(DeploymentRuntimeError::NotFound(format!(
+                "download OSS unit release returned HTTP {}",
+                response.status()
+            )));
+        }
+        let mut file = fs::File::create(&destination)
+            .await
+            .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
+        let mut hasher = Sha256::new();
+        let mut received = 0_u64;
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            DeploymentRuntimeError::NotFound(format!("read OSS unit release failed: {error}"))
+        })? {
+            received = received.saturating_add(chunk.len() as u64);
+            if release.size_bytes > 0 && received > release.size_bytes as u64 {
+                let _ = fs::remove_file(&destination).await;
+                return Err(DeploymentRuntimeError::Validation(
+                    "OSS unit release is larger than registered size".to_owned(),
+                ));
+            }
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
+        }
+        file.flush()
+            .await
+            .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
+        let checksum = format!("{:x}", hasher.finalize());
+        if (release.size_bytes > 0 && received != release.size_bytes as u64)
+            || !release.checksum_sha256.eq_ignore_ascii_case(&checksum)
+        {
+            let _ = fs::remove_file(&destination).await;
+            return Err(DeploymentRuntimeError::Validation(
+                "downloaded OSS unit release integrity check failed".to_owned(),
+            ));
+        }
+        release.package_path = destination;
+        release.storage_provider = "local".to_owned();
+        Ok(())
     }
 }
 
@@ -1065,6 +1167,21 @@ fn script_file_name(slot: &str) -> Result<&'static str, DeploymentRuntimeError> 
     }
 }
 
+fn safe_package_name(name: &str) -> Result<&str, DeploymentRuntimeError> {
+    let name = name.trim();
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\'])
+        || Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name)
+    {
+        return Err(DeploymentRuntimeError::Validation(
+            "unit release package name is unsafe".to_owned(),
+        ));
+    }
+    Ok(name)
+}
+
 fn environment_variables(
     secrets: &BTreeMap<String, String>,
     environment_key: &str,
@@ -1251,5 +1368,7 @@ mod tests {
             .is_err()
         );
         assert!(script_file_name("unknown").is_err());
+        assert!(safe_package_name("../package.tar.gz").is_err());
+        assert!(safe_package_name("package.tar.gz").is_ok());
     }
 }
