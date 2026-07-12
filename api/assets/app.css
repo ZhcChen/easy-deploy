@@ -635,9 +635,132 @@ a {
   color: #42526a;
 }
 
+.tone-danger {
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+}
+
 .deployment-console,
 .deployment-history-panel {
   margin-bottom: 16px;
+}
+
+.deployment-history-meta,
+.deployment-cleanup-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px 20px;
+}
+
+.deployment-history-meta div,
+.deployment-cleanup-actions > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.deployment-history-meta span,
+.deployment-history-timeline,
+.deployment-result-detail,
+.deployment-artifact-line,
+.deployment-cleanup-actions span,
+.deployment-cleanup-actions small {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.deployment-history-meta strong,
+.deployment-cleanup-actions strong {
+  overflow-wrap: anywhere;
+}
+
+.deployment-history-summary {
+  margin: 18px 0 0;
+}
+
+.deployment-history-timeline,
+.deployment-result-main,
+.deployment-result-detail,
+.deployment-artifact-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+
+.deployment-result-list,
+.deployment-log-list {
+  display: grid;
+  gap: 0;
+}
+
+.deployment-result-row {
+  padding: 16px 0;
+  border-top: 1px solid var(--line);
+}
+
+.deployment-result-row:first-child {
+  border-top: 0;
+}
+
+.deployment-result-main {
+  align-items: center;
+  justify-content: space-between;
+}
+
+.deployment-result-main > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.deployment-result-main span,
+.deployment-result-detail,
+.deployment-artifact-line {
+  overflow-wrap: anywhere;
+}
+
+.deployment-result-detail,
+.deployment-artifact-line {
+  margin-top: 10px;
+}
+
+.deployment-log-entry,
+.cleanup-confirmation {
+  border-top: 1px solid var(--line);
+}
+
+.deployment-log-entry summary,
+.cleanup-confirmation summary {
+  cursor: pointer;
+  padding: 12px 0;
+}
+
+.deployment-log-entry summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.deployment-log-entry pre {
+  max-height: 420px;
+  margin: 0 0 16px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.cleanup-confirmation form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 10px;
+  padding-bottom: 12px;
+}
+
+.cleanup-confirmation label {
+  display: grid;
+  gap: 5px;
+  min-width: min(100%, 240px);
 }
 
 .environment-tabs {
@@ -4441,6 +4564,17 @@ tbody tr:last-child td {
 }
 
 @media (max-width: 760px) {
+  .deployment-history-meta,
+  .deployment-cleanup-actions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .deployment-result-main,
+  .deployment-log-entry summary {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
   .deploy-risk-summary {
     flex-direction: column;
     gap: 6px;

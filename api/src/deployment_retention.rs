@@ -1,11 +1,17 @@
 use std::{
     collections::{HashMap, VecDeque},
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
 use async_trait::async_trait;
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use tokio::sync::Mutex;
+
+use crate::artifact_storage::{
+    AliyunOssObjectVerifier, ArtifactObjectVerifier, ArtifactStorageConfig,
+    STORAGE_PROVIDER_ALIYUN_OSS, STORAGE_PROVIDER_LOCAL,
+};
 
 pub const DEFAULT_STEP_LOG_HEAD_BYTES: usize = 2 * 1024 * 1024;
 pub const DEFAULT_STEP_LOG_TAIL_BYTES: usize = 8 * 1024 * 1024;
@@ -123,6 +129,56 @@ pub struct ArtifactCleanupPreview {
     pub blockers: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationReleaseCleanupPreview {
+    pub app_release_id: i64,
+    pub version: String,
+    pub version_code: i64,
+    pub immutable_status: String,
+    pub estimated_bytes: u64,
+    pub archive_blockers: Vec<String>,
+    pub blockers: Vec<String>,
+}
+
+impl ApplicationReleaseCleanupPreview {
+    pub fn can_archive(&self) -> bool {
+        self.immutable_status == "ready" && self.archive_blockers.is_empty()
+    }
+
+    pub fn can_delete(&self) -> bool {
+        self.immutable_status == "archived" && self.blockers.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentHistoryDeletePreview {
+    pub deployment_run_id: i64,
+    pub app_release_id: i64,
+    pub task_id: Option<i64>,
+    pub status: String,
+    pub snapshot_status: String,
+    pub log_reference_count: i64,
+    pub unit_result_count: i64,
+    pub queue_reference_count: i64,
+    pub blockers: Vec<String>,
+}
+
+impl DeploymentHistoryDeletePreview {
+    pub fn allowed(&self) -> bool {
+        self.blockers.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentHistoryDeleteResult {
+    pub deployment_run_id: i64,
+    pub app_release_id: i64,
+    pub task_id: Option<i64>,
+    pub deleted_unit_results: u64,
+    pub deleted_queue_rows: u64,
+    pub cleared_task_release: bool,
+}
+
 impl ArtifactCleanupPreview {
     pub fn allowed(&self) -> bool {
         self.blockers.is_empty()
@@ -137,7 +193,9 @@ impl ArtifactCleanupPreview {
 pub struct ArtifactDeletionTarget {
     pub provider: String,
     pub package_path: String,
+    pub extract_dir: String,
     pub bucket: String,
+    pub endpoint: String,
     pub object_key: String,
     pub object_version_id: String,
 }
@@ -145,6 +203,13 @@ pub struct ArtifactDeletionTarget {
 #[async_trait]
 pub trait ArtifactObjectDeleter: Send + Sync {
     async fn delete(&self, target: &ArtifactDeletionTarget) -> Result<(), String>;
+}
+
+#[derive(Clone)]
+pub struct ArtifactStorageDeleter {
+    data_dir: PathBuf,
+    storage: ArtifactStorageConfig,
+    oss: Arc<dyn ArtifactObjectVerifier>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +222,59 @@ pub struct ArtifactCleanupResult {
 #[derive(Clone)]
 pub struct DeploymentRetentionService {
     db: SqlitePool,
+}
+
+impl ArtifactStorageDeleter {
+    pub fn new(data_dir: impl AsRef<Path>, storage: ArtifactStorageConfig) -> Self {
+        Self::with_oss_verifier(
+            data_dir,
+            storage,
+            Arc::new(AliyunOssObjectVerifier::default()),
+        )
+    }
+
+    pub fn with_oss_verifier(
+        data_dir: impl AsRef<Path>,
+        storage: ArtifactStorageConfig,
+        oss: Arc<dyn ArtifactObjectVerifier>,
+    ) -> Self {
+        Self {
+            data_dir: data_dir.as_ref().to_path_buf(),
+            storage,
+            oss,
+        }
+    }
+}
+
+#[async_trait]
+impl ArtifactObjectDeleter for ArtifactStorageDeleter {
+    async fn delete(&self, target: &ArtifactDeletionTarget) -> Result<(), String> {
+        match target.provider.as_str() {
+            STORAGE_PROVIDER_LOCAL => {
+                delete_local_artifact_paths(
+                    &self.data_dir,
+                    [&target.package_path, &target.extract_dir],
+                )
+                .await
+            }
+            STORAGE_PROVIDER_ALIYUN_OSS => {
+                let version_id = target.object_version_id.trim();
+                if version_id.is_empty() {
+                    return Err("OSS 制品缺少精确对象版本号，拒绝删除当前版本".to_owned());
+                }
+                let mut config = self.storage.aliyun_oss.clone();
+                config.bucket = target.bucket.trim().to_owned();
+                if !target.endpoint.trim().is_empty() {
+                    config.endpoint = target.endpoint.trim().to_owned();
+                }
+                self.oss
+                    .delete(&config, &target.object_key, Some(version_id))
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            provider => Err(format!("不支持清理存储类型 {provider}")),
+        }
+    }
 }
 
 impl std::fmt::Display for DeploymentRetentionError {
@@ -378,7 +496,11 @@ impl DeploymentLogService {
         Ok(previews)
     }
 
-    pub async fn delete_task_logs(&self, task_id: i64) -> Result<u64, DeploymentRetentionError> {
+    pub async fn delete_task_logs(
+        &self,
+        task_id: i64,
+        operator: &str,
+    ) -> Result<u64, DeploymentRetentionError> {
         let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
         let task_status: Option<String> =
             sqlx::query_scalar("SELECT status FROM operation_tasks WHERE id = ?1")
@@ -427,9 +549,20 @@ impl DeploymentLogService {
             .bind(task_id)
             .execute(&mut *tx)
             .await?;
+        let released_bytes = (bounded_bytes + legacy_bytes).max(0) as u64;
+        insert_cleanup_event(
+            &mut tx,
+            "task",
+            task_id,
+            "info",
+            "部署任务日志已清理",
+            operator,
+            &format!("释放 {released_bytes} 字节，任务、阶段、步骤和单元结果继续保留"),
+        )
+        .await?;
         tx.commit().await?;
         self.state.lock().await.tasks.remove(&task_id);
-        Ok((bounded_bytes + legacy_bytes).max(0) as u64)
+        Ok(released_bytes)
     }
 
     async fn mutate_buffer(
@@ -657,6 +790,202 @@ impl DeploymentRetentionService {
         Ok(preview)
     }
 
+    pub async fn preview_application_release_cleanup(
+        &self,
+        app_id: i64,
+        app_release_id: i64,
+    ) -> Result<ApplicationReleaseCleanupPreview, DeploymentRetentionError> {
+        let mut tx = self.db.begin().await?;
+        let preview = application_release_cleanup_preview(&mut tx, app_id, app_release_id).await?;
+        tx.commit().await?;
+        Ok(preview)
+    }
+
+    pub async fn preview_deployment_history_delete(
+        &self,
+        app_id: i64,
+        deployment_run_id: i64,
+    ) -> Result<DeploymentHistoryDeletePreview, DeploymentRetentionError> {
+        let mut tx = self.db.begin().await?;
+        let preview = deployment_history_delete_preview(&mut tx, app_id, deployment_run_id).await?;
+        tx.commit().await?;
+        Ok(preview)
+    }
+
+    pub async fn delete_deployment_history(
+        &self,
+        app_id: i64,
+        deployment_run_id: i64,
+        operator: &str,
+    ) -> Result<DeploymentHistoryDeleteResult, DeploymentRetentionError> {
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let preview = deployment_history_delete_preview(&mut tx, app_id, deployment_run_id).await?;
+        if !preview.allowed() {
+            return Err(DeploymentRetentionError::InvalidState(format!(
+                "部署历史当前不可彻底删除：{}",
+                preview.blockers.join("；")
+            )));
+        }
+
+        let mut deleted_queue_rows = 0;
+        let mut cleared_task_release = false;
+        if let Some(task_id) = preview.task_id {
+            let deleted_queue = sqlx::query(
+                r#"
+                DELETE FROM app_release_queue
+                WHERE task_id = ?1
+                  AND release_id = ?2
+                  AND status NOT IN ('scheduled', 'queued', 'running')
+                "#,
+            )
+            .bind(task_id)
+            .bind(preview.app_release_id)
+            .execute(&mut *tx)
+            .await?;
+            deleted_queue_rows = deleted_queue.rows_affected();
+
+            let cleared_task = sqlx::query(
+                "UPDATE operation_tasks SET release_id = NULL WHERE id = ?1 AND release_id = ?2",
+            )
+            .bind(task_id)
+            .bind(preview.app_release_id)
+            .execute(&mut *tx)
+            .await?;
+            cleared_task_release = cleared_task.rows_affected() > 0;
+        }
+
+        insert_cleanup_event(
+            &mut tx,
+            "environment_deployment_run",
+            deployment_run_id,
+            "warning",
+            "部署历史已彻底删除",
+            operator,
+            &format!(
+                "删除 {} 条部署单元结果，应用版本 #{} 的任务引用已{}清除，关联发布队列删除 {} 条",
+                preview.unit_result_count,
+                preview.app_release_id,
+                if cleared_task_release { "" } else { "无需" },
+                deleted_queue_rows
+            ),
+        )
+        .await?;
+
+        let deleted_run =
+            sqlx::query("DELETE FROM environment_deployment_runs WHERE id = ?1 AND app_id = ?2")
+                .bind(deployment_run_id)
+                .bind(app_id)
+                .execute(&mut *tx)
+                .await?;
+        if deleted_run.rows_affected() != 1 {
+            return Err(DeploymentRetentionError::NotFound(
+                "部署历史不存在".to_owned(),
+            ));
+        }
+        tx.commit().await?;
+
+        Ok(DeploymentHistoryDeleteResult {
+            deployment_run_id,
+            app_release_id: preview.app_release_id,
+            task_id: preview.task_id,
+            deleted_unit_results: preview.unit_result_count.max(0) as u64,
+            deleted_queue_rows,
+            cleared_task_release,
+        })
+    }
+
+    pub async fn archive_application_release(
+        &self,
+        app_id: i64,
+        app_release_id: i64,
+        operator: &str,
+    ) -> Result<ApplicationReleaseCleanupPreview, DeploymentRetentionError> {
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let preview = application_release_cleanup_preview(&mut tx, app_id, app_release_id).await?;
+        if !preview.can_archive() {
+            return Err(DeploymentRetentionError::InvalidState(format!(
+                "应用版本当前不可归档：{}",
+                if preview.archive_blockers.is_empty() {
+                    format!("当前状态为 {}", preview.immutable_status)
+                } else {
+                    preview.archive_blockers.join("；")
+                }
+            )));
+        }
+        sqlx::query(
+            r#"
+            UPDATE application_release_manifests
+            SET immutable_status = 'archived',
+                archived_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE app_release_id = ?1 AND immutable_status = 'ready'
+            "#,
+        )
+        .bind(app_release_id)
+        .execute(&mut *tx)
+        .await?;
+        insert_cleanup_event(
+            &mut tx,
+            "application_release",
+            app_release_id,
+            "info",
+            "应用版本已归档",
+            operator,
+            &format!(
+                "版本 {} · versionCode {}",
+                preview.version, preview.version_code
+            ),
+        )
+        .await?;
+        let archived = application_release_cleanup_preview(&mut tx, app_id, app_release_id).await?;
+        tx.commit().await?;
+        Ok(archived)
+    }
+
+    pub async fn delete_application_release(
+        &self,
+        app_id: i64,
+        app_release_id: i64,
+        operator: &str,
+    ) -> Result<u64, DeploymentRetentionError> {
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let preview = application_release_cleanup_preview(&mut tx, app_id, app_release_id).await?;
+        if !preview.can_delete() {
+            return Err(DeploymentRetentionError::InvalidState(format!(
+                "应用版本当前不可彻底删除：{}",
+                if preview.blockers.is_empty() {
+                    format!("请先归档，当前状态为 {}", preview.immutable_status)
+                } else {
+                    preview.blockers.join("；")
+                }
+            )));
+        }
+        insert_cleanup_event(
+            &mut tx,
+            "application_release",
+            app_release_id,
+            "info",
+            "已彻底删除应用版本",
+            operator,
+            &format!(
+                "版本 {} · versionCode {}，结构化部署历史和审计记录未删除",
+                preview.version, preview.version_code
+            ),
+        )
+        .await?;
+        let deleted = sqlx::query("DELETE FROM app_releases WHERE id = ?1 AND app_id = ?2")
+            .bind(app_release_id)
+            .bind(app_id)
+            .execute(&mut *tx)
+            .await?;
+        if deleted.rows_affected() != 1 {
+            return Err(DeploymentRetentionError::NotFound(
+                "应用版本不存在".to_owned(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(preview.estimated_bytes)
+    }
+
     pub async fn cleanup_artifact(
         &self,
         unit_release_id: i64,
@@ -675,10 +1004,10 @@ impl DeploymentRetentionService {
                 }
             )));
         }
-        let target = sqlx::query_as::<_, (String, String, String, String, String)>(
+        let target = sqlx::query_as::<_, (String, String, String, String, String, String, String)>(
             r#"
-            SELECT storage_provider, package_path, storage_bucket,
-                   storage_object_key, storage_object_version_id
+            SELECT storage_provider, package_path, extract_dir, storage_bucket,
+                   storage_endpoint, storage_object_key, storage_object_version_id
             FROM deployment_unit_releases WHERE id = ?1
             "#,
         )
@@ -693,6 +1022,7 @@ impl DeploymentRetentionService {
         .await?;
         insert_cleanup_event(
             &mut tx,
+            "deployment_artifact",
             unit_release_id,
             "info",
             "开始清理部署单元制品",
@@ -705,9 +1035,11 @@ impl DeploymentRetentionService {
         let target = ArtifactDeletionTarget {
             provider: target.0,
             package_path: target.1,
-            bucket: target.2,
-            object_key: target.3,
-            object_version_id: target.4,
+            extract_dir: target.2,
+            bucket: target.3,
+            endpoint: target.4,
+            object_key: target.5,
+            object_version_id: target.6,
         };
         match deleter.delete(&target).await {
             Ok(()) => {
@@ -727,6 +1059,7 @@ impl DeploymentRetentionService {
                 .await?;
                 insert_cleanup_event(
                     &mut tx,
+                    "deployment_artifact",
                     unit_release_id,
                     "info",
                     "部署单元制品清理完成",
@@ -753,6 +1086,7 @@ impl DeploymentRetentionService {
                 .await?;
                 insert_cleanup_event(
                     &mut tx,
+                    "deployment_artifact",
                     unit_release_id,
                     "error",
                     "部署单元制品清理失败",
@@ -833,6 +1167,7 @@ impl DeploymentRetentionService {
         .await?;
         insert_cleanup_event(
             &mut tx,
+            "environment_deployment_run",
             deployment_run_id,
             "info",
             "部署配置与制品快照已清理",
@@ -902,8 +1237,200 @@ async fn artifact_cleanup_preview(
     })
 }
 
+async fn application_release_cleanup_preview(
+    tx: &mut Transaction<'_, Sqlite>,
+    app_id: i64,
+    app_release_id: i64,
+) -> Result<ApplicationReleaseCleanupPreview, DeploymentRetentionError> {
+    let release = sqlx::query_as::<_, (String, i64, String, i64)>(
+        r#"
+        SELECT releases.version, releases.version_code, manifests.immutable_status,
+               length(CAST(manifests.manifest_json AS BLOB))
+                 + length(CAST(releases.metadata AS BLOB)) AS estimated_bytes
+        FROM app_releases releases
+        JOIN application_release_manifests manifests
+          ON manifests.app_release_id = releases.id
+        WHERE releases.id = ?1 AND releases.app_id = ?2
+          AND manifests.immutable_status <> 'deleted'
+        "#,
+    )
+    .bind(app_release_id)
+    .bind(app_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| DeploymentRetentionError::NotFound("应用版本不存在".to_owned()))?;
+
+    let mut archive_blockers = Vec::new();
+    let mut blockers = Vec::new();
+    let current_refs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM app_environments WHERE current_app_release_id = ?1",
+    )
+    .bind(app_release_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if current_refs > 0 {
+        let blocker = format!("仍是 {current_refs} 个环境的当前版本");
+        archive_blockers.push(blocker.clone());
+        blockers.push(blocker);
+    }
+    let active_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM environment_deployment_runs WHERE app_release_id = ?1 AND status IN ('queued', 'running', 'reconciling')",
+    )
+    .bind(app_release_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if active_runs > 0 {
+        archive_blockers.push(format!("仍被 {active_runs} 个活动部署使用"));
+    }
+    let deployment_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM environment_deployment_runs WHERE app_release_id = ?1",
+    )
+    .bind(app_release_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if deployment_runs > 0 {
+        blockers.push(format!("仍被 {deployment_runs} 条部署历史引用"));
+    }
+    let active_queue: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM app_release_queue WHERE release_id = ?1 AND status IN ('scheduled', 'queued', 'running')",
+    )
+    .bind(app_release_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if active_queue > 0 {
+        archive_blockers.push(format!("仍有 {active_queue} 条活动发布队列记录"));
+    }
+    let queue_refs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM app_release_queue WHERE release_id = ?1")
+            .bind(app_release_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if queue_refs > 0 {
+        blockers.push(format!("仍被 {queue_refs} 条发布队列历史引用"));
+    }
+    let task_refs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM operation_tasks WHERE release_id = ?1")
+            .bind(app_release_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if task_refs > 0 {
+        blockers.push(format!("仍被 {task_refs} 条任务历史引用"));
+    }
+    let legacy_run_refs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM deployment_runs WHERE release_id = ?1")
+            .bind(app_release_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if legacy_run_refs > 0 {
+        blockers.push(format!("仍被 {legacy_run_refs} 条兼容部署历史引用"));
+    }
+    let base_refs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM application_release_manifests WHERE base_app_release_id = ?1 AND immutable_status <> 'deleted'",
+    )
+    .bind(app_release_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if base_refs > 0 {
+        blockers.push(format!("仍是 {base_refs} 个应用版本的继承基线"));
+    }
+
+    Ok(ApplicationReleaseCleanupPreview {
+        app_release_id,
+        version: release.0,
+        version_code: release.1,
+        immutable_status: release.2,
+        estimated_bytes: release.3.max(0) as u64,
+        archive_blockers,
+        blockers,
+    })
+}
+
+async fn deployment_history_delete_preview(
+    tx: &mut Transaction<'_, Sqlite>,
+    app_id: i64,
+    deployment_run_id: i64,
+) -> Result<DeploymentHistoryDeletePreview, DeploymentRetentionError> {
+    let run = sqlx::query_as::<_, (i64, Option<i64>, String, String)>(
+        r#"
+        SELECT app_release_id, task_id, status, snapshot_status
+        FROM environment_deployment_runs
+        WHERE id = ?1 AND app_id = ?2
+        "#,
+    )
+    .bind(deployment_run_id)
+    .bind(app_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| DeploymentRetentionError::NotFound("部署历史不存在".to_owned()))?;
+
+    let unit_result_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM deployment_unit_run_results WHERE deployment_run_id = ?1",
+    )
+    .bind(deployment_run_id)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    let (log_reference_count, queue_reference_count) = match run.1 {
+        Some(task_id) => {
+            let log_references: i64 = sqlx::query_scalar(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM deployment_step_log_buffers WHERE task_id = ?1)
+                  + (SELECT COUNT(*) FROM deployment_task_log_budgets WHERE task_id = ?1)
+                  + (SELECT COUNT(*) FROM operation_task_logs WHERE task_id = ?1)
+                "#,
+            )
+            .bind(task_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            let active_queue_references: i64 = sqlx::query_scalar(
+                r#"
+                SELECT COUNT(*)
+                FROM app_release_queue
+                WHERE task_id = ?1
+                  AND release_id = ?2
+                  AND status IN ('scheduled', 'queued', 'running')
+                "#,
+            )
+            .bind(task_id)
+            .bind(run.0)
+            .fetch_one(&mut **tx)
+            .await?;
+            (log_references, active_queue_references)
+        }
+        None => (0, 0),
+    };
+
+    let mut blockers = Vec::new();
+    if matches!(run.2.as_str(), "queued" | "running" | "reconciling") {
+        blockers.push(format!("部署仍处于 {} 状态", run.2));
+    }
+    if run.3 != "deleted" {
+        blockers.push("请先清理配置与制品快照".to_owned());
+    }
+    if log_reference_count > 0 {
+        blockers.push("请先清理执行日志".to_owned());
+    }
+    if queue_reference_count > 0 {
+        blockers.push("关联发布队列仍处于活动状态".to_owned());
+    }
+
+    Ok(DeploymentHistoryDeletePreview {
+        deployment_run_id,
+        app_release_id: run.0,
+        task_id: run.1,
+        status: run.2,
+        snapshot_status: run.3,
+        log_reference_count,
+        unit_result_count,
+        queue_reference_count,
+        blockers,
+    })
+}
+
 async fn insert_cleanup_event(
     tx: &mut Transaction<'_, Sqlite>,
+    target_type: &str,
     target_id: i64,
     level: &str,
     title: &str,
@@ -914,16 +1441,91 @@ async fn insert_cleanup_event(
         r#"
         INSERT INTO event_logs(
             event_type, level, target_type, target_id, target_name, title, summary, detail
-        ) VALUES ('deployment.cleanup', ?1, 'deployment_artifact', ?2, '', ?3, ?4, ?5)
+        ) VALUES ('deployment.cleanup', ?1, ?2, ?3, '', ?4, ?5, ?6)
         "#,
     )
     .bind(level)
+    .bind(target_type)
     .bind(target_id.to_string())
     .bind(title)
     .bind(format!("操作人：{}", operator.trim()))
     .bind(detail)
     .execute(&mut **tx)
     .await?;
+    Ok(())
+}
+
+async fn delete_local_artifact_paths<'a>(
+    data_dir: &Path,
+    paths: impl IntoIterator<Item = &'a String>,
+) -> Result<(), String> {
+    let root = tokio::fs::canonicalize(data_dir).await.map_err(|error| {
+        format!(
+            "无法确认平台数据目录 {}：{error}",
+            data_dir.to_string_lossy()
+        )
+    })?;
+    let mut targets = Vec::new();
+    for path in paths {
+        let value = path.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let candidate = PathBuf::from(value);
+        let candidate = if candidate.is_absolute() {
+            candidate
+        } else {
+            data_dir.join(candidate)
+        };
+        let metadata = match tokio::fs::symlink_metadata(&candidate).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "读取本地制品路径 {} 失败：{error}",
+                    candidate.to_string_lossy()
+                ));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "本地制品路径 {} 是符号链接，拒绝清理",
+                candidate.to_string_lossy()
+            ));
+        }
+        let canonical = tokio::fs::canonicalize(&candidate).await.map_err(|error| {
+            format!(
+                "无法确认本地制品路径 {}：{error}",
+                candidate.to_string_lossy()
+            )
+        })?;
+        if canonical == root || !canonical.starts_with(&root) {
+            return Err(format!(
+                "本地制品路径 {} 不在平台数据目录内，拒绝清理",
+                candidate.to_string_lossy()
+            ));
+        }
+        targets.push((candidate, metadata));
+    }
+
+    for (target, metadata) in targets {
+        if metadata.is_dir() {
+            tokio::fs::remove_dir_all(&target).await
+        } else if metadata.is_file() {
+            tokio::fs::remove_file(&target).await
+        } else {
+            return Err(format!(
+                "本地制品路径 {} 不是普通文件或目录，拒绝清理",
+                target.to_string_lossy()
+            ));
+        }
+        .map_err(|error| {
+            format!(
+                "删除本地制品路径 {} 失败：{error}",
+                target.to_string_lossy()
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -1410,7 +2012,7 @@ mod tests {
         assert!(snapshot.stored_bytes <= 32);
 
         let active_error = service
-            .delete_task_logs(task_id)
+            .delete_task_logs(task_id, "operator")
             .await
             .expect_err("active task logs stay protected");
         assert!(matches!(
@@ -1425,7 +2027,7 @@ mod tests {
             .expect("finish task");
 
         let released = service
-            .delete_task_logs(task_id)
+            .delete_task_logs(task_id, "operator")
             .await
             .expect("delete logs");
         assert_eq!(released, snapshot.stored_bytes);
@@ -1443,6 +2045,15 @@ mod tests {
                 .await
                 .expect("check step");
         assert!(task_exists && step_exists);
+        let cleanup_event: (String, String) = sqlx::query_as(
+            "SELECT target_type, summary FROM event_logs WHERE event_type = 'deployment.cleanup' AND target_id = ?1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(task_id.to_string())
+        .fetch_one(&db)
+        .await
+        .expect("load log cleanup event");
+        assert_eq!(cleanup_event.0, "task");
+        assert!(cleanup_event.1.contains("operator"));
     }
 
     #[tokio::test]
@@ -1578,6 +2189,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn application_release_archive_and_delete_honor_reference_blockers() {
+        let db = retention_database().await;
+        let app_id = sqlx::query(
+            "INSERT INTO apps(app_key, name, app_type, deploy_mode, work_dir, status) VALUES ('release-cleanup-app', 'Release Cleanup', 'compose', 'compose', '/srv/app', 'ready')",
+        )
+        .execute(&db)
+        .await
+        .expect("insert app")
+        .last_insert_rowid();
+        let environment_id = sqlx::query(
+            "INSERT INTO app_environments(app_id, environment_key, name, status) VALUES (?1, 'production', '正式环境', 'ready')",
+        )
+        .bind(app_id)
+        .execute(&db)
+        .await
+        .expect("insert environment")
+        .last_insert_rowid();
+        let unit_id = sqlx::query(
+            "INSERT INTO deployment_units(app_id, unit_key, name) VALUES (?1, 'api', 'API')",
+        )
+        .bind(app_id)
+        .execute(&db)
+        .await
+        .expect("insert unit")
+        .last_insert_rowid();
+        let artifact_id = insert_artifact(&db, unit_id, "3.0.0", "/tmp/release-cleanup.tgz").await;
+        let app_release_id = sqlx::query(
+            "INSERT INTO app_releases(app_id, version, version_code, status, source) VALUES (?1, '3.0.0', 100, 'received', 'openapi')",
+        )
+        .bind(app_id)
+        .execute(&db)
+        .await
+        .expect("insert app release")
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO application_release_manifests(app_release_id, manifest_hash, manifest_json) VALUES (?1, 'release-cleanup-manifest', '{\"units\":[\"api\"]}')",
+        )
+        .bind(app_release_id)
+        .execute(&db)
+        .await
+        .expect("insert manifest");
+        sqlx::query(
+            "INSERT INTO app_release_units(app_release_id, unit_id, unit_release_id) VALUES (?1, ?2, ?3)",
+        )
+        .bind(app_release_id)
+        .bind(unit_id)
+        .bind(artifact_id)
+        .execute(&db)
+        .await
+        .expect("insert release unit");
+        sqlx::query("UPDATE app_environments SET current_app_release_id = ?2 WHERE id = ?1")
+            .bind(environment_id)
+            .bind(app_release_id)
+            .execute(&db)
+            .await
+            .expect("set current release");
+        let service = DeploymentRetentionService::new(db.clone());
+
+        let blocked = service
+            .preview_application_release_cleanup(app_id, app_release_id)
+            .await
+            .expect("preview current release");
+        assert!(!blocked.can_archive());
+        assert!(!blocked.can_delete());
+        assert!(
+            blocked
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("当前版本"))
+        );
+
+        sqlx::query("UPDATE app_environments SET current_app_release_id = NULL WHERE id = ?1")
+            .bind(environment_id)
+            .execute(&db)
+            .await
+            .expect("clear current release");
+        let archived = service
+            .archive_application_release(app_id, app_release_id, "operator")
+            .await
+            .expect("archive release");
+        assert_eq!(archived.immutable_status, "archived");
+        assert!(archived.can_delete());
+
+        let released = service
+            .delete_application_release(app_id, app_release_id, "operator")
+            .await
+            .expect("delete archived release");
+        assert!(released > 0);
+        let release_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM app_releases WHERE id = ?1)")
+                .bind(app_release_id)
+                .fetch_one(&db)
+                .await
+                .expect("check deleted release");
+        assert!(!release_exists);
+        let artifact = service
+            .preview_artifact_cleanup(artifact_id)
+            .await
+            .expect("preview newly unreferenced artifact");
+        assert!(artifact.allowed());
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event_logs WHERE event_type = 'deployment.cleanup' AND target_type = 'application_release' AND target_id = ?1",
+        )
+        .bind(app_release_id.to_string())
+        .fetch_one(&db)
+        .await
+        .expect("count application release events");
+        assert_eq!(event_count, 2);
+    }
+
+    #[tokio::test]
     async fn deleting_deployment_snapshot_preserves_structured_unit_result() {
         let db = retention_database().await;
         let app_id = sqlx::query(
@@ -1687,6 +2409,292 @@ mod tests {
                 "健康检查失败".to_owned()
             )
         );
+        let cleanup_target: String = sqlx::query_scalar(
+            "SELECT target_type FROM event_logs WHERE event_type = 'deployment.cleanup' AND target_id = ?1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(run_id.to_string())
+        .fetch_one(&db)
+        .await
+        .expect("load snapshot cleanup event");
+        assert_eq!(cleanup_target, "environment_deployment_run");
+    }
+
+    #[tokio::test]
+    async fn deleting_deployment_history_releases_application_and_artifact_chain() {
+        let db = retention_database().await;
+        let app_id = sqlx::query(
+            "INSERT INTO apps(app_key, name, app_type, deploy_mode, work_dir, status) VALUES ('history-delete-app', 'History Delete', 'compose', 'compose', '/srv/app', 'ready')",
+        )
+        .execute(&db)
+        .await
+        .expect("insert app")
+        .last_insert_rowid();
+        let environment_id = sqlx::query(
+            "INSERT INTO app_environments(app_id, environment_key, name, status) VALUES (?1, 'production', '正式环境', 'ready')",
+        )
+        .bind(app_id)
+        .execute(&db)
+        .await
+        .expect("insert environment")
+        .last_insert_rowid();
+        let unit_id = sqlx::query(
+            "INSERT INTO deployment_units(app_id, unit_key, name) VALUES (?1, 'api', 'API')",
+        )
+        .bind(app_id)
+        .execute(&db)
+        .await
+        .expect("insert unit")
+        .last_insert_rowid();
+        let artifact_id = insert_artifact(&db, unit_id, "4.0.0", "/tmp/history-delete.tgz").await;
+        let config_id = sqlx::query(
+            "INSERT INTO app_config_revisions(app_id, revision_no, config_json, public_config_json, config_hash) VALUES (?1, 100, '{}', '{}', 'history-delete-config')",
+        )
+        .bind(app_id)
+        .execute(&db)
+        .await
+        .expect("insert config")
+        .last_insert_rowid();
+        let app_release_id = sqlx::query(
+            "INSERT INTO app_releases(app_id, version, version_code, status, source) VALUES (?1, '4.0.0', 100, 'received', 'openapi')",
+        )
+        .bind(app_id)
+        .execute(&db)
+        .await
+        .expect("insert app release")
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO application_release_manifests(app_release_id, manifest_hash, manifest_json) VALUES (?1, 'history-delete-manifest', '{\"units\":[\"api\"]}')",
+        )
+        .bind(app_release_id)
+        .execute(&db)
+        .await
+        .expect("insert manifest");
+        sqlx::query(
+            "INSERT INTO app_release_units(app_release_id, unit_id, unit_release_id) VALUES (?1, ?2, ?3)",
+        )
+        .bind(app_release_id)
+        .bind(unit_id)
+        .bind(artifact_id)
+        .execute(&db)
+        .await
+        .expect("insert release unit");
+        let task_id = sqlx::query(
+            "INSERT INTO operation_tasks(task_kind, title, app_id, release_id, environment_id, status) VALUES ('release.deploy', 'history delete', ?1, ?2, ?3, 'failed')",
+        )
+        .bind(app_id)
+        .bind(app_release_id)
+        .bind(environment_id)
+        .execute(&db)
+        .await
+        .expect("insert task")
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO operation_task_logs(task_id, stream, content) VALUES (?1, 'stdout', 'deploy failed')",
+        )
+        .bind(task_id)
+        .execute(&db)
+        .await
+        .expect("insert task log");
+        sqlx::query(
+            "INSERT INTO app_release_queue(app_id, release_id, status, triggered_by, task_id, environment_id) VALUES (?1, ?2, 'failed', 'operator', ?3, ?4)",
+        )
+        .bind(app_id)
+        .bind(app_release_id)
+        .bind(task_id)
+        .bind(environment_id)
+        .execute(&db)
+        .await
+        .expect("insert queue row");
+        let run_id = sqlx::query(
+            "INSERT INTO environment_deployment_runs(app_id, environment_id, app_release_id, config_revision_id, task_id, deployment_mode, plan_hash, plan_json, status, summary, finished_at) VALUES (?1, ?2, ?3, ?4, ?5, 'normal', 'hash', ?6, 'all_failed', '全部失败', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(app_id)
+        .bind(environment_id)
+        .bind(app_release_id)
+        .bind(config_id)
+        .bind(task_id)
+        .bind(r#"{"units":[{"unit":"api"}]}"#)
+        .execute(&db)
+        .await
+        .expect("insert run")
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO deployment_unit_run_results(deployment_run_id, unit_id, unit_release_id, stage_no, action, status, failure_kind, failure_summary) VALUES (?1, ?2, ?3, 1, 'deploy', 'failed', 'script_failed', '脚本失败')",
+        )
+        .bind(run_id)
+        .bind(unit_id)
+        .bind(artifact_id)
+        .execute(&db)
+        .await
+        .expect("insert unit result");
+
+        let retention = DeploymentRetentionService::new(db.clone());
+        let blocked = retention
+            .preview_deployment_history_delete(app_id, run_id)
+            .await
+            .expect("preview blocked history delete");
+        assert!(!blocked.allowed());
+        assert!(blocked.blockers.iter().any(|item| item.contains("快照")));
+        assert!(blocked.blockers.iter().any(|item| item.contains("日志")));
+
+        DeploymentLogService::new(db.clone())
+            .delete_task_logs(task_id, "operator")
+            .await
+            .expect("delete logs first");
+        retention
+            .delete_deployment_snapshot(run_id, "operator")
+            .await
+            .expect("delete snapshot second");
+        let ready = retention
+            .preview_deployment_history_delete(app_id, run_id)
+            .await
+            .expect("preview ready history delete");
+        assert!(ready.allowed());
+        assert_eq!(ready.unit_result_count, 1);
+
+        let deleted = retention
+            .delete_deployment_history(app_id, run_id, "operator")
+            .await
+            .expect("delete deployment history");
+        assert_eq!(deleted.deleted_unit_results, 1);
+        assert_eq!(deleted.deleted_queue_rows, 1);
+        assert!(deleted.cleared_task_release);
+
+        let run_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM environment_deployment_runs WHERE id = ?1)",
+        )
+        .bind(run_id)
+        .fetch_one(&db)
+        .await
+        .expect("check run deleted");
+        assert!(!run_exists);
+        let result_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM deployment_unit_run_results WHERE deployment_run_id = ?1",
+        )
+        .bind(run_id)
+        .fetch_one(&db)
+        .await
+        .expect("check unit results deleted");
+        assert_eq!(result_count, 0);
+        let task_release_id: Option<i64> =
+            sqlx::query_scalar("SELECT release_id FROM operation_tasks WHERE id = ?1")
+                .bind(task_id)
+                .fetch_one(&db)
+                .await
+                .expect("load retained task");
+        assert!(task_release_id.is_none());
+
+        let archived = retention
+            .archive_application_release(app_id, app_release_id, "operator")
+            .await
+            .expect("archive app release after history delete");
+        assert!(archived.can_delete());
+        retention
+            .delete_application_release(app_id, app_release_id, "operator")
+            .await
+            .expect("delete app release after history delete");
+        let artifact = retention
+            .preview_artifact_cleanup(artifact_id)
+            .await
+            .expect("preview artifact after app release delete");
+        assert!(artifact.allowed());
+
+        let history_event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event_logs WHERE event_type = 'deployment.cleanup' AND target_type = 'environment_deployment_run' AND target_id = ?1 AND title = '部署历史已彻底删除'",
+        )
+        .bind(run_id.to_string())
+        .fetch_one(&db)
+        .await
+        .expect("count history delete event");
+        assert_eq!(history_event_count, 1);
+    }
+
+    #[tokio::test]
+    async fn concrete_deleter_removes_only_local_paths_inside_data_directory() {
+        let data_dir = tempfile::tempdir().expect("create data dir");
+        let package_dir = data_dir.path().join("artifacts");
+        let extract_dir = package_dir.join("release");
+        std::fs::create_dir_all(&extract_dir).expect("create extract dir");
+        let package_path = package_dir.join("release.tgz");
+        std::fs::write(&package_path, b"package").expect("write package");
+        std::fs::write(extract_dir.join("compose.yaml"), b"services: {}")
+            .expect("write extracted file");
+        let outside = tempfile::NamedTempFile::new().expect("create outside file");
+        let deleter = ArtifactStorageDeleter::new(
+            data_dir.path(),
+            crate::artifact_storage::ArtifactStorageConfig::default(),
+        );
+
+        deleter
+            .delete(&ArtifactDeletionTarget {
+                provider: "local".to_owned(),
+                package_path: package_path.to_string_lossy().into_owned(),
+                extract_dir: extract_dir.to_string_lossy().into_owned(),
+                bucket: String::new(),
+                endpoint: String::new(),
+                object_key: String::new(),
+                object_version_id: String::new(),
+            })
+            .await
+            .expect("delete local artifact");
+        assert!(!package_path.exists());
+        assert!(!extract_dir.exists());
+
+        let error = deleter
+            .delete(&ArtifactDeletionTarget {
+                provider: "local".to_owned(),
+                package_path: outside.path().to_string_lossy().into_owned(),
+                extract_dir: String::new(),
+                bucket: String::new(),
+                endpoint: String::new(),
+                object_key: String::new(),
+                object_version_id: String::new(),
+            })
+            .await
+            .expect_err("outside path must stay protected");
+        assert!(error.contains("数据目录"));
+        assert!(outside.path().exists());
+    }
+
+    #[tokio::test]
+    async fn concrete_deleter_uses_stored_oss_bucket_endpoint_and_exact_version() {
+        let data_dir = tempfile::tempdir().expect("create data dir");
+        let verifier = Arc::new(RecordingOssVerifier::default());
+        let deleter = ArtifactStorageDeleter::with_oss_verifier(
+            data_dir.path(),
+            crate::artifact_storage::ArtifactStorageConfig {
+                provider: "local".to_owned(),
+                aliyun_oss: crate::artifact_storage::AliyunOssConfig::default(),
+            },
+            verifier.clone(),
+        );
+        let mut target = ArtifactDeletionTarget {
+            provider: "aliyun_oss".to_owned(),
+            package_path: String::new(),
+            extract_dir: String::new(),
+            bucket: "release-bucket".to_owned(),
+            endpoint: "https://oss-cn-shanghai.aliyuncs.com".to_owned(),
+            object_key: "releases/api-1.0.0.tgz".to_owned(),
+            object_version_id: "version-42".to_owned(),
+        };
+
+        deleter.delete(&target).await.expect("delete exact version");
+        {
+            let calls = verifier.calls.lock().expect("lock delete calls");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, "release-bucket");
+            assert_eq!(calls[0].1, "https://oss-cn-shanghai.aliyuncs.com");
+            assert_eq!(calls[0].2, "releases/api-1.0.0.tgz");
+            assert_eq!(calls[0].3.as_deref(), Some("version-42"));
+        }
+
+        target.object_version_id.clear();
+        let error = deleter
+            .delete(&target)
+            .await
+            .expect_err("missing exact version must be rejected");
+        assert!(error.contains("精确对象版本号"));
+        assert_eq!(verifier.calls.lock().expect("lock delete calls").len(), 1);
     }
 
     async fn retention_database() -> SqlitePool {
@@ -1737,6 +2745,42 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    type RecordedOssDelete = (String, String, String, Option<String>);
+
+    #[derive(Default)]
+    struct RecordingOssVerifier {
+        calls: std::sync::Mutex<Vec<RecordedOssDelete>>,
+    }
+
+    #[async_trait]
+    impl crate::artifact_storage::ArtifactObjectVerifier for RecordingOssVerifier {
+        async fn verify(
+            &self,
+            _config: &crate::artifact_storage::AliyunOssConfig,
+            _object_key: &str,
+        ) -> Result<
+            crate::artifact_storage::VerifiedArtifactObject,
+            crate::artifact_storage::ArtifactStorageError,
+        > {
+            unreachable!("verification is not used by the cleanup deleter")
+        }
+
+        async fn delete(
+            &self,
+            config: &crate::artifact_storage::AliyunOssConfig,
+            object_key: &str,
+            version_id: Option<&str>,
+        ) -> Result<(), crate::artifact_storage::ArtifactStorageError> {
+            self.calls.lock().expect("lock delete calls").push((
+                config.bucket.clone(),
+                config.endpoint.clone(),
+                object_key.to_owned(),
+                version_id.map(str::to_owned),
+            ));
+            Ok(())
         }
     }
 }

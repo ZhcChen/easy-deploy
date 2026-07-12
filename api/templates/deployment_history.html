@@ -1,0 +1,110 @@
+{% extends "layout.html" %}
+
+{% block title %}部署 #{{ run_id }} - {{ product_name }}{% endblock %}
+
+{% block topbar_actions %}
+<a class="ghost-button" href="/apps/{{ app_id }}">返回应用</a>
+{% match task_id %}{% when Some with (id) %}<a class="primary-button compact-button" href="/tasks/{{ id }}">查看任务过程</a>{% when None %}{% endmatch %}
+{% endblock %}
+
+{% block content %}
+{% if let Some(message) = notice %}
+  <section class="panel notice-panel" role="status"><strong>{{ message }}</strong></section>
+{% endif %}
+
+<section class="panel deployment-history-hero" aria-labelledby="deployment-history-title">
+  <div class="panel-header">
+    <div>
+      <span class="badge tone-{{ status_tone }}">{{ status }}</span>
+      <h2 id="deployment-history-title">部署 #{{ run_id }}</h2>
+      <p>{{ app_name }} · {{ environment_name }} · {{ version }}</p>
+    </div>
+  </div>
+  <div class="deployment-history-meta">
+    <div><span>应用</span><strong>{{ app_key }}</strong></div>
+    <div><span>环境</span><strong>{{ environment_key }}</strong></div>
+    <div><span>应用版本</span><strong>{{ version }} · versionCode {{ version_code }}</strong></div>
+    <div><span>配置版本</span><strong>revision {{ config_revision_no }}</strong></div>
+    <div><span>部署模式</span><strong>{{ deployment_mode }}</strong></div>
+    <div><span>发起人</span><strong>{{ created_by }}</strong></div>
+  </div>
+  <p class="deployment-history-summary">{{ summary }}</p>
+  <div class="deployment-history-timeline">
+    <span>创建 {{ created_at }}</span><span>开始 {{ started_at }}</span><span>结束 {{ finished_at }}</span>
+  </div>
+</section>
+
+<section class="summary-grid" aria-label="部署结果概览">
+  <article class="summary-card tone-{{ status_tone }}"><span>最终结果</span><strong>{{ status }}</strong><p>{{ units.len() }} 个部署单元</p></article>
+  <article class="summary-card tone-{% if replayable %}success{% else %}warning{% endif %}"><span>重放能力</span><strong>{% if replayable %}可重放{% else %}不可重放{% endif %}</strong><p>{% if replayable %}快照和引用制品完整{% else %}快照或引用制品已清理{% endif %}</p></article>
+  <article class="summary-card tone-{{ snapshot_tone }}"><span>配置快照</span><strong>{{ snapshot_status }}</strong><p>{{ snapshot_size }}</p></article>
+  <article class="summary-card tone-{% if log_truncated %}warning{% else %}neutral{% endif %}"><span>执行日志</span><strong>{{ log_size }}</strong><p>{% if log_truncated %}保留层丢弃 {{ log_dropped_size }}{% else %}未触发保留上限{% endif %}</p></article>
+</section>
+
+<section class="panel" aria-labelledby="unit-results-title">
+  <div class="panel-header"><div><h2 id="unit-results-title">部署单元结果</h2><p>结构化结果独立于日志和配置快照保存。</p></div></div>
+  {% if units.len() == 0 %}
+    <div class="empty-state"><strong>没有部署单元结果</strong><span>该记录可能来自旧版本或尚未开始执行。</span></div>
+  {% else %}
+    <div class="deployment-result-list">
+      {% for unit in units %}
+        <article class="deployment-result-row">
+          <div class="deployment-result-main">
+            <div><strong>{{ unit.unit_name }}</strong><span>{{ unit.unit_key }} · {{ unit.stage }}</span></div>
+            <div><strong>{{ unit.version }}</strong><span>{{ unit.started_at }} → {{ unit.finished_at }}</span></div>
+            <div><span class="badge tone-{{ unit.action_tone }}">{{ unit.action }}</span><span class="badge tone-{{ unit.status_tone }}">{{ unit.status }}</span></div>
+          </div>
+          <div class="deployment-result-detail"><span>退出码 {{ unit.exit_code }}</span><span>{{ unit.failure_summary }}</span></div>
+          {% match unit.unit_release_id %}
+            {% when Some with (artifact_id) %}
+              <div class="deployment-artifact-line">
+                <span>制品 #{{ artifact_id }} · {{ unit.artifact_size }}</span>
+                <span class="badge tone-{{ unit.artifact_tone }}">{{ unit.artifact_status }}</span>
+                <span>{{ unit.artifact_blockers }}</span>
+                {% if unit.can_cleanup_artifact %}
+                  <details class="cleanup-confirmation">
+                    <summary>清理制品</summary>
+                    <form method="post" action="/apps/{{ app_id }}/deployments/{{ run_id }}/artifacts/{{ artifact_id }}/cleanup">
+                      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                      <label>输入部署编号 {{ run_id }} 以确认<input name="confirmation" inputmode="numeric" required></label>
+                      <button class="primary-button danger-action compact-button" type="submit">确认清理制品</button>
+                    </form>
+                  </details>
+                {% endif %}
+              </div>
+            {% when None %}
+              <div class="deployment-artifact-line"><span>未保留制品引用，当前记录不可重放。</span></div>
+          {% endmatch %}
+        </article>
+      {% endfor %}
+    </div>
+  {% endif %}
+</section>
+
+<section class="panel" aria-labelledby="deployment-logs-title">
+  <div class="panel-header"><div><h2 id="deployment-logs-title">本次部署过程</h2><p>按需展开步骤输出；活动任务请进入任务页查看实时状态。</p></div></div>
+  {% if logs.len() == 0 %}
+    <div class="empty-state"><strong>日志已清理或未产生</strong><span>部署单元结果和失败摘要仍然保留。</span></div>
+  {% else %}
+    <div class="deployment-log-list">
+      {% for log in logs %}
+        <details class="deployment-log-entry">
+          <summary><span>{{ log.source }} · {{ log.created_at }}</span><span class="badge tone-{{ log.stream_tone }}">{{ log.stream }}</span></summary>
+          <pre>{{ log.content }}</pre>
+        </details>
+      {% endfor %}
+    </div>
+  {% endif %}
+</section>
+
+{% if can_cleanup %}
+<section class="panel deployment-cleanup-panel" aria-labelledby="deployment-cleanup-title">
+  <div class="panel-header"><div><h2 id="deployment-cleanup-title">历史存储清理</h2><p>日志和快照可独立清理；彻底删除历史会删除结构化单元结果。</p></div></div>
+  <div class="deployment-cleanup-actions">
+    <div><span>执行日志</span><strong>{{ log_size }}</strong>{% if can_cleanup_logs %}<details class="cleanup-confirmation"><summary>清理日志</summary><form method="post" action="/apps/{{ app_id }}/deployments/{{ run_id }}/logs/cleanup"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>输入部署编号 {{ run_id }} 以确认<input name="confirmation" inputmode="numeric" required></label><button class="primary-button danger-action compact-button" type="submit">确认清理日志</button></form></details>{% else %}<small>无可清理日志或部署仍处于活动状态</small>{% endif %}</div>
+    <div><span>配置与制品快照</span><strong>{{ snapshot_size }}</strong>{% if can_cleanup_snapshot %}<details class="cleanup-confirmation"><summary>清理快照</summary><form method="post" action="/apps/{{ app_id }}/deployments/{{ run_id }}/snapshot/cleanup"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>输入部署编号 {{ run_id }} 以确认<input name="confirmation" inputmode="numeric" required></label><button class="primary-button danger-action compact-button" type="submit">确认清理快照</button></form></details>{% else %}<small>快照已清理或部署仍处于活动状态</small>{% endif %}</div>
+    <div><span>结构化历史</span><strong>部署 #{{ run_id }}</strong><small>{{ history_delete_blockers }}</small>{% if can_delete_history %}<details class="cleanup-confirmation"><summary>彻底删除历史记录</summary><form method="post" action="/apps/{{ app_id }}/deployments/{{ run_id }}/cleanup"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>输入部署编号 {{ run_id }} 以确认<input name="confirmation" inputmode="numeric" required></label><button class="primary-button danger-action compact-button" type="submit">确认删除历史</button></form></details>{% endif %}</div>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

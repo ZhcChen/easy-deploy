@@ -39,8 +39,10 @@ pub const APPS_UPDATE: &str = "apps.update";
 pub const APPS_STATUS: &str = "apps.status";
 pub const SERVICES_VIEW: &str = "services.view";
 pub const SERVICES_DEPLOY: &str = "services.deploy";
+pub const SERVICES_DEPLOY_FORCE: &str = "services.deploy.force";
 pub const SERVICES_DEPLOY_CANCEL: &str = "services.deploy.cancel";
 pub const SERVICES_DEPLOY_RECONCILE: &str = "services.deploy.reconcile";
+pub const DEPLOYMENTS_CLEANUP: &str = "deployments.cleanup";
 pub const SERVICES_LOGS: &str = "services.logs";
 pub const TASKS_RETRY: &str = "tasks.retry";
 pub const NODES_VIEW: &str = "nodes.view";
@@ -122,6 +124,14 @@ pub fn all_permissions() -> &'static [PermissionDef] {
             module: "服务",
         },
         PermissionDef {
+            key: SERVICES_DEPLOY_FORCE,
+            name: "强制全量部署",
+            description: "忽略当前指纹并重新部署目标版本中的全部启用单元。",
+            resource_type: PermissionResourceType::Action,
+            resource_key: SERVICES_DEPLOY_FORCE,
+            module: "服务",
+        },
+        PermissionDef {
             key: SERVICES_DEPLOY_CANCEL,
             name: "取消部署",
             description: "终止运行中的环境部署并保留目标状态未知记录。",
@@ -136,6 +146,14 @@ pub fn all_permissions() -> &'static [PermissionDef] {
             resource_type: PermissionResourceType::Action,
             resource_key: SERVICES_DEPLOY_RECONCILE,
             module: "服务",
+        },
+        PermissionDef {
+            key: DEPLOYMENTS_CLEANUP,
+            name: "清理部署历史",
+            description: "清理终态部署的日志、快照和不再被引用的制品。",
+            resource_type: PermissionResourceType::Action,
+            resource_key: DEPLOYMENTS_CLEANUP,
+            module: "部署任务",
         },
         PermissionDef {
             key: SERVICES_LOGS,
@@ -360,9 +378,11 @@ pub fn permission_dependencies(permission_key: &str) -> &'static [&'static str] 
     match permission_key {
         "apps.create" | "apps.update" | APPS_STATUS => &[APPS_VIEW],
         SERVICES_DEPLOY
+        | SERVICES_DEPLOY_FORCE
         | SERVICES_DEPLOY_CANCEL
         | SERVICES_DEPLOY_RECONCILE
         | "services.rollback" => &[APPS_VIEW, SERVICES_VIEW, TASKS_VIEW],
+        DEPLOYMENTS_CLEANUP => &[APPS_VIEW, TASKS_VIEW, ARTIFACTS_VIEW],
         SERVICES_LOGS => &[SERVICES_VIEW],
         NODES_MANAGE => &[NODES_VIEW],
         NODES_INSTALL => &[NODES_VIEW, TASKS_VIEW],

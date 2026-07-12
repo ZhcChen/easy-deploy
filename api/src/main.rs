@@ -11,7 +11,9 @@ use api::{
     deploy::{ComposeExecutor, SystemdExecutor, TokioCommandRunner, ssh_known_hosts_file},
     deployment_console::DeploymentConsoleService,
     deployment_orchestrator::DeploymentOrchestratorService,
-    deployment_retention::{DeploymentLogService, DeploymentRetentionService},
+    deployment_retention::{
+        ArtifactStorageDeleter, DeploymentLogService, DeploymentRetentionService,
+    },
     deployment_runtime::{ComposeDeploymentUnitExecutor, DeploymentRuntimeService},
     events::EventLogService,
     maintenance::{CleanDemoDataOptions, clean_demo_data},
@@ -161,6 +163,32 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
     let deployment_orchestrator = DeploymentOrchestratorService::new(db.clone());
     let deployment_logs = DeploymentLogService::new(db.clone());
     let deployment_retention = DeploymentRetentionService::new(db.clone());
+    let artifact_deleter = ArtifactStorageDeleter::new(
+        &settings.data_dir,
+        platform
+            .config()
+            .await
+            .context("load artifact storage config for cleanup recovery")?
+            .artifact_storage,
+    );
+    let recovered_artifacts = deployment_retention
+        .recover_deleting_artifacts("startup-recovery", &artifact_deleter)
+        .await
+        .context("recover interrupted artifact cleanup")?;
+    for result in recovered_artifacts {
+        if result.status == "delete_failed" {
+            tracing::warn!(
+                unit_release_id = result.unit_release_id,
+                error = %result.error,
+                "interrupted artifact cleanup recovery failed"
+            );
+        } else {
+            tracing::info!(
+                unit_release_id = result.unit_release_id,
+                "interrupted artifact cleanup recovered"
+            );
+        }
+    }
     let interrupted_recovery = deployment_orchestrator
         .reconcile_interrupted_runs()
         .await

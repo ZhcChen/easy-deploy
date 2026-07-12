@@ -123,6 +123,51 @@ pub struct AppDetailTemplate<'a> {
 }
 
 #[derive(Template)]
+#[template(path = "deployment_history.html")]
+pub struct DeploymentHistoryTemplate<'a> {
+    pub product_name: &'a str,
+    pub css: &'a str,
+    pub asset_version: &'a str,
+    pub release_version: &'a str,
+    pub current_user: &'a str,
+    pub csrf_token: &'a str,
+    pub nav_sections: &'a [NavSection<'a>],
+    pub app_id: i64,
+    pub app_name: &'a str,
+    pub app_key: &'a str,
+    pub run_id: i64,
+    pub task_id: Option<i64>,
+    pub environment_name: &'a str,
+    pub environment_key: &'a str,
+    pub version: &'a str,
+    pub version_code: i64,
+    pub config_revision_no: i64,
+    pub deployment_mode: &'static str,
+    pub status: &'static str,
+    pub status_tone: &'static str,
+    pub summary: &'a str,
+    pub created_by: &'a str,
+    pub created_at: &'a str,
+    pub started_at: &'a str,
+    pub finished_at: &'a str,
+    pub replayable: bool,
+    pub snapshot_status: &'static str,
+    pub snapshot_tone: &'static str,
+    pub snapshot_size: String,
+    pub log_size: String,
+    pub log_dropped_size: String,
+    pub log_truncated: bool,
+    pub units: &'a [DeploymentHistoryUnitRow],
+    pub logs: &'a [DeploymentHistoryLogRow],
+    pub can_cleanup: bool,
+    pub can_cleanup_logs: bool,
+    pub can_cleanup_snapshot: bool,
+    pub can_delete_history: bool,
+    pub history_delete_blockers: String,
+    pub notice: Option<&'a str>,
+}
+
+#[derive(Template)]
 #[template(path = "deploy_confirm.html")]
 pub struct DeployConfirmTemplate<'a> {
     pub product_name: &'a str,
@@ -637,6 +682,7 @@ pub struct ApplicationDeployTemplate<'a> {
     pub has_active_run: bool,
     pub active_run_id: i64,
     pub executor_available: bool,
+    pub can_force: bool,
 }
 
 pub struct ApplicationDeployPlanRow {
@@ -855,6 +901,12 @@ pub struct ApplicationReleaseRow {
     pub version_code: i64,
     pub unit_count: i64,
     pub created_at: String,
+    pub status: &'static str,
+    pub status_tone: &'static str,
+    pub estimated_size: String,
+    pub blockers: String,
+    pub can_archive: bool,
+    pub can_delete: bool,
 }
 
 pub struct EnvironmentDeploymentRunRow {
@@ -867,6 +919,35 @@ pub struct EnvironmentDeploymentRunRow {
     pub status_tone: &'static str,
     pub result_summary: String,
     pub summary: String,
+    pub created_at: String,
+}
+
+pub struct DeploymentHistoryUnitRow {
+    pub unit_release_id: Option<i64>,
+    pub unit_key: String,
+    pub unit_name: String,
+    pub stage: String,
+    pub version: String,
+    pub action: &'static str,
+    pub action_tone: &'static str,
+    pub status: &'static str,
+    pub status_tone: &'static str,
+    pub failure_summary: String,
+    pub exit_code: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub artifact_status: &'static str,
+    pub artifact_tone: &'static str,
+    pub artifact_size: String,
+    pub artifact_blockers: String,
+    pub can_cleanup_artifact: bool,
+}
+
+pub struct DeploymentHistoryLogRow {
+    pub source: String,
+    pub stream: String,
+    pub stream_tone: &'static str,
+    pub content: String,
     pub created_at: String,
 }
 

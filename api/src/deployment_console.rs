@@ -78,6 +78,65 @@ pub struct DeploymentRunSummary {
     pub finished_at: Option<String>,
 }
 
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+pub struct DeploymentRunDetailSummary {
+    pub run_id: i64,
+    pub app_id: i64,
+    pub app_name: String,
+    pub app_key: String,
+    pub task_id: Option<i64>,
+    pub task_title: Option<String>,
+    pub environment_id: i64,
+    pub environment_name: String,
+    pub environment_key: String,
+    pub release_id: i64,
+    pub release_version: String,
+    pub release_version_code: i64,
+    pub config_revision_no: i64,
+    pub deployment_mode: String,
+    pub status: String,
+    pub summary: String,
+    pub created_by: String,
+    pub plan_hash: String,
+    pub snapshot_status: String,
+    pub snapshot_deleted_at: Option<String>,
+    pub snapshot_bytes: i64,
+    pub log_bytes: i64,
+    pub log_dropped_bytes: i64,
+    pub log_truncated: bool,
+    pub replayable: bool,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+pub struct DeploymentUnitRunResultDetail {
+    pub result_id: i64,
+    pub unit_id: i64,
+    pub unit_key: String,
+    pub unit_name: String,
+    pub unit_release_id: Option<i64>,
+    pub release_version: Option<String>,
+    pub release_version_code: Option<i64>,
+    pub artifact_status: Option<String>,
+    pub artifact_size_bytes: Option<i64>,
+    pub stage_no: i64,
+    pub action: String,
+    pub status: String,
+    pub failure_kind: String,
+    pub failure_summary: String,
+    pub exit_code: Option<i64>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentRunDetail {
+    pub run: DeploymentRunDetailSummary,
+    pub units: Vec<DeploymentUnitRunResultDetail>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplicationDeploymentDetail {
     pub environments: Vec<ApplicationEnvironmentSummary>,
@@ -239,6 +298,92 @@ impl DeploymentConsoleService {
         .await
     }
 
+    pub async fn deployment_run_detail(
+        &self,
+        app_id: i64,
+        deployment_run_id: i64,
+    ) -> Result<Option<DeploymentRunDetail>, sqlx::Error> {
+        let run = sqlx::query_as::<_, DeploymentRunDetailSummary>(
+            r#"
+            SELECT runs.id AS run_id, runs.app_id, apps.name AS app_name,
+                   apps.app_key, runs.task_id, tasks.title AS task_title,
+                   runs.environment_id, environments.name AS environment_name,
+                   environments.environment_key,
+                   releases.id AS release_id, releases.version AS release_version,
+                   releases.version_code AS release_version_code,
+                   configs.revision_no AS config_revision_no,
+                   runs.deployment_mode, runs.status, runs.summary, runs.created_by,
+                   runs.plan_hash, runs.snapshot_status, runs.snapshot_deleted_at,
+                   CASE WHEN runs.snapshot_status = 'active'
+                        THEN length(CAST(runs.plan_json AS BLOB)) ELSE 0 END AS snapshot_bytes,
+                   COALESCE((
+                       SELECT SUM(buffers.stored_bytes)
+                       FROM deployment_step_log_buffers buffers
+                       WHERE buffers.task_id = runs.task_id
+                   ), 0) + COALESCE((
+                       SELECT SUM(length(CAST(logs.content AS BLOB)))
+                       FROM operation_task_logs logs
+                       WHERE logs.task_id = runs.task_id
+                   ), 0) AS log_bytes,
+                   COALESCE((
+                       SELECT budgets.dropped_bytes
+                       FROM deployment_task_log_budgets budgets
+                       WHERE budgets.task_id = runs.task_id
+                   ), 0) AS log_dropped_bytes,
+                   COALESCE((
+                       SELECT budgets.truncated
+                       FROM deployment_task_log_budgets budgets
+                       WHERE budgets.task_id = runs.task_id
+                   ), 0) AS log_truncated,
+                   CASE WHEN runs.snapshot_status = 'active' AND NOT EXISTS (
+                       SELECT 1
+                       FROM deployment_unit_run_results results
+                       LEFT JOIN deployment_unit_releases artifacts
+                         ON artifacts.id = results.unit_release_id
+                       WHERE results.deployment_run_id = runs.id
+                         AND results.action NOT IN ('stop', 'application_check')
+                         AND (results.unit_release_id IS NULL OR artifacts.artifact_status <> 'active')
+                   ) THEN 1 ELSE 0 END AS replayable,
+                   runs.created_at, runs.started_at, runs.finished_at
+            FROM environment_deployment_runs runs
+            JOIN apps ON apps.id = runs.app_id
+            JOIN app_environments environments ON environments.id = runs.environment_id
+            JOIN app_releases releases ON releases.id = runs.app_release_id
+            JOIN app_config_revisions configs ON configs.id = runs.config_revision_id
+            LEFT JOIN operation_tasks tasks ON tasks.id = runs.task_id
+            WHERE runs.id = ?1 AND runs.app_id = ?2
+            "#,
+        )
+        .bind(deployment_run_id)
+        .bind(app_id)
+        .fetch_optional(&self.db)
+        .await?;
+        let Some(run) = run else {
+            return Ok(None);
+        };
+        let units = sqlx::query_as::<_, DeploymentUnitRunResultDetail>(
+            r#"
+            SELECT results.id AS result_id, results.unit_id, units.unit_key,
+                   units.name AS unit_name, results.unit_release_id,
+                   artifacts.version AS release_version,
+                   artifacts.version_code AS release_version_code,
+                   artifacts.artifact_status, artifacts.size_bytes AS artifact_size_bytes,
+                   results.stage_no, results.action, results.status,
+                   results.failure_kind, results.failure_summary, results.exit_code,
+                   results.started_at, results.finished_at
+            FROM deployment_unit_run_results results
+            JOIN deployment_units units ON units.id = results.unit_id
+            LEFT JOIN deployment_unit_releases artifacts ON artifacts.id = results.unit_release_id
+            WHERE results.deployment_run_id = ?1
+            ORDER BY results.stage_no, results.id
+            "#,
+        )
+        .bind(deployment_run_id)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(Some(DeploymentRunDetail { run, units }))
+    }
+
     pub async fn application_detail(
         &self,
         app_id: i64,
@@ -381,6 +526,75 @@ mod tests {
         .execute(&db)
         .await
         .expect("insert runtime state");
+        let config_revision_id = sqlx::query(
+            "INSERT INTO app_config_revisions(app_id, revision_no, config_json, public_config_json, config_hash) VALUES (?1, 100, '{}', '{}', 'console-config')",
+        )
+        .bind(app_id)
+        .execute(&db)
+        .await
+        .expect("insert config revision")
+        .last_insert_rowid();
+        let task_id = sqlx::query(
+            "INSERT INTO operation_tasks(task_kind, title, app_id, release_id, environment_id, status, created_by) VALUES ('release.deploy', '部署控制台应用', ?1, ?2, ?3, 'failed', 'operator')",
+        )
+        .bind(app_id)
+        .bind(app_release_id)
+        .bind(environment_id)
+        .execute(&db)
+        .await
+        .expect("insert task")
+        .last_insert_rowid();
+        let step_id = sqlx::query(
+            "INSERT INTO operation_task_steps(task_id, step_no, step_key, title, status) VALUES (?1, 1, 'deploy', '部署 API', 'failed')",
+        )
+        .bind(task_id)
+        .execute(&db)
+        .await
+        .expect("insert step")
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO deployment_task_log_budgets(task_id, stored_bytes, received_bytes, dropped_bytes, max_bytes, truncated) VALUES (?1, 12, 20, 8, 100, 1)",
+        )
+        .bind(task_id)
+        .execute(&db)
+        .await
+        .expect("insert log budget");
+        sqlx::query(
+            "INSERT INTO deployment_step_log_buffers(step_id, task_id, head_content, stored_bytes, received_bytes, dropped_bytes, truncated, finished) VALUES (?1, ?2, X'68656C6C6F', 5, 8, 3, 1, 1)",
+        )
+        .bind(step_id)
+        .bind(task_id)
+        .execute(&db)
+        .await
+        .expect("insert bounded log");
+        sqlx::query(
+            "INSERT INTO operation_task_logs(task_id, stream, content) VALUES (?1, 'system', '开始部署')",
+        )
+        .bind(task_id)
+        .execute(&db)
+        .await
+        .expect("insert legacy log");
+        let run_id = sqlx::query(
+            "INSERT INTO environment_deployment_runs(app_id, environment_id, app_release_id, config_revision_id, task_id, deployment_mode, plan_hash, plan_json, status, summary, created_by) VALUES (?1, ?2, ?3, ?4, ?5, 'normal', 'console-plan', '{\"units\":[\"api\"]}', 'all_failed', 'API 部署失败', 'operator')",
+        )
+        .bind(app_id)
+        .bind(environment_id)
+        .bind(app_release_id)
+        .bind(config_revision_id)
+        .bind(task_id)
+        .execute(&db)
+        .await
+        .expect("insert deployment run")
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO deployment_unit_run_results(deployment_run_id, unit_id, unit_release_id, stage_no, action, status, failure_kind, failure_summary, exit_code) VALUES (?1, ?2, ?3, 1, 'deploy', 'failed', 'command_failed', 'compose up 失败', 17)",
+        )
+        .bind(run_id)
+        .bind(unit_id)
+        .bind(unit_release_id)
+        .execute(&db)
+        .await
+        .expect("insert unit result");
 
         let service = DeploymentConsoleService::new(db.clone());
         let detail = service
@@ -400,7 +614,29 @@ mod tests {
         assert_eq!(detail.units[0].latest_version.as_deref(), Some("1.2.0"));
         assert_eq!(detail.units[0].healthy_count, 1);
         assert_eq!(detail.releases.len(), 1);
-        assert!(detail.runs.is_empty());
+        assert_eq!(detail.runs.len(), 1);
+        assert_eq!(detail.runs[0].status, "all_failed");
+
+        let run = service
+            .deployment_run_detail(app_id, run_id)
+            .await
+            .expect("load deployment run detail")
+            .expect("deployment run exists");
+        assert_eq!(run.run.app_name, "控制台应用");
+        assert_eq!(run.run.environment_name, "正式环境");
+        assert_eq!(run.run.release_version, "2.0.0");
+        assert_eq!(run.run.config_revision_no, 100);
+        assert!(run.run.snapshot_bytes > 2);
+        assert!(run.run.log_bytes >= 5);
+        assert_eq!(run.run.log_dropped_bytes, 8);
+        assert!(run.run.log_truncated);
+        assert!(run.run.replayable);
+        assert_eq!(run.units.len(), 1);
+        assert_eq!(run.units[0].unit_key, "api");
+        assert_eq!(run.units[0].release_version.as_deref(), Some("1.2.0"));
+        assert_eq!(run.units[0].artifact_status.as_deref(), Some("active"));
+        assert_eq!(run.units[0].exit_code, Some(17));
+        assert_eq!(run.units[0].failure_summary, "compose up 失败");
     }
 
     #[tokio::test]

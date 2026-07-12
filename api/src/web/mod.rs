@@ -41,11 +41,11 @@ use crate::{
     auth::{
         API_TOKENS_MANAGE, API_TOKENS_VIEW, APPS_STATUS, APPS_VIEW, ARTIFACTS_UPLOAD,
         ARTIFACTS_VIEW, AUDIT_VIEW, AuditLogFilter, AuthService, CurrentSession, DASHBOARD_VIEW,
-        LoginInput, NODES_INSTALL, NODES_MANAGE, NODES_VIEW, PROFILE_VIEW, RBAC_ACCOUNTS_VIEW,
-        RBAC_PERMISSIONS_VIEW, RBAC_ROLES_VIEW, RBAC_SESSIONS_VIEW, SERVICES_DEPLOY,
-        SERVICES_DEPLOY_CANCEL, SERVICES_DEPLOY_RECONCILE, SERVICES_LOGS, SERVICES_VIEW,
-        SETTINGS_UPDATE, SETTINGS_VIEW, SessionTokens, TASKS_RETRY, TASKS_VIEW, TEMPLATES_VIEW,
-        nav_permission, permission_dependencies,
+        DEPLOYMENTS_CLEANUP, LoginInput, NODES_INSTALL, NODES_MANAGE, NODES_VIEW, PROFILE_VIEW,
+        RBAC_ACCOUNTS_VIEW, RBAC_PERMISSIONS_VIEW, RBAC_ROLES_VIEW, RBAC_SESSIONS_VIEW,
+        SERVICES_DEPLOY, SERVICES_DEPLOY_CANCEL, SERVICES_DEPLOY_FORCE, SERVICES_DEPLOY_RECONCILE,
+        SERVICES_LOGS, SERVICES_VIEW, SETTINGS_UPDATE, SETTINGS_VIEW, SessionTokens, TASKS_RETRY,
+        TASKS_VIEW, TEMPLATES_VIEW, nav_permission, permission_dependencies,
     },
     catalog::compose_templates,
     deployment_console::DeploymentConsoleService,
@@ -53,7 +53,9 @@ use crate::{
         CreateDeploymentRunInput, DeploymentCancellationRegistry, DeploymentUnitExecutor,
     },
     deployment_orchestrator::{DeploymentAction, DeploymentMode, DeploymentOrchestratorService},
-    deployment_retention::{DeploymentLogService, DeploymentRetentionService},
+    deployment_retention::{
+        ArtifactStorageDeleter, DeploymentLogService, DeploymentRetentionService,
+    },
     events::{EventLogError, EventLogFilter, EventLogService},
     health::{HealthCheckKind, normalize_health_config},
     host_metrics::HostMetricsService,
@@ -75,13 +77,14 @@ use templates::{
     ArtifactPageRow, ArtifactsTemplate, AuditFilterOptionRow, AuditLogRow, AuditTemplate,
     ComposeResultView, DashboardTemplate, DeployConfirmTargetNodeRow, DeployConfirmTemplate,
     DeployPlanFileRow, DeployPlanStepRow, DeployPreflightActionRow, DeployPreflightCheckRow,
-    DeployPreflightRow, DeploymentEnvironmentRow, DeploymentTaskControlView, DeploymentUnitRow,
-    EnvironmentDeploymentRunRow, EventLogRow, EventsTemplate, LoginTemplate, NavItem, NavSection,
-    NodeAppRuntimeRow, NodeCapabilityGuideRow, NodeCheckHistoryRow, NodeCredentialOptionRow,
-    NodeCredentialPageRow, NodeCredentialsTemplate, NodeDetailModalRow, NodeDetailTemplate,
-    NodePageRow, NodeRow, NodeTaskRow, NodesTemplate, PermissionGroup, PermissionRow,
-    PermissionsTemplate, ProfileTemplate, RbacFilterOptionRow, ReleaseQueueRow, RoleRow,
-    RolesTemplate, ServiceLogTailOptionRow, ServiceLogsTemplate, ServiceNodeLinkRow,
+    DeployPreflightRow, DeploymentEnvironmentRow, DeploymentHistoryLogRow,
+    DeploymentHistoryTemplate, DeploymentHistoryUnitRow, DeploymentTaskControlView,
+    DeploymentUnitRow, EnvironmentDeploymentRunRow, EventLogRow, EventsTemplate, LoginTemplate,
+    NavItem, NavSection, NodeAppRuntimeRow, NodeCapabilityGuideRow, NodeCheckHistoryRow,
+    NodeCredentialOptionRow, NodeCredentialPageRow, NodeCredentialsTemplate, NodeDetailModalRow,
+    NodeDetailTemplate, NodePageRow, NodeRow, NodeTaskRow, NodesTemplate, PermissionGroup,
+    PermissionRow, PermissionsTemplate, ProfileTemplate, RbacFilterOptionRow, ReleaseQueueRow,
+    RoleRow, RolesTemplate, ServiceLogTailOptionRow, ServiceLogsTemplate, ServiceNodeLinkRow,
     ServicePageRow, ServicesTemplate, SessionRow, SessionsTemplate, SettingsRow, SettingsTemplate,
     SummaryItem, TaskAppFilterRow, TaskDetailTemplate, TaskDetailView, TaskExecutionGuideView,
     TaskFilterOptionRow, TaskLogRow, TaskNodeResultRow, TaskPageRow, TaskPhaseGroupRow,
@@ -91,7 +94,7 @@ use templates::{
 
 const LOGO_SVG: &str = include_str!("../../assets/logo.svg");
 const APP_JS: &str = include_str!("../../assets/app.js");
-const ASSET_VERSION: &str = "20260712-deployment-controls";
+const ASSET_VERSION: &str = "20260712-history-retention";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -251,6 +254,34 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/apps/{app_id}/deploy",
             get(application_deploy_page).post(application_deploy_submit),
+        )
+        .route(
+            "/apps/{app_id}/deployments/{deployment_run_id}",
+            get(deployment_history_page),
+        )
+        .route(
+            "/apps/{app_id}/deployments/{deployment_run_id}/logs/cleanup",
+            post(deployment_logs_cleanup_submit),
+        )
+        .route(
+            "/apps/{app_id}/deployments/{deployment_run_id}/snapshot/cleanup",
+            post(deployment_snapshot_cleanup_submit),
+        )
+        .route(
+            "/apps/{app_id}/deployments/{deployment_run_id}/cleanup",
+            post(deployment_history_cleanup_submit),
+        )
+        .route(
+            "/apps/{app_id}/deployments/{deployment_run_id}/artifacts/{unit_release_id}/cleanup",
+            post(deployment_artifact_cleanup_submit),
+        )
+        .route(
+            "/apps/{app_id}/releases/{app_release_id}/archive",
+            post(application_release_archive_submit),
+        )
+        .route(
+            "/apps/{app_id}/releases/{app_release_id}/cleanup",
+            post(application_release_cleanup_submit),
         )
         .route("/apps/{app_id}/status", post(app_status_submit))
         .route("/apps/{app_id}/metadata", post(app_metadata_submit))
@@ -953,6 +984,17 @@ struct ApplicationDeployForm {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+struct DeploymentHistoryQuery {
+    notice: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct DeploymentCleanupForm {
+    csrf_token: String,
+    confirmation: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
 struct NodesQuery {
     r#type: Option<String>,
     status: Option<String>,
@@ -1485,15 +1527,14 @@ async fn application_deploy_page(
     let selected_release_id = query.app_release_id.unwrap_or_else(|| {
         console
             .releases
-            .first()
+            .iter()
+            .find(|release| release.immutable_status == "ready")
             .map(|release| release.release_id)
             .unwrap_or_default()
     });
-    if !console
-        .releases
-        .iter()
-        .any(|release| release.release_id == selected_release_id)
-    {
+    if !console.releases.iter().any(|release| {
+        release.release_id == selected_release_id && release.immutable_status == "ready"
+    }) {
         return bad_request("应用版本不存在或不可部署".to_owned());
     }
     let mode = match query.mode.as_deref().unwrap_or("normal") {
@@ -1501,6 +1542,9 @@ async fn application_deploy_page(
         "force" => DeploymentMode::Force,
         _ => return bad_request("部署模式必须是 normal 或 force".to_owned()),
     };
+    if mode == DeploymentMode::Force && !session.can(SERVICES_DEPLOY_FORCE) {
+        return forbidden();
+    }
     let plan = match state
         .deployment_orchestrator()
         .preview(query.environment_id, selected_release_id, mode)
@@ -1542,12 +1586,19 @@ async fn application_deploy_page(
     let releases = console
         .releases
         .iter()
+        .filter(|release| release.immutable_status == "ready")
         .map(|release| ApplicationReleaseRow {
             id: release.release_id,
             version: release.version.clone(),
             version_code: release.version_code,
             unit_count: release.unit_count,
             created_at: release.created_at.clone(),
+            status: "可部署",
+            status_tone: "success",
+            estimated_size: String::new(),
+            blockers: String::new(),
+            can_archive: false,
+            can_delete: false,
         })
         .collect::<Vec<_>>();
     let nav_sections = nav_sections("/apps", &session);
@@ -1583,6 +1634,7 @@ async fn application_deploy_page(
         has_active_run: environment.active_run_id.is_some(),
         active_run_id: environment.active_run_id.unwrap_or_default(),
         executor_available: state.deployment_executor().is_some(),
+        can_force: session.can(SERVICES_DEPLOY_FORCE),
     })
 }
 
@@ -1610,6 +1662,9 @@ async fn application_deploy_submit(
         "force" => DeploymentMode::Force,
         _ => return bad_request("部署模式必须是 normal 或 force".to_owned()),
     };
+    if mode == DeploymentMode::Force && !session.can(SERVICES_DEPLOY_FORCE) {
+        return forbidden();
+    }
     let environment_app_id: Option<i64> = match sqlx::query_scalar(
         "SELECT app_id FROM app_environments WHERE id = ?1 AND status = 'ready'",
     )
@@ -1660,6 +1715,497 @@ async fn application_deploy_submit(
         cancellations.remove(deployment_run_id);
     });
     redirect(&format!("/tasks/{task_id}"))
+}
+
+async fn deployment_history_page(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Path((app_id, deployment_run_id)): Path<(i64, i64)>,
+    Query(query): Query<DeploymentHistoryQuery>,
+) -> Response {
+    if !session.can(APPS_VIEW) {
+        return forbidden();
+    }
+    let detail = match state
+        .deployment_console()
+        .deployment_run_detail(app_id, deployment_run_id)
+        .await
+    {
+        Ok(Some(detail)) => detail,
+        Ok(None) => return (StatusCode::NOT_FOUND, "部署历史不存在").into_response(),
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    let logs = match detail.run.task_id {
+        Some(task_id) => match state
+            .tasks()
+            .task_logs_with_deployment(task_id, state.deployment_logs())
+            .await
+        {
+            Ok(logs) => logs,
+            Err(error) => return task_error_response(error),
+        },
+        None => Vec::new(),
+    };
+    let can_cleanup = session.can(DEPLOYMENTS_CLEANUP);
+    let mut unit_rows = Vec::with_capacity(detail.units.len());
+    for unit in &detail.units {
+        let artifact_preview = match unit.unit_release_id {
+            Some(unit_release_id) => match state
+                .deployment_retention()
+                .preview_artifact_cleanup(unit_release_id)
+                .await
+            {
+                Ok(preview) => Some(preview),
+                Err(error) => return deployment_retention_error_response(error),
+            },
+            None => None,
+        };
+        let (artifact_status, artifact_tone, artifact_size, artifact_blockers, cleanup_allowed) =
+            match artifact_preview {
+                Some(preview) => (
+                    artifact_status_label(&preview.artifact_status),
+                    artifact_status_tone(&preview.artifact_status),
+                    format_size(&preview.size_bytes.to_string()),
+                    if preview.blockers.is_empty() {
+                        "当前没有引用阻止清理".to_owned()
+                    } else {
+                        preview.blockers.join("；")
+                    },
+                    preview.allowed(),
+                ),
+                None => (
+                    "未保留",
+                    "warning",
+                    "0 B".to_owned(),
+                    "制品引用已从部署快照移除".to_owned(),
+                    false,
+                ),
+            };
+        unit_rows.push(DeploymentHistoryUnitRow {
+            unit_release_id: unit.unit_release_id,
+            unit_key: unit.unit_key.clone(),
+            unit_name: unit.unit_name.clone(),
+            stage: format!("阶段 {}", unit.stage_no),
+            version: unit
+                .release_version
+                .as_ref()
+                .zip(unit.release_version_code)
+                .map(|(version, code)| format!("{version} · versionCode {code}"))
+                .unwrap_or_else(|| "无制品版本".to_owned()),
+            action: deployment_action_name(&unit.action),
+            action_tone: deployment_action_status_tone(&unit.action),
+            status: deployment_unit_result_status_label(&unit.status),
+            status_tone: deployment_unit_result_status_tone(&unit.status),
+            failure_summary: if unit.failure_summary.trim().is_empty() {
+                "无失败信息".to_owned()
+            } else {
+                unit.failure_summary.clone()
+            },
+            exit_code: unit
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            started_at: unit
+                .started_at
+                .clone()
+                .unwrap_or_else(|| "未开始".to_owned()),
+            finished_at: unit
+                .finished_at
+                .clone()
+                .unwrap_or_else(|| "未结束".to_owned()),
+            artifact_status,
+            artifact_tone,
+            artifact_size,
+            artifact_blockers,
+            can_cleanup_artifact: can_cleanup && cleanup_allowed,
+        });
+    }
+    let log_rows = logs
+        .into_iter()
+        .map(|log| DeploymentHistoryLogRow {
+            source: log.source.label(),
+            stream_tone: task_log_stream_tone(&log.stream),
+            stream: log.stream,
+            content: log.content,
+            created_at: log.created_at,
+        })
+        .collect::<Vec<_>>();
+    let active = matches!(
+        detail.run.status.as_str(),
+        "queued" | "running" | "reconciling"
+    );
+    let snapshot_active = detail.run.snapshot_status == "active";
+    let history_delete_preview = if can_cleanup {
+        match state
+            .deployment_retention()
+            .preview_deployment_history_delete(app_id, deployment_run_id)
+            .await
+        {
+            Ok(preview) => Some(preview),
+            Err(error) => return deployment_retention_error_response(error),
+        }
+    } else {
+        None
+    };
+    let can_delete_history = history_delete_preview
+        .as_ref()
+        .map(|preview| preview.allowed())
+        .unwrap_or(false);
+    let history_delete_blockers = history_delete_preview
+        .as_ref()
+        .map(|preview| {
+            if preview.blockers.is_empty() {
+                "可彻底删除；任务基础记录、事件和审计日志会保留。".to_owned()
+            } else {
+                preview.blockers.join("；")
+            }
+        })
+        .unwrap_or_default();
+    let nav_sections = nav_sections("/apps", &session);
+    render_html(DeploymentHistoryTemplate {
+        product_name: "Easy Deploy",
+        css: include_str!("../../assets/app.css"),
+        asset_version: ASSET_VERSION,
+        release_version: concat!("v", env!("CARGO_PKG_VERSION")),
+        current_user: session.display_name(),
+        csrf_token: &session.csrf_token,
+        nav_sections: &nav_sections,
+        app_id,
+        app_name: &detail.run.app_name,
+        app_key: &detail.run.app_key,
+        run_id: detail.run.run_id,
+        task_id: detail.run.task_id,
+        environment_name: &detail.run.environment_name,
+        environment_key: &detail.run.environment_key,
+        version: &detail.run.release_version,
+        version_code: detail.run.release_version_code,
+        config_revision_no: detail.run.config_revision_no,
+        deployment_mode: if detail.run.deployment_mode == "force" {
+            "强制全量"
+        } else {
+            "正常部署"
+        },
+        status: console_deployment_status_label(&detail.run.status),
+        status_tone: console_deployment_status_tone(&detail.run.status),
+        summary: if detail.run.summary.trim().is_empty() {
+            "暂无执行摘要"
+        } else {
+            &detail.run.summary
+        },
+        created_by: if detail.run.created_by.trim().is_empty() {
+            "未知"
+        } else {
+            &detail.run.created_by
+        },
+        created_at: &detail.run.created_at,
+        started_at: detail.run.started_at.as_deref().unwrap_or("未开始"),
+        finished_at: detail.run.finished_at.as_deref().unwrap_or("未结束"),
+        replayable: detail.run.replayable,
+        snapshot_status: if snapshot_active {
+            "已保留"
+        } else {
+            "已清理"
+        },
+        snapshot_tone: if snapshot_active {
+            "success"
+        } else {
+            "warning"
+        },
+        snapshot_size: format_size(&detail.run.snapshot_bytes.max(0).to_string()),
+        log_size: format_size(&detail.run.log_bytes.max(0).to_string()),
+        log_dropped_size: format_size(&detail.run.log_dropped_bytes.max(0).to_string()),
+        log_truncated: detail.run.log_truncated,
+        units: &unit_rows,
+        logs: &log_rows,
+        can_cleanup,
+        can_cleanup_logs: can_cleanup && !active && detail.run.log_bytes > 0,
+        can_cleanup_snapshot: can_cleanup && !active && snapshot_active,
+        can_delete_history,
+        history_delete_blockers,
+        notice: deployment_history_notice(query.notice.as_deref()),
+    })
+}
+
+async fn deployment_logs_cleanup_submit(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Path((app_id, deployment_run_id)): Path<(i64, i64)>,
+    Form(form): Form<DeploymentCleanupForm>,
+) -> Response {
+    if let Some(response) = validate_deployment_cleanup_form(&session, deployment_run_id, &form) {
+        return response;
+    }
+    let run = match owned_deployment_run(&state, app_id, deployment_run_id).await {
+        Ok(run) => run,
+        Err(response) => return response,
+    };
+    let Some(task_id) = run.task_id else {
+        return bad_request("该部署没有可清理的任务日志".to_owned());
+    };
+    let released = match state
+        .deployment_logs()
+        .delete_task_logs(task_id, &session.account.username)
+        .await
+    {
+        Ok(released) => released,
+        Err(error) => return deployment_retention_error_response(error),
+    };
+    record_audit_event(
+        &state,
+        &session,
+        "deployments.cleanup.logs",
+        "environment_deployment_run",
+        &deployment_run_id.to_string(),
+        &format!("清理部署任务 #{task_id} 日志，释放 {released} 字节"),
+    )
+    .await;
+    redirect(&format!(
+        "/apps/{app_id}/deployments/{deployment_run_id}?notice=logs-cleaned"
+    ))
+}
+
+async fn deployment_snapshot_cleanup_submit(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Path((app_id, deployment_run_id)): Path<(i64, i64)>,
+    Form(form): Form<DeploymentCleanupForm>,
+) -> Response {
+    if let Some(response) = validate_deployment_cleanup_form(&session, deployment_run_id, &form) {
+        return response;
+    }
+    if let Err(response) = owned_deployment_run(&state, app_id, deployment_run_id).await {
+        return response;
+    }
+    let released = match state
+        .deployment_retention()
+        .delete_deployment_snapshot(deployment_run_id, &session.account.username)
+        .await
+    {
+        Ok(released) => released,
+        Err(error) => return deployment_retention_error_response(error),
+    };
+    record_audit_event(
+        &state,
+        &session,
+        "deployments.cleanup.snapshot",
+        "environment_deployment_run",
+        &deployment_run_id.to_string(),
+        &format!("清理部署配置与制品快照，释放 {released} 字节"),
+    )
+    .await;
+    redirect(&format!(
+        "/apps/{app_id}/deployments/{deployment_run_id}?notice=snapshot-cleaned"
+    ))
+}
+
+async fn deployment_history_cleanup_submit(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Path((app_id, deployment_run_id)): Path<(i64, i64)>,
+    Form(form): Form<DeploymentCleanupForm>,
+) -> Response {
+    if let Some(response) = validate_deployment_cleanup_form(&session, deployment_run_id, &form) {
+        return response;
+    }
+    if let Err(response) = owned_deployment_run(&state, app_id, deployment_run_id).await {
+        return response;
+    }
+    let result = match state
+        .deployment_retention()
+        .delete_deployment_history(app_id, deployment_run_id, &session.account.username)
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => return deployment_retention_error_response(error),
+    };
+    record_audit_event(
+        &state,
+        &session,
+        "deployments.cleanup.history_delete",
+        "environment_deployment_run",
+        &deployment_run_id.to_string(),
+        &format!(
+            "彻底删除部署历史，删除 {} 条单元结果，清理 {} 条发布队列记录，应用版本 #{}",
+            result.deleted_unit_results, result.deleted_queue_rows, result.app_release_id
+        ),
+    )
+    .await;
+    redirect(&format!(
+        "/apps/{app_id}?notice=deployment-history-deleted#environment-deployment-history-title"
+    ))
+}
+
+async fn deployment_artifact_cleanup_submit(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Path((app_id, deployment_run_id, unit_release_id)): Path<(i64, i64, i64)>,
+    Form(form): Form<DeploymentCleanupForm>,
+) -> Response {
+    if let Some(response) = validate_deployment_cleanup_form(&session, deployment_run_id, &form) {
+        return response;
+    }
+    if let Err(response) = owned_deployment_run(&state, app_id, deployment_run_id).await {
+        return response;
+    }
+    let belongs_to_app = match sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM deployment_unit_releases releases
+            JOIN deployment_units units ON units.id = releases.unit_id
+            WHERE releases.id = ?1 AND units.app_id = ?2
+        )
+        "#,
+    )
+    .bind(unit_release_id)
+    .bind(app_id)
+    .fetch_one(state.db())
+    .await
+    {
+        Ok(belongs) => belongs,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    if !belongs_to_app {
+        return (StatusCode::NOT_FOUND, "部署单元制品不存在").into_response();
+    }
+    let platform = match state.platform().config().await {
+        Ok(platform) => platform,
+        Err(error) => return platform_error_response(error),
+    };
+    let deleter =
+        ArtifactStorageDeleter::new(&state.settings().data_dir, platform.artifact_storage);
+    let result = match state
+        .deployment_retention()
+        .cleanup_artifact(unit_release_id, &session.account.username, &deleter)
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => return deployment_retention_error_response(error),
+    };
+    record_audit_event(
+        &state,
+        &session,
+        "deployments.cleanup.artifact",
+        "deployment_unit_release",
+        &unit_release_id.to_string(),
+        &format!("制品清理结果：{} {}", result.status, result.error),
+    )
+    .await;
+    let notice = if result.status == "deleted" {
+        "artifact-cleaned"
+    } else {
+        "artifact-failed"
+    };
+    redirect(&format!(
+        "/apps/{app_id}/deployments/{deployment_run_id}?notice={notice}"
+    ))
+}
+
+async fn application_release_archive_submit(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Path((app_id, app_release_id)): Path<(i64, i64)>,
+    Form(form): Form<DeploymentCleanupForm>,
+) -> Response {
+    if let Some(response) = validate_cleanup_confirmation(&session, app_release_id, "版本", &form)
+    {
+        return response;
+    }
+    let archived = match state
+        .deployment_retention()
+        .archive_application_release(app_id, app_release_id, &session.account.username)
+        .await
+    {
+        Ok(archived) => archived,
+        Err(error) => return deployment_retention_error_response(error),
+    };
+    record_audit_event(
+        &state,
+        &session,
+        "deployments.cleanup.release_archive",
+        "application_release",
+        &app_release_id.to_string(),
+        &format!(
+            "归档应用版本 {} · versionCode {}",
+            archived.version, archived.version_code
+        ),
+    )
+    .await;
+    redirect(&format!("/apps/{app_id}#application-releases-title"))
+}
+
+async fn application_release_cleanup_submit(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Path((app_id, app_release_id)): Path<(i64, i64)>,
+    Form(form): Form<DeploymentCleanupForm>,
+) -> Response {
+    if let Some(response) = validate_cleanup_confirmation(&session, app_release_id, "版本", &form)
+    {
+        return response;
+    }
+    let released = match state
+        .deployment_retention()
+        .delete_application_release(app_id, app_release_id, &session.account.username)
+        .await
+    {
+        Ok(released) => released,
+        Err(error) => return deployment_retention_error_response(error),
+    };
+    record_audit_event(
+        &state,
+        &session,
+        "deployments.cleanup.release_delete",
+        "application_release",
+        &app_release_id.to_string(),
+        &format!("彻底删除未被引用的应用版本记录，释放 {released} 字节"),
+    )
+    .await;
+    redirect(&format!("/apps/{app_id}#application-releases-title"))
+}
+
+fn validate_deployment_cleanup_form(
+    session: &CurrentSession,
+    deployment_run_id: i64,
+    form: &DeploymentCleanupForm,
+) -> Option<Response> {
+    validate_cleanup_confirmation(session, deployment_run_id, "部署", form)
+}
+
+fn validate_cleanup_confirmation(
+    session: &CurrentSession,
+    expected_id: i64,
+    target_label: &str,
+    form: &DeploymentCleanupForm,
+) -> Option<Response> {
+    if !valid_csrf(session, &form.csrf_token) || !session.can(DEPLOYMENTS_CLEANUP) {
+        return Some(forbidden());
+    }
+    if form.confirmation.trim() != expected_id.to_string() {
+        return Some(bad_request(format!(
+            "{target_label}编号确认不匹配，未执行操作"
+        )));
+    }
+    None
+}
+
+async fn owned_deployment_run(
+    state: &AppState,
+    app_id: i64,
+    deployment_run_id: i64,
+) -> Result<crate::deployment_console::DeploymentRunDetailSummary, Response> {
+    match state
+        .deployment_console()
+        .deployment_run_detail(app_id, deployment_run_id)
+        .await
+    {
+        Ok(Some(detail)) => Ok(detail.run),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "部署历史不存在").into_response()),
+        Err(error) => Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()),
+    }
 }
 
 async fn render_app_detail(
@@ -1745,17 +2291,45 @@ async fn render_app_detail(
             }
         })
         .collect::<Vec<_>>();
-    let application_releases = console
-        .releases
-        .iter()
-        .map(|release| ApplicationReleaseRow {
+    let can_cleanup_releases =
+        session.can(DEPLOYMENTS_CLEANUP) && !app_detail_is_deploying(&detail);
+    let mut application_releases = Vec::with_capacity(console.releases.len());
+    for release in &console.releases {
+        let preview = match state
+            .deployment_retention()
+            .preview_application_release_cleanup(detail.app.id, release.release_id)
+            .await
+        {
+            Ok(preview) => preview,
+            Err(error) => return deployment_retention_error_response(error),
+        };
+        let blockers = if preview.immutable_status == "ready" {
+            &preview.archive_blockers
+        } else {
+            &preview.blockers
+        };
+        application_releases.push(ApplicationReleaseRow {
             id: release.release_id,
             version: release.version.clone(),
             version_code: release.version_code,
             unit_count: release.unit_count,
             created_at: release.created_at.clone(),
-        })
-        .collect::<Vec<_>>();
+            status: application_release_status_label(&preview.immutable_status),
+            status_tone: application_release_status_tone(&preview.immutable_status),
+            estimated_size: format_size(&preview.estimated_bytes.to_string()),
+            blockers: if blockers.is_empty() {
+                if preview.immutable_status == "ready" {
+                    "可归档；归档后不再出现在部署版本选择中".to_owned()
+                } else {
+                    "没有引用阻止彻底删除".to_owned()
+                }
+            } else {
+                blockers.join("；")
+            },
+            can_archive: can_cleanup_releases && preview.can_archive(),
+            can_delete: can_cleanup_releases && preview.can_delete(),
+        });
+    }
     let environment_runs = console
         .runs
         .iter()
@@ -7562,6 +8136,89 @@ fn deployment_action_tone(action: DeploymentAction) -> &'static str {
     }
 }
 
+fn deployment_action_name(action: &str) -> &'static str {
+    match action {
+        "deploy" => "部署",
+        "skip" => "跳过",
+        "start" => "启动",
+        "stop" => "停止",
+        "upgrade" => "升级",
+        "downgrade" => "降级",
+        "restore" => "恢复结构",
+        "application_check" => "应用检查",
+        _ => "未知动作",
+    }
+}
+
+fn deployment_action_status_tone(action: &str) -> &'static str {
+    match action {
+        "skip" => "neutral",
+        "stop" | "downgrade" | "restore" => "warning",
+        _ => "active",
+    }
+}
+
+fn deployment_unit_result_status_label(status: &str) -> &'static str {
+    match status {
+        "pending" => "等待中",
+        "running" => "执行中",
+        "success" => "成功",
+        "failed" => "失败",
+        "skipped" => "已跳过",
+        "not_started" => "未执行",
+        "canceled_unknown" => "已取消，目标未知",
+        _ => "未知",
+    }
+}
+
+fn deployment_unit_result_status_tone(status: &str) -> &'static str {
+    match status {
+        "success" => "success",
+        "running" => "active",
+        "failed" => "danger",
+        "canceled_unknown" => "warning",
+        _ => "neutral",
+    }
+}
+
+fn artifact_status_label(status: &str) -> &'static str {
+    match status {
+        "active" => "已保留",
+        "deleting" => "清理中",
+        "delete_failed" => "清理失败",
+        "deleted" => "已清理",
+        _ => "未知",
+    }
+}
+
+fn artifact_status_tone(status: &str) -> &'static str {
+    match status {
+        "active" => "success",
+        "deleting" => "active",
+        "delete_failed" => "danger",
+        _ => "neutral",
+    }
+}
+
+fn application_release_status_label(status: &str) -> &'static str {
+    match status {
+        "ready" => "可部署",
+        "archived" => "已归档",
+        "deleting" => "清理中",
+        "deleted" => "已清理",
+        _ => "未知",
+    }
+}
+
+fn application_release_status_tone(status: &str) -> &'static str {
+    match status {
+        "ready" => "success",
+        "deleting" => "active",
+        "archived" | "deleted" => "neutral",
+        _ => "warning",
+    }
+}
+
 fn console_deployment_status_label(status: &str) -> &'static str {
     match status {
         "waiting" => "等待部署",
@@ -7593,8 +8250,31 @@ fn console_deployment_status_tone(status: &str) -> &'static str {
     match status {
         "success" => "success",
         "queued" | "running" => "active",
-        "reconciling" | "partial_failed" | "all_failed" | "failed" => "warning",
+        "reconciling" | "partial_failed" => "warning",
+        "all_failed" | "failed" => "danger",
         _ => "neutral",
+    }
+}
+
+fn deployment_retention_error_response(
+    error: crate::deployment_retention::DeploymentRetentionError,
+) -> Response {
+    use crate::deployment_retention::DeploymentRetentionError;
+    let status = match &error {
+        DeploymentRetentionError::NotFound(_) => StatusCode::NOT_FOUND,
+        DeploymentRetentionError::InvalidState(_) => StatusCode::BAD_REQUEST,
+        DeploymentRetentionError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, error.to_string()).into_response()
+}
+
+fn deployment_history_notice(notice: Option<&str>) -> Option<&'static str> {
+    match notice {
+        Some("logs-cleaned") => Some("执行日志已清理，结构化部署结果继续保留。"),
+        Some("snapshot-cleaned") => Some("配置与制品快照已清理，该次部署现已不可重放。"),
+        Some("artifact-cleaned") => Some("未被引用的部署单元制品已清理。"),
+        Some("artifact-failed") => Some("制品清理失败，引用和错误信息已保留，可排查后重试。"),
+        _ => None,
     }
 }
 
@@ -10125,6 +10805,9 @@ fn api_token_notice_message(notice: Option<&str>) -> Option<&'static str> {
 fn app_detail_notice_message(notice: Option<&str>) -> Option<&'static str> {
     match notice {
         Some("created") => Some("应用已创建，按下面的下一步完成首次部署。"),
+        Some("deployment-history-deleted") => {
+            Some("部署历史已彻底删除，任务基础记录、事件和审计日志仍保留。")
+        }
         _ => None,
     }
 }
@@ -10961,6 +11644,92 @@ mod tests {
         (environment_id, app_release_id)
     }
 
+    async fn seed_terminal_deployment_run(
+        db: &SqlitePool,
+        app_id: i64,
+        environment_id: i64,
+        app_release_id: i64,
+    ) -> (i64, i64, i64) {
+        let config_revision_id: i64 = sqlx::query_scalar(
+            "SELECT config_revision_id FROM app_release_environment_configs WHERE app_release_id = ?1 AND environment_id = ?2",
+        )
+        .bind(app_release_id)
+        .bind(environment_id)
+        .fetch_one(db)
+        .await
+        .expect("load config revision");
+        let (unit_id, unit_release_id): (i64, i64) = sqlx::query_as(
+            "SELECT unit_id, unit_release_id FROM app_release_units WHERE app_release_id = ?1 AND unit_release_id IS NOT NULL LIMIT 1",
+        )
+        .bind(app_release_id)
+        .fetch_one(db)
+        .await
+        .expect("load release unit");
+        let task_id = sqlx::query(
+            "INSERT INTO operation_tasks(task_kind, title, app_id, release_id, environment_id, status, created_by) VALUES ('release.deploy', '历史详情测试', ?1, ?2, ?3, 'failed', 'admin')",
+        )
+        .bind(app_id)
+        .bind(app_release_id)
+        .bind(environment_id)
+        .execute(db)
+        .await
+        .expect("insert terminal task")
+        .last_insert_rowid();
+        let step_id = sqlx::query(
+            "INSERT INTO operation_task_steps(task_id, step_no, step_key, title, status, exit_code) VALUES (?1, 1, 'deploy', '部署 default', 'failed', 17)",
+        )
+        .bind(task_id)
+        .execute(db)
+        .await
+        .expect("insert terminal step")
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO operation_task_logs(task_id, step_id, stream, content) VALUES (?1, ?2, 'stderr', 'compose up failed')",
+        )
+        .bind(task_id)
+        .bind(step_id)
+        .execute(db)
+        .await
+        .expect("insert task log");
+        sqlx::query(
+            "INSERT INTO deployment_task_log_budgets(task_id, stored_bytes, received_bytes, dropped_bytes, max_bytes, truncated) VALUES (?1, 5, 9, 4, 100, 1)",
+        )
+        .bind(task_id)
+        .execute(db)
+        .await
+        .expect("insert task log budget");
+        sqlx::query(
+            "INSERT INTO deployment_step_log_buffers(step_id, task_id, head_content, stored_bytes, received_bytes, dropped_bytes, truncated, finished) VALUES (?1, ?2, X'68656C6C6F', 5, 9, 4, 1, 1)",
+        )
+        .bind(step_id)
+        .bind(task_id)
+        .execute(db)
+        .await
+        .expect("insert bounded log");
+        let run_id = sqlx::query(
+            "INSERT INTO environment_deployment_runs(app_id, environment_id, app_release_id, config_revision_id, task_id, deployment_mode, plan_hash, plan_json, status, summary, created_by, finished_at) VALUES (?1, ?2, ?3, ?4, ?5, 'normal', 'history-plan', '{\"units\":[\"default\"]}', 'all_failed', '全部失败', 'admin', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(app_id)
+        .bind(environment_id)
+        .bind(app_release_id)
+        .bind(config_revision_id)
+        .bind(task_id)
+        .execute(db)
+        .await
+        .expect("insert terminal deployment run")
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO deployment_unit_run_results(deployment_run_id, unit_id, unit_release_id, stage_no, action, status, failure_kind, failure_summary, exit_code, finished_at) VALUES (?1, ?2, ?3, 1, 'deploy', 'failed', 'command_failed', 'Compose 启动失败', 17, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(run_id)
+        .bind(unit_id)
+        .bind(unit_release_id)
+        .execute(db)
+        .await
+        .expect("insert terminal unit result");
+        (run_id, task_id, unit_release_id)
+    }
+
     async fn create_compose_test_app_with_mode(
         apps: &AppService,
         app_key: &str,
@@ -11137,6 +11906,419 @@ mod tests {
             environment_status,
             ("running".to_owned(), "success".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn normal_deployment_permission_does_not_grant_force_mode() {
+        let app = test_web_app().await;
+        let app_id = create_compose_test_app(&app.apps, "normal-only-deployer-app").await;
+        let (environment_id, app_release_id) =
+            seed_deployable_application_release(&app.db, app_id).await;
+        let admin = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let role_id = sqlx::query(
+            "INSERT INTO admin_roles(role_code, role_name, description, status) VALUES ('normal_only_deployer', '普通部署', '', 'active')",
+        )
+        .execute(&app.db)
+        .await
+        .expect("insert custom role")
+        .last_insert_rowid();
+        sqlx::query(
+            r#"
+            INSERT INTO admin_role_permissions(role_id, permission_id)
+            SELECT ?1, id FROM admin_permissions
+            WHERE permission_key IN ('apps.view', 'services.view', 'tasks.view', 'services.deploy')
+            "#,
+        )
+        .bind(role_id)
+        .execute(&app.db)
+        .await
+        .expect("grant normal deploy permissions");
+        app.auth
+            .create_account(
+                &admin.session,
+                "normal_deployer",
+                "Normal Deployer",
+                "password123",
+                &[role_id],
+            )
+            .await
+            .expect("create custom deployer");
+        let deployer = app
+            .auth
+            .login(LoginInput {
+                username: "normal_deployer".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("login custom deployer");
+        let cookie = format!("ed_access={}", deployer.tokens.access_token);
+
+        let normal_page = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/apps/{app_id}/deploy?environment_id={environment_id}&app_release_id={app_release_id}&mode=normal"
+                    ))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .expect("build normal preview request"),
+            )
+            .await
+            .expect("send normal preview request");
+        assert_eq!(normal_page.status(), StatusCode::OK);
+        let normal_html = String::from_utf8_lossy(
+            &to_bytes(normal_page.into_body(), usize::MAX)
+                .await
+                .expect("read normal preview"),
+        )
+        .into_owned();
+        assert!(!normal_html.contains("value=\"force\""));
+
+        let force_page = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/apps/{app_id}/deploy?environment_id={environment_id}&app_release_id={app_release_id}&mode=force"
+                    ))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .expect("build force preview request"),
+            )
+            .await
+            .expect("send force preview request");
+        assert_eq!(force_page.status(), StatusCode::FORBIDDEN);
+
+        let force_plan = DeploymentOrchestratorService::new(app.db.clone())
+            .preview(environment_id, app_release_id, DeploymentMode::Force)
+            .await
+            .expect("preview force plan");
+        let force_submit = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/apps/{app_id}/deploy"))
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={}&environment_id={environment_id}&app_release_id={app_release_id}&mode=force&expected_plan_hash={}",
+                        deployer.session.csrf_token, force_plan.plan_hash
+                    )))
+                    .expect("build force submit request"),
+            )
+            .await
+            .expect("send force submit request");
+        assert_eq!(force_submit.status(), StatusCode::FORBIDDEN);
+        let run_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM environment_deployment_runs WHERE app_id = ?1",
+        )
+        .bind(app_id)
+        .fetch_one(&app.db)
+        .await
+        .expect("count deployment runs");
+        assert_eq!(run_count, 0);
+    }
+
+    #[tokio::test]
+    async fn deployment_history_detail_cleans_logs_and_snapshot_with_confirmation() {
+        let app = test_web_app().await;
+        let app_id = create_compose_test_app(&app.apps, "history-detail-app").await;
+        let (environment_id, app_release_id) =
+            seed_deployable_application_release(&app.db, app_id).await;
+        let (run_id, task_id, _unit_release_id) =
+            seed_terminal_deployment_run(&app.db, app_id, environment_id, app_release_id).await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+        let history_uri = format!("/apps/{app_id}/deployments/{run_id}");
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&history_uri)
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build history request"),
+            )
+            .await
+            .expect("send history request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8_lossy(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read history page"),
+        )
+        .into_owned();
+        assert!(html.contains("history-detail-app app"));
+        assert!(html.contains("Compose 启动失败"));
+        assert!(html.contains("compose up failed"));
+        assert!(html.contains("全部失败"));
+        assert!(html.contains("可重放"));
+
+        let invalid = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("{history_uri}/logs/cleanup"))
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token=wrong&confirmation={run_id}"
+                    )))
+                    .expect("build invalid cleanup request"),
+            )
+            .await
+            .expect("send invalid cleanup request");
+        assert_eq!(invalid.status(), StatusCode::FORBIDDEN);
+
+        let cleanup_form = format!(
+            "csrf_token={}&confirmation={run_id}",
+            login.session.csrf_token
+        );
+        let cleanup_logs = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("{history_uri}/logs/cleanup"))
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(cleanup_form.clone()))
+                    .expect("build log cleanup request"),
+            )
+            .await
+            .expect("send log cleanup request");
+        assert_eq!(cleanup_logs.status(), StatusCode::SEE_OTHER);
+        let log_count: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM operation_task_logs WHERE task_id = ?1) + (SELECT COUNT(*) FROM deployment_step_log_buffers WHERE task_id = ?1)",
+        )
+        .bind(task_id)
+        .fetch_one(&app.db)
+        .await
+        .expect("count retained logs");
+        assert_eq!(log_count, 0);
+
+        let cleanup_snapshot = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("{history_uri}/snapshot/cleanup"))
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(cleanup_form.clone()))
+                    .expect("build snapshot cleanup request"),
+            )
+            .await
+            .expect("send snapshot cleanup request");
+        assert_eq!(cleanup_snapshot.status(), StatusCode::SEE_OTHER);
+        let snapshot_status: String = sqlx::query_scalar(
+            "SELECT snapshot_status FROM environment_deployment_runs WHERE id = ?1",
+        )
+        .bind(run_id)
+        .fetch_one(&app.db)
+        .await
+        .expect("load snapshot status");
+        assert_eq!(snapshot_status, "deleted");
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM admin_audit_logs WHERE action LIKE 'deployments.cleanup.%' AND target_id = ?1",
+        )
+        .bind(run_id.to_string())
+        .fetch_one(&app.db)
+        .await
+        .expect("count cleanup audit logs");
+        assert_eq!(audit_count, 2);
+
+        let ready_to_delete = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&history_uri)
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build cleaned history request"),
+            )
+            .await
+            .expect("send cleaned history request");
+        assert_eq!(ready_to_delete.status(), StatusCode::OK);
+        let ready_html = String::from_utf8_lossy(
+            &to_bytes(ready_to_delete.into_body(), usize::MAX)
+                .await
+                .expect("read cleaned history page"),
+        )
+        .into_owned();
+        assert!(ready_html.contains("彻底删除历史记录"));
+        assert!(ready_html.contains("任务基础记录、事件和审计日志会保留"));
+
+        let delete_history = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("{history_uri}/cleanup"))
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(cleanup_form))
+                    .expect("build history delete request"),
+            )
+            .await
+            .expect("send history delete request");
+        assert_eq!(delete_history.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            delete_history.headers().get(header::LOCATION),
+            Some(
+                &format!(
+                    "/apps/{app_id}?notice=deployment-history-deleted#environment-deployment-history-title"
+                )
+                    .parse()
+                    .expect("valid redirect")
+            )
+        );
+        let run_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM environment_deployment_runs WHERE id = ?1)",
+        )
+        .bind(run_id)
+        .fetch_one(&app.db)
+        .await
+        .expect("check history deleted");
+        assert!(!run_exists);
+        let task_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM operation_tasks WHERE id = ?1)")
+                .bind(task_id)
+                .fetch_one(&app.db)
+                .await
+                .expect("check task retained");
+        assert!(task_exists);
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM admin_audit_logs WHERE action LIKE 'deployments.cleanup.%' AND target_id = ?1",
+        )
+        .bind(run_id.to_string())
+        .fetch_one(&app.db)
+        .await
+        .expect("count history delete audit logs");
+        assert_eq!(audit_count, 3);
+
+        let (unit_id, unit_release_id): (i64, i64) = sqlx::query_as(
+            "SELECT unit_id, unit_release_id FROM app_release_units WHERE app_release_id = ?1 AND unit_release_id IS NOT NULL LIMIT 1",
+        )
+        .bind(app_release_id)
+        .fetch_one(&app.db)
+        .await
+        .expect("load reusable unit release");
+        let unused_release_id = sqlx::query(
+            "INSERT INTO app_releases(app_id, version, version_code, status, source) VALUES (?1, '2.0.0', 101, 'received', 'openapi')",
+        )
+        .bind(app_id)
+        .execute(&app.db)
+        .await
+        .expect("insert unused app release")
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO application_release_manifests(app_release_id, manifest_hash, manifest_json) VALUES (?1, ?2, '{}')",
+        )
+        .bind(unused_release_id)
+        .bind(format!("unused-release-{unused_release_id}"))
+        .execute(&app.db)
+        .await
+        .expect("insert unused manifest");
+        sqlx::query(
+            "INSERT INTO app_release_units(app_release_id, unit_id, unit_release_id) VALUES (?1, ?2, ?3)",
+        )
+        .bind(unused_release_id)
+        .bind(unit_id)
+        .bind(unit_release_id)
+        .execute(&app.db)
+        .await
+        .expect("insert unused release unit");
+        let release_form = format!(
+            "csrf_token={}&confirmation={unused_release_id}",
+            login.session.csrf_token
+        );
+        let archive = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/apps/{app_id}/releases/{unused_release_id}/archive"
+                    ))
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(release_form.clone()))
+                    .expect("build release archive request"),
+            )
+            .await
+            .expect("send release archive request");
+        assert_eq!(archive.status(), StatusCode::SEE_OTHER);
+        let archived_status: String = sqlx::query_scalar(
+            "SELECT immutable_status FROM application_release_manifests WHERE app_release_id = ?1",
+        )
+        .bind(unused_release_id)
+        .fetch_one(&app.db)
+        .await
+        .expect("load archived status");
+        assert_eq!(archived_status, "archived");
+
+        let delete = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/apps/{app_id}/releases/{unused_release_id}/cleanup"
+                    ))
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(release_form))
+                    .expect("build release cleanup request"),
+            )
+            .await
+            .expect("send release cleanup request");
+        assert_eq!(delete.status(), StatusCode::SEE_OTHER);
+        let unused_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM app_releases WHERE id = ?1)")
+                .bind(unused_release_id)
+                .fetch_one(&app.db)
+                .await
+                .expect("check removed app release");
+        assert!(!unused_exists);
     }
 
     #[tokio::test]
