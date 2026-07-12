@@ -10,6 +10,9 @@ use tokio::sync::Mutex;
 pub const DEFAULT_STEP_LOG_HEAD_BYTES: usize = 2 * 1024 * 1024;
 pub const DEFAULT_STEP_LOG_TAIL_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_TASK_LOG_BYTES: usize = 100 * 1024 * 1024;
+pub const TASK_LOG_PREVIEW_HEAD_BYTES: usize = 8 * 1024;
+pub const TASK_LOG_PREVIEW_TAIL_BYTES: usize = 24 * 1024;
+pub const TASK_LOG_PREVIEW_MAX_STEPS: usize = 32;
 
 #[derive(Clone)]
 pub struct DeploymentLogService {
@@ -22,13 +25,85 @@ pub struct DeploymentLogService {
 
 #[derive(Default)]
 struct DeploymentLogState {
-    tasks: HashMap<i64, TaskLogBudget>,
+    tasks: HashMap<i64, Arc<Mutex<ActiveTaskLog>>>,
+}
+
+struct ActiveTaskLog {
+    budget: TaskLogBudget,
     steps: HashMap<i64, ActiveStepLog>,
 }
 
 struct ActiveStepLog {
-    task_id: i64,
     buffer: BoundedLogBuffer,
+    finished: bool,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedTaskLogPreview {
+    pub step_id: i64,
+    pub head: Vec<u8>,
+    pub tail: Vec<u8>,
+    pub stored_bytes: u64,
+    pub dropped_bytes: u64,
+    pub truncated: bool,
+    pub preview_omitted_bytes: u64,
+    pub updated_at: String,
+    pub live: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct BoundedTaskLogPreviewRow {
+    step_id: i64,
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    stored_bytes: i64,
+    dropped_bytes: i64,
+    truncated: bool,
+    updated_at: String,
+}
+
+struct PersistedStepLog {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    received_bytes: u64,
+    dropped_bytes: u64,
+    head_limit: usize,
+    tail_limit: usize,
+    finished: bool,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct PersistedTaskLogRow {
+    stored_bytes: i64,
+    received_bytes: i64,
+    dropped_bytes: i64,
+    max_bytes: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct PersistedStepLogRow {
+    step_updated_at: String,
+    head: Option<Vec<u8>>,
+    tail: Option<Vec<u8>>,
+    received_bytes: Option<i64>,
+    dropped_bytes: Option<i64>,
+    head_limit: Option<i64>,
+    tail_limit: Option<i64>,
+    finished: Option<bool>,
+    log_updated_at: Option<String>,
+}
+
+struct LogPersistenceSnapshot {
+    step: BoundedLogSnapshot,
+    head_limit: usize,
+    tail_limit: usize,
+    task_max_bytes: usize,
+    task_stored_bytes: u64,
+    task_received_bytes: u64,
+    task_dropped_bytes: u64,
+    task_truncated: bool,
     finished: bool,
 }
 
@@ -134,8 +209,43 @@ impl DeploymentLogService {
         secrets: &[String],
         chunk: &[u8],
     ) -> Result<BoundedLogSnapshot, DeploymentRetentionError> {
-        self.write(task_id, step_id, secrets, Some(chunk), false)
+        self.append_buffered(task_id, step_id, secrets, chunk)
+            .await?;
+        self.checkpoint(task_id, step_id).await
+    }
+
+    pub async fn append_buffered(
+        &self,
+        task_id: i64,
+        step_id: i64,
+        secrets: &[String],
+        chunk: &[u8],
+    ) -> Result<(), DeploymentRetentionError> {
+        self.mutate_buffer(task_id, step_id, secrets, Some(chunk), 0, false)
             .await
+    }
+
+    pub async fn record_dropped(
+        &self,
+        task_id: i64,
+        step_id: i64,
+        secrets: &[String],
+        dropped_bytes: u64,
+    ) -> Result<(), DeploymentRetentionError> {
+        self.mutate_buffer(task_id, step_id, secrets, None, dropped_bytes, false)
+            .await
+    }
+
+    pub async fn checkpoint(
+        &self,
+        task_id: i64,
+        step_id: i64,
+    ) -> Result<BoundedLogSnapshot, DeploymentRetentionError> {
+        let Some(snapshot) = self.persistence_snapshot(task_id, step_id).await else {
+            return self.snapshot(task_id, step_id).await;
+        };
+        self.persist(task_id, step_id, &snapshot).await?;
+        Ok(snapshot.step)
     }
 
     pub async fn finish(
@@ -143,7 +253,17 @@ impl DeploymentLogService {
         task_id: i64,
         step_id: i64,
     ) -> Result<BoundedLogSnapshot, DeploymentRetentionError> {
-        self.write(task_id, step_id, &[], None, true).await
+        self.mutate_buffer(task_id, step_id, &[], None, 0, true)
+            .await?;
+        let snapshot = self
+            .persistence_snapshot(task_id, step_id)
+            .await
+            .ok_or_else(|| DeploymentRetentionError::NotFound("步骤日志不存在".to_owned()))?;
+        self.persist(task_id, step_id, &snapshot).await?;
+        if let Some(task) = self.active_task_if_present(task_id).await {
+            task.lock().await.steps.remove(&step_id);
+        }
+        Ok(snapshot.step)
     }
 
     pub async fn snapshot(
@@ -173,8 +293,116 @@ impl DeploymentLogService {
         })
     }
 
+    pub async fn task_previews(
+        &self,
+        task_id: i64,
+    ) -> Result<Vec<BoundedTaskLogPreview>, DeploymentRetentionError> {
+        self.task_previews_with_limits(
+            task_id,
+            TASK_LOG_PREVIEW_HEAD_BYTES,
+            TASK_LOG_PREVIEW_TAIL_BYTES,
+            TASK_LOG_PREVIEW_MAX_STEPS,
+        )
+        .await
+    }
+
+    async fn task_previews_with_limits(
+        &self,
+        task_id: i64,
+        head_limit: usize,
+        tail_limit: usize,
+        max_steps: usize,
+    ) -> Result<Vec<BoundedTaskLogPreview>, DeploymentRetentionError> {
+        let rows = sqlx::query_as::<_, BoundedTaskLogPreviewRow>(
+            r#"
+            SELECT step_id,
+                   substr(head_content, 1, ?2) AS head,
+                   CASE WHEN ?3 = 0 THEN X'' ELSE substr(tail_content, -?3) END AS tail,
+                   stored_bytes, dropped_bytes, truncated, updated_at
+            FROM deployment_step_log_buffers
+            WHERE task_id = ?1
+            ORDER BY updated_at DESC, step_id DESC
+            LIMIT ?4
+            "#,
+        )
+        .bind(task_id)
+        .bind(head_limit as i64)
+        .bind(tail_limit as i64)
+        .bind(max_steps.max(1) as i64)
+        .fetch_all(&self.db)
+        .await?;
+        let mut previews = rows
+            .into_iter()
+            .map(|row| BoundedTaskLogPreview {
+                step_id: row.step_id,
+                preview_omitted_bytes: (row.stored_bytes
+                    - row.head.len() as i64
+                    - row.tail.len() as i64)
+                    .max(0) as u64,
+                head: row.head,
+                tail: row.tail,
+                stored_bytes: row.stored_bytes.max(0) as u64,
+                dropped_bytes: row.dropped_bytes.max(0) as u64,
+                truncated: row.truncated,
+                updated_at: row.updated_at,
+                live: false,
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(task) = self.active_task_if_present(task_id).await {
+            let task = task.lock().await;
+            for (step_id, step) in &task.steps {
+                let mut preview = step.buffer.preview(head_limit, tail_limit);
+                preview.step_id = *step_id;
+                preview.updated_at = step.updated_at.clone();
+                preview.live = true;
+                if let Some(existing) = previews
+                    .iter_mut()
+                    .find(|existing| existing.step_id == *step_id)
+                {
+                    *existing = preview;
+                } else {
+                    previews.push(preview);
+                }
+            }
+        }
+        previews.sort_by(|left, right| {
+            right
+                .live
+                .cmp(&left.live)
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+                .then_with(|| right.step_id.cmp(&left.step_id))
+        });
+        previews.truncate(max_steps.max(1));
+        previews.sort_by_key(|preview| preview.step_id);
+        Ok(previews)
+    }
+
     pub async fn delete_task_logs(&self, task_id: i64) -> Result<u64, DeploymentRetentionError> {
         let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let task_status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM operation_tasks WHERE id = ?1")
+                .bind(task_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let task_status = task_status
+            .ok_or_else(|| DeploymentRetentionError::NotFound("任务不存在".to_owned()))?;
+        let reconciling: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM environment_deployment_runs
+                WHERE task_id = ?1 AND status = 'reconciling'
+            )
+            "#,
+        )
+        .bind(task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if matches!(task_status.as_str(), "queued" | "running") || reconciling {
+            return Err(DeploymentRetentionError::InvalidState(
+                "活动部署或待核对部署的日志不能清理".to_owned(),
+            ));
+        }
         let bounded_bytes: i64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(stored_bytes), 0) FROM deployment_step_log_buffers WHERE task_id = ?1",
         )
@@ -200,72 +428,160 @@ impl DeploymentLogService {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        let mut state = self.state.lock().await;
-        state.tasks.remove(&task_id);
-        state.steps.retain(|_, step| step.task_id != task_id);
+        self.state.lock().await.tasks.remove(&task_id);
         Ok((bounded_bytes + legacy_bytes).max(0) as u64)
     }
 
-    async fn write(
+    async fn mutate_buffer(
         &self,
         task_id: i64,
         step_id: i64,
         secrets: &[String],
         chunk: Option<&[u8]>,
+        dropped_bytes: u64,
         finish: bool,
-    ) -> Result<BoundedLogSnapshot, DeploymentRetentionError> {
-        let valid_step: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM operation_task_steps WHERE id = ?1 AND task_id = ?2)",
-        )
-        .bind(step_id)
-        .bind(task_id)
-        .fetch_one(&self.db)
-        .await?;
-        if !valid_step {
-            return Err(DeploymentRetentionError::NotFound(
-                "任务步骤不存在".to_owned(),
-            ));
+    ) -> Result<(), DeploymentRetentionError> {
+        let task = self.active_task(task_id).await?;
+        let needs_step = !task.lock().await.steps.contains_key(&step_id);
+        if needs_step {
+            let persisted = self.load_step(task_id, step_id).await?;
+            let step = ActiveStepLog {
+                buffer: BoundedLogBuffer::from_persisted(
+                    persisted.head_limit,
+                    persisted.tail_limit,
+                    persisted.head,
+                    persisted.tail,
+                    persisted.received_bytes,
+                    persisted.dropped_bytes,
+                    secrets.to_vec(),
+                ),
+                finished: persisted.finished,
+                updated_at: persisted.updated_at,
+            };
+            task.lock().await.steps.entry(step_id).or_insert(step);
         }
-        let mut state = self.state.lock().await;
-        state
-            .tasks
-            .entry(task_id)
-            .or_insert_with(|| TaskLogBudget::new(self.task_limit));
-        state.steps.entry(step_id).or_insert_with(|| ActiveStepLog {
-            task_id,
-            buffer: BoundedLogBuffer::new(self.head_limit, self.tail_limit, secrets.to_vec()),
-            finished: false,
-        });
-        let mut task_budget = state
-            .tasks
-            .remove(&task_id)
-            .expect("task budget was inserted above");
-        let step = state
-            .steps
+        let mut task = task.lock().await;
+        let ActiveTaskLog { budget, steps } = &mut *task;
+        let step = steps
             .get_mut(&step_id)
-            .expect("step buffer was inserted above");
-        if step.task_id != task_id || step.finished {
-            state.tasks.insert(task_id, task_budget);
+            .expect("step was initialized before log mutation");
+        if step.finished && !finish {
             return Err(DeploymentRetentionError::InvalidState(
                 "步骤日志已经结束或不属于该任务".to_owned(),
             ));
         }
         if let Some(chunk) = chunk {
-            step.buffer.append(chunk, &mut task_budget);
+            step.buffer.append(chunk, budget);
         }
-        if finish {
-            step.buffer.finish(&mut task_budget);
+        if dropped_bytes > 0 {
+            step.buffer.record_external_drop(dropped_bytes, budget);
+        }
+        if finish && !step.finished {
+            step.buffer.finish(budget);
             step.finished = true;
         }
-        let snapshot = step.buffer.snapshot();
-        let finished = step.finished;
-        let task_values = (
-            task_budget.stored_bytes(),
-            task_budget.received_bytes(),
-            task_budget.dropped_bytes(),
-            task_budget.truncated(),
-        );
-        state.tasks.insert(task_id, task_budget);
+        Ok(())
+    }
+
+    async fn active_task(
+        &self,
+        task_id: i64,
+    ) -> Result<Arc<Mutex<ActiveTaskLog>>, DeploymentRetentionError> {
+        if let Some(task) = self.active_task_if_present(task_id).await {
+            return Ok(task);
+        }
+        let persisted = sqlx::query_as::<_, PersistedTaskLogRow>(
+            r#"
+            SELECT stored_bytes, received_bytes, dropped_bytes, max_bytes
+            FROM deployment_task_log_budgets WHERE task_id = ?1
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&self.db)
+        .await?;
+        let budget = match persisted {
+            Some(row) => TaskLogBudget::from_usage(
+                row.max_bytes.max(1) as usize,
+                row.stored_bytes.max(0) as usize,
+                row.received_bytes.max(0) as u64,
+                row.dropped_bytes.max(0) as u64,
+            ),
+            None => TaskLogBudget::new(self.task_limit),
+        };
+        let candidate = Arc::new(Mutex::new(ActiveTaskLog {
+            budget,
+            steps: HashMap::new(),
+        }));
+        let mut state = self.state.lock().await;
+        Ok(state.tasks.entry(task_id).or_insert(candidate).clone())
+    }
+
+    async fn active_task_if_present(&self, task_id: i64) -> Option<Arc<Mutex<ActiveTaskLog>>> {
+        self.state.lock().await.tasks.get(&task_id).cloned()
+    }
+
+    async fn load_step(
+        &self,
+        task_id: i64,
+        step_id: i64,
+    ) -> Result<PersistedStepLog, DeploymentRetentionError> {
+        let row = sqlx::query_as::<_, PersistedStepLogRow>(
+            r#"
+            SELECT steps.updated_at AS step_updated_at,
+                   logs.head_content AS head, logs.tail_content AS tail,
+                   logs.received_bytes, logs.dropped_bytes,
+                   logs.head_limit_bytes AS head_limit,
+                   logs.tail_limit_bytes AS tail_limit,
+                   logs.finished, logs.updated_at AS log_updated_at
+            FROM operation_task_steps steps
+            LEFT JOIN deployment_step_log_buffers logs ON logs.step_id = steps.id
+            WHERE steps.id = ?1 AND steps.task_id = ?2
+            "#,
+        )
+        .bind(step_id)
+        .bind(task_id)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or_else(|| DeploymentRetentionError::NotFound("任务步骤不存在".to_owned()))?;
+        Ok(PersistedStepLog {
+            head: row.head.unwrap_or_default(),
+            tail: row.tail.unwrap_or_default(),
+            received_bytes: row.received_bytes.unwrap_or(0).max(0) as u64,
+            dropped_bytes: row.dropped_bytes.unwrap_or(0).max(0) as u64,
+            head_limit: row.head_limit.unwrap_or(self.head_limit as i64).max(0) as usize,
+            tail_limit: row.tail_limit.unwrap_or(self.tail_limit as i64).max(0) as usize,
+            finished: row.finished.unwrap_or(false),
+            updated_at: row.log_updated_at.unwrap_or(row.step_updated_at),
+        })
+    }
+
+    async fn persistence_snapshot(
+        &self,
+        task_id: i64,
+        step_id: i64,
+    ) -> Option<LogPersistenceSnapshot> {
+        let task = self.active_task_if_present(task_id).await?;
+        let task = task.lock().await;
+        let step = task.steps.get(&step_id)?;
+        Some(LogPersistenceSnapshot {
+            step: step.buffer.snapshot(),
+            head_limit: step.buffer.head_limit,
+            tail_limit: step.buffer.tail_limit,
+            task_max_bytes: task.budget.max_bytes,
+            task_stored_bytes: task.budget.stored_bytes() as u64,
+            task_received_bytes: task.budget.received_bytes(),
+            task_dropped_bytes: task.budget.dropped_bytes(),
+            task_truncated: task.budget.truncated(),
+            finished: step.finished,
+        })
+    }
+
+    async fn persist(
+        &self,
+        task_id: i64,
+        step_id: i64,
+        snapshot: &LogPersistenceSnapshot,
+    ) -> Result<(), DeploymentRetentionError> {
         let mut tx = self.db.begin().await?;
         sqlx::query(
             r#"
@@ -273,20 +589,20 @@ impl DeploymentLogService {
                 task_id, stored_bytes, received_bytes, dropped_bytes, max_bytes, truncated
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(task_id) DO UPDATE SET
-                stored_bytes = excluded.stored_bytes,
-                received_bytes = excluded.received_bytes,
-                dropped_bytes = excluded.dropped_bytes,
+                stored_bytes = MAX(deployment_task_log_budgets.stored_bytes, excluded.stored_bytes),
+                received_bytes = MAX(deployment_task_log_budgets.received_bytes, excluded.received_bytes),
+                dropped_bytes = MAX(deployment_task_log_budgets.dropped_bytes, excluded.dropped_bytes),
                 max_bytes = excluded.max_bytes,
-                truncated = excluded.truncated,
+                truncated = MAX(deployment_task_log_budgets.truncated, excluded.truncated),
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             "#,
         )
         .bind(task_id)
-        .bind(task_values.0 as i64)
-        .bind(task_values.1 as i64)
-        .bind(task_values.2 as i64)
-        .bind(self.task_limit as i64)
-        .bind(task_values.3)
+        .bind(snapshot.task_stored_bytes as i64)
+        .bind(snapshot.task_received_bytes as i64)
+        .bind(snapshot.task_dropped_bytes as i64)
+        .bind(snapshot.task_max_bytes as i64)
+        .bind(snapshot.task_truncated)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -303,25 +619,26 @@ impl DeploymentLogService {
                 received_bytes = excluded.received_bytes,
                 dropped_bytes = excluded.dropped_bytes,
                 truncated = excluded.truncated,
-                finished = excluded.finished,
+                finished = MAX(deployment_step_log_buffers.finished, excluded.finished),
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE excluded.received_bytes >= deployment_step_log_buffers.received_bytes
             "#,
         )
         .bind(step_id)
         .bind(task_id)
-        .bind(&snapshot.head)
-        .bind(&snapshot.tail)
-        .bind(snapshot.stored_bytes as i64)
-        .bind(snapshot.received_bytes as i64)
-        .bind(snapshot.dropped_bytes as i64)
-        .bind(self.head_limit as i64)
-        .bind(self.tail_limit as i64)
-        .bind(snapshot.truncated)
-        .bind(finished)
+        .bind(&snapshot.step.head)
+        .bind(&snapshot.step.tail)
+        .bind(snapshot.step.stored_bytes as i64)
+        .bind(snapshot.step.received_bytes as i64)
+        .bind(snapshot.step.dropped_bytes as i64)
+        .bind(snapshot.head_limit as i64)
+        .bind(snapshot.tail_limit as i64)
+        .bind(snapshot.step.truncated)
+        .bind(snapshot.finished)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(snapshot)
+        Ok(())
     }
 }
 
@@ -642,6 +959,20 @@ impl TaskLogBudget {
         }
     }
 
+    fn from_usage(
+        max_bytes: usize,
+        stored_bytes: usize,
+        received_bytes: u64,
+        dropped_bytes: u64,
+    ) -> Self {
+        Self {
+            max_bytes,
+            stored_bytes: stored_bytes.min(max_bytes),
+            received_bytes,
+            dropped_bytes,
+        }
+    }
+
     fn allocate(&mut self, requested: usize) -> usize {
         let allocated = requested.min(self.max_bytes.saturating_sub(self.stored_bytes));
         self.stored_bytes += allocated;
@@ -689,6 +1020,28 @@ impl BoundedLogBuffer {
         }
     }
 
+    fn from_persisted(
+        head_limit: usize,
+        tail_limit: usize,
+        mut head: Vec<u8>,
+        tail: Vec<u8>,
+        received_bytes: u64,
+        dropped_bytes: u64,
+        secrets: Vec<String>,
+    ) -> Self {
+        head.truncate(head_limit);
+        let tail_start = tail.len().saturating_sub(tail_limit);
+        Self {
+            head_limit,
+            tail_limit,
+            head,
+            tail: tail[tail_start..].iter().copied().collect(),
+            received_bytes,
+            dropped_bytes,
+            redactor: StreamingRedactor::new(secrets),
+        }
+    }
+
     pub fn append(&mut self, chunk: &[u8], task_budget: &mut TaskLogBudget) {
         let redacted = self.redactor.push(chunk);
         self.append_redacted(&redacted, task_budget);
@@ -699,6 +1052,12 @@ impl BoundedLogBuffer {
         self.append_redacted(&redacted, task_budget);
     }
 
+    pub fn record_external_drop(&mut self, count: u64, task_budget: &mut TaskLogBudget) {
+        self.received_bytes = self.received_bytes.saturating_add(count);
+        task_budget.received_bytes = task_budget.received_bytes.saturating_add(count);
+        self.record_drop(count, task_budget);
+    }
+
     pub fn snapshot(&self) -> BoundedLogSnapshot {
         BoundedLogSnapshot {
             head: self.head.clone(),
@@ -707,6 +1066,30 @@ impl BoundedLogBuffer {
             received_bytes: self.received_bytes,
             dropped_bytes: self.dropped_bytes,
             truncated: self.dropped_bytes > 0,
+        }
+    }
+
+    fn preview(&self, head_limit: usize, tail_limit: usize) -> BoundedTaskLogPreview {
+        let head_len = self.head.len().min(head_limit);
+        let tail_start = self.tail.len().saturating_sub(tail_limit);
+        let head = self.head[..head_len].to_vec();
+        let tail = self
+            .tail
+            .iter()
+            .skip(tail_start)
+            .copied()
+            .collect::<Vec<_>>();
+        let stored_bytes = self.head.len() + self.tail.len();
+        BoundedTaskLogPreview {
+            step_id: 0,
+            preview_omitted_bytes: stored_bytes.saturating_sub(head.len() + tail.len()) as u64,
+            head,
+            tail,
+            stored_bytes: stored_bytes as u64,
+            dropped_bytes: self.dropped_bytes,
+            truncated: self.dropped_bytes > 0,
+            updated_at: String::new(),
+            live: true,
         }
     }
 
@@ -727,21 +1110,30 @@ impl BoundedLogBuffer {
                 offset += requested - allocated;
             }
         }
-        for byte in &bytes[offset..] {
-            if self.tail.len() < self.tail_limit {
-                if task_budget.allocate(1) == 1 {
-                    self.tail.push_back(*byte);
-                } else {
-                    self.record_drop(1, task_budget);
-                }
-            } else if self.tail_limit > 0 {
-                self.tail.pop_front();
-                self.tail.push_back(*byte);
-                self.record_drop(1, task_budget);
-            } else {
-                self.record_drop(1, task_budget);
-            }
+        let mut remaining = &bytes[offset..];
+        if self.tail.len() < self.tail_limit && !remaining.is_empty() {
+            let requested = (self.tail_limit - self.tail.len()).min(remaining.len());
+            let allocated = task_budget.allocate(requested);
+            self.tail.extend(remaining[..allocated].iter().copied());
+            remaining = &remaining[allocated..];
         }
+        if remaining.is_empty() {
+            return;
+        }
+        let retained_tail = self.tail.len();
+        if retained_tail == 0 {
+            self.record_drop(remaining.len() as u64, task_budget);
+            return;
+        }
+        if remaining.len() >= retained_tail {
+            self.tail.clear();
+            self.tail
+                .extend(remaining[remaining.len() - retained_tail..].iter().copied());
+        } else {
+            self.tail.drain(..remaining.len());
+            self.tail.extend(remaining.iter().copied());
+        }
+        self.record_drop(remaining.len() as u64, task_budget);
     }
 
     fn record_drop(&mut self, count: u64, task_budget: &mut TaskLogBudget) {
@@ -750,8 +1142,15 @@ impl BoundedLogBuffer {
     }
 }
 
+pub fn redact_log_text(secrets: &[String], content: &str) -> String {
+    let mut redactor = StreamingRedactor::new(secrets.to_vec());
+    let mut redacted = redactor.push(content.as_bytes());
+    redacted.extend(redactor.finish());
+    String::from_utf8_lossy(&redacted).into_owned()
+}
+
 #[derive(Debug)]
-struct StreamingRedactor {
+pub(crate) struct StreamingRedactor {
     secrets: Vec<Vec<u8>>,
     pending: Vec<u8>,
     overlap: usize,
@@ -759,7 +1158,7 @@ struct StreamingRedactor {
 }
 
 impl StreamingRedactor {
-    fn new(secrets: Vec<String>) -> Self {
+    pub(crate) fn new(secrets: Vec<String>) -> Self {
         let mut secrets = secrets
             .into_iter()
             .filter(|secret| !secret.is_empty())
@@ -782,12 +1181,12 @@ impl StreamingRedactor {
         }
     }
 
-    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.pending.extend_from_slice(chunk);
         self.process(false)
     }
 
-    fn finish(&mut self) -> Vec<u8> {
+    pub(crate) fn finish(&mut self) -> Vec<u8> {
         self.process(true)
     }
 
@@ -1010,6 +1409,21 @@ mod tests {
         assert!(!rendered.contains("explicit-secret"));
         assert!(snapshot.stored_bytes <= 32);
 
+        let active_error = service
+            .delete_task_logs(task_id)
+            .await
+            .expect_err("active task logs stay protected");
+        assert!(matches!(
+            active_error,
+            DeploymentRetentionError::InvalidState(_)
+        ));
+
+        sqlx::query("UPDATE operation_tasks SET status = 'success' WHERE id = ?1")
+            .bind(task_id)
+            .execute(&db)
+            .await
+            .expect("finish task");
+
         let released = service
             .delete_task_logs(task_id)
             .await
@@ -1029,6 +1443,49 @@ mod tests {
                 .await
                 .expect("check step");
         assert!(task_exists && step_exists);
+    }
+
+    #[tokio::test]
+    async fn task_preview_is_bounded_and_finished_step_releases_live_buffer() {
+        let db = retention_database().await;
+        let task_id = sqlx::query(
+            "INSERT INTO operation_tasks(task_kind, title, status) VALUES ('release.deploy', 'preview', 'running')",
+        )
+        .execute(&db)
+        .await
+        .expect("insert task")
+        .last_insert_rowid();
+        let step_id = sqlx::query(
+            "INSERT INTO operation_task_steps(task_id, step_no, step_key, title, status) VALUES (?1, 1, 'unit', 'unit', 'running')",
+        )
+        .bind(task_id)
+        .execute(&db)
+        .await
+        .expect("insert step")
+        .last_insert_rowid();
+        let service = DeploymentLogService::with_limits(db, 64, 64, 128);
+        service
+            .append_buffered(task_id, step_id, &[], &vec![b'x'; 1_000])
+            .await
+            .expect("buffer output");
+        service.finish(task_id, step_id).await.expect("finish log");
+
+        let previews = service
+            .task_previews_with_limits(task_id, 4, 4, 32)
+            .await
+            .expect("load preview");
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].head.len(), 4);
+        assert_eq!(previews[0].tail.len(), 4);
+        assert_eq!(previews[0].preview_omitted_bytes, 120);
+        assert!(previews[0].truncated);
+        assert!(!previews[0].live);
+
+        let task = service
+            .active_task_if_present(task_id)
+            .await
+            .expect("task budget remains cached");
+        assert!(!task.lock().await.steps.contains_key(&step_id));
     }
 
     #[tokio::test]

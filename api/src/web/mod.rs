@@ -3548,7 +3548,11 @@ async fn task_detail_page(
         Ok(None) => DeploymentTaskControlView::default(),
         Err(error) => return deployment_orchestrator_error_response(error),
     };
-    let logs = match state.tasks().task_logs(task_id).await {
+    let logs = match state
+        .tasks()
+        .task_logs_with_deployment(task_id, state.deployment_logs())
+        .await
+    {
         Ok(logs) => logs,
         Err(err) => return task_error_response(err),
     };
@@ -3604,7 +3608,7 @@ async fn task_detail_page(
     let mut ungrouped_log_rows = Vec::new();
     for log in &logs {
         let row = TaskLogRow {
-            id: log.id,
+            source_label: log.source.label(),
             stream: &log.stream,
             stream_tone: task_log_stream_tone(&log.stream),
             content: &log.content,

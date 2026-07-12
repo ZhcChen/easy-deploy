@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     future::pending,
     path::{Path, PathBuf},
     process::Stdio,
@@ -7,11 +8,25 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tokio::{fs, io::AsyncWriteExt, process::Command, sync::watch, time::timeout};
+use tokio::{
+    fs,
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    process::Command,
+    sync::{mpsc, watch},
+    time::timeout,
+};
 
 use crate::settings::DEFAULT_COMMAND_TIMEOUT_SECS;
 
 pub type DynCommandRunner = Arc<dyn CommandRunner>;
+pub type DynCommandOutputSink = Arc<dyn CommandOutputSink>;
+
+const COMMAND_CAPTURE_HEAD_BYTES: usize = 64 * 1024;
+const COMMAND_CAPTURE_TAIL_BYTES: usize = 256 * 1024;
+const COMMAND_OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
+const COMMAND_OUTPUT_CHANNEL_CAPACITY: usize = 16;
+const COMMAND_OUTPUT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+const COMMAND_CAPTURE_TRUNCATION_MARKER: &str = "\n...[命令输出已截断，仅保留开头与结尾]...\n";
 
 #[derive(Debug)]
 pub enum DeployError {
@@ -37,6 +52,22 @@ impl std::fmt::Display for DeployError {
 }
 
 impl std::error::Error for DeployError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandOutputStream {
+    Stdout,
+    Stderr,
+    System,
+}
+
+#[async_trait]
+pub trait CommandOutputSink: Send + Sync {
+    async fn write(&self, stream: CommandOutputStream, chunk: &[u8]) -> Result<(), DeployError>;
+
+    async fn flush(&self) -> Result<(), DeployError> {
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
@@ -111,6 +142,26 @@ impl CommandResult {
 pub trait CommandRunner: Send + Sync {
     async fn run(&self, spec: CommandSpec) -> Result<CommandResult, DeployError>;
 
+    async fn run_streaming(
+        &self,
+        spec: CommandSpec,
+        output_sink: DynCommandOutputSink,
+    ) -> Result<CommandResult, DeployError> {
+        let result = self.run(spec).await?;
+        if !result.stdout.is_empty() {
+            output_sink
+                .write(CommandOutputStream::Stdout, result.stdout.as_bytes())
+                .await?;
+        }
+        if !result.stderr.is_empty() {
+            output_sink
+                .write(CommandOutputStream::Stderr, result.stderr.as_bytes())
+                .await?;
+        }
+        output_sink.flush().await?;
+        Ok(result)
+    }
+
     async fn run_cancellable(
         &self,
         spec: CommandSpec,
@@ -124,6 +175,24 @@ pub trait CommandRunner: Send + Sync {
         }
         tokio::select! {
             result = self.run(spec) => result,
+            _ = cancellation.cancelled() => Err(DeployError::Canceled(format!("命令 {command} 已取消"))),
+        }
+    }
+
+    async fn run_cancellable_streaming(
+        &self,
+        spec: CommandSpec,
+        cancellation: CancellationSignal,
+        output_sink: DynCommandOutputSink,
+    ) -> Result<CommandResult, DeployError> {
+        let command = render_command(&spec.program, &spec.args);
+        if cancellation.is_cancelled() {
+            return Err(DeployError::Canceled(format!(
+                "命令 {command} 在启动前已取消"
+            )));
+        }
+        tokio::select! {
+            result = self.run_streaming(spec, output_sink) => result,
             _ = cancellation.cancelled() => Err(DeployError::Canceled(format!("命令 {command} 已取消"))),
         }
     }
@@ -150,7 +219,15 @@ impl Default for TokioCommandRunner {
 #[async_trait]
 impl CommandRunner for TokioCommandRunner {
     async fn run(&self, spec: CommandSpec) -> Result<CommandResult, DeployError> {
-        self.run_process(spec, None).await
+        self.run_process(spec, None, None).await
+    }
+
+    async fn run_streaming(
+        &self,
+        spec: CommandSpec,
+        output_sink: DynCommandOutputSink,
+    ) -> Result<CommandResult, DeployError> {
+        self.run_process(spec, None, Some(output_sink)).await
     }
 
     async fn run_cancellable(
@@ -158,7 +235,17 @@ impl CommandRunner for TokioCommandRunner {
         spec: CommandSpec,
         cancellation: CancellationSignal,
     ) -> Result<CommandResult, DeployError> {
-        self.run_process(spec, Some(&cancellation)).await
+        self.run_process(spec, Some(&cancellation), None).await
+    }
+
+    async fn run_cancellable_streaming(
+        &self,
+        spec: CommandSpec,
+        cancellation: CancellationSignal,
+        output_sink: DynCommandOutputSink,
+    ) -> Result<CommandResult, DeployError> {
+        self.run_process(spec, Some(&cancellation), Some(output_sink))
+            .await
     }
 }
 
@@ -167,6 +254,7 @@ impl TokioCommandRunner {
         &self,
         spec: CommandSpec,
         cancellation: Option<&CancellationSignal>,
+        output_sink: Option<DynCommandOutputSink>,
     ) -> Result<CommandResult, DeployError> {
         let command = render_command(&spec.program, &spec.args);
         if cancellation.is_some_and(CancellationSignal::is_cancelled) {
@@ -187,48 +275,310 @@ impl TokioCommandRunner {
             use std::os::unix::process::CommandExt;
             process.as_std_mut().process_group(0);
         }
-        let child = process
+        let mut child = process
             .spawn()
             .map_err(|err| DeployError::Command(format!("执行命令 {command} 失败: {err}")))?;
         let process_id = child.id();
-        let mut wait = Box::pin(child.wait_with_output());
+        let stdout = child.stdout.take().ok_or_else(|| {
+            DeployError::Command(format!("执行命令 {command} 失败: 无法读取 stdout"))
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            DeployError::Command(format!("执行命令 {command} 失败: 无法读取 stderr"))
+        })?;
+        let (output_sender, mut output_receiver) = mpsc::channel(COMMAND_OUTPUT_CHANNEL_CAPACITY);
+        let output_tasks = vec![
+            tokio::spawn(read_command_output(
+                stdout,
+                CommandOutputStream::Stdout,
+                output_sender.clone(),
+            )),
+            tokio::spawn(read_command_output(
+                stderr,
+                CommandOutputStream::Stderr,
+                output_sender.clone(),
+            )),
+        ];
+        drop(output_sender);
+        let mut wait = Box::pin(child.wait());
         let deadline = tokio::time::sleep(self.timeout);
         tokio::pin!(deadline);
-        enum Completion {
-            Finished(std::io::Result<std::process::Output>),
-            Canceled,
-            TimedOut,
-        }
-        let completion = tokio::select! {
-            output = &mut wait => Completion::Finished(output),
-            _ = wait_for_cancellation(cancellation) => Completion::Canceled,
-            _ = &mut deadline => Completion::TimedOut,
+        let cancellation_wait = wait_for_cancellation(cancellation);
+        tokio::pin!(cancellation_wait);
+        let mut output_open = true;
+        let mut stdout_capture = BoundedCommandCapture::new();
+        let mut stderr_capture = BoundedCommandCapture::new();
+        let completion = loop {
+            tokio::select! {
+                biased;
+                status = &mut wait => {
+                    break status.map_err(|error| CommandProcessStop::OutputError(
+                        DeployError::Command(format!("执行命令 {command} 失败: {error}")),
+                    ));
+                }
+                event = output_receiver.recv(), if output_open => {
+                    match event {
+                        Some(event) => {
+                            if let Err(error) = handle_command_output_event(
+                                event,
+                                output_sink.as_ref(),
+                                &mut stdout_capture,
+                                &mut stderr_capture,
+                            ).await {
+                                break Err(CommandProcessStop::OutputError(error));
+                            }
+                        }
+                        None => output_open = false,
+                    }
+                }
+                _ = &mut cancellation_wait => {
+                    break Err(CommandProcessStop::Canceled);
+                }
+                _ = &mut deadline => {
+                    break Err(CommandProcessStop::TimedOut);
+                }
+            }
         };
-        let output = match completion {
-            Completion::Finished(output) => output
-                .map_err(|err| DeployError::Command(format!("执行命令 {command} 失败: {err}")))?,
-            Completion::Canceled => {
-                terminate_process(process_id, false).await;
-                if timeout(Duration::from_secs(5), &mut wait).await.is_err() {
+
+        let status = match completion {
+            Ok(status) => status,
+            Err(stop_reason) => {
+                let graceful = matches!(stop_reason, CommandProcessStop::Canceled);
+                terminate_process(process_id, !graceful).await;
+                let grace_period = if graceful {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_secs(1)
+                };
+                if timeout(grace_period, &mut wait).await.is_err() {
                     terminate_process(process_id, true).await;
                     let _ = timeout(Duration::from_secs(5), &mut wait).await;
                 }
-                return Err(DeployError::Canceled(format!("命令 {command} 已取消")));
-            }
-            Completion::TimedOut => {
-                terminate_process(process_id, true).await;
-                let _ = timeout(Duration::from_secs(5), &mut wait).await;
-                return Err(DeployError::Command(format!(
-                    "执行命令 {command} 超时（{} 秒）",
-                    self.timeout.as_secs()
-                )));
+                if let Err(error) = drain_command_output(
+                    &mut output_receiver,
+                    output_sink.as_ref(),
+                    &mut stdout_capture,
+                    &mut stderr_capture,
+                )
+                .await
+                {
+                    tracing::warn!(error = %error, "failed to drain deployment command output");
+                }
+                if let Err(error) = flush_command_output_sink(output_sink.as_ref()).await {
+                    tracing::warn!(error = %error, "failed to flush deployment command output");
+                }
+                for task in &output_tasks {
+                    if !task.is_finished() {
+                        task.abort();
+                    }
+                }
+                for task in output_tasks {
+                    let _ = task.await;
+                }
+                return Err(match stop_reason {
+                    CommandProcessStop::Canceled => {
+                        DeployError::Canceled(format!("命令 {command} 已取消"))
+                    }
+                    CommandProcessStop::TimedOut => DeployError::Command(format!(
+                        "执行命令 {command} 超时（{} 秒）",
+                        self.timeout.as_secs()
+                    )),
+                    CommandProcessStop::OutputError(error) => error,
+                });
             }
         };
+        let drain_result = drain_command_output(
+            &mut output_receiver,
+            output_sink.as_ref(),
+            &mut stdout_capture,
+            &mut stderr_capture,
+        )
+        .await;
+        for task in &output_tasks {
+            if !task.is_finished() {
+                task.abort();
+            }
+        }
+        for task in output_tasks {
+            let _ = task.await;
+        }
+        drain_result?;
+        flush_command_output_sink(output_sink.as_ref()).await?;
         Ok(CommandResult {
-            status_code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            status_code: status.code(),
+            stdout: String::from_utf8_lossy(&stdout_capture.into_bytes()).to_string(),
+            stderr: String::from_utf8_lossy(&stderr_capture.into_bytes()).to_string(),
         })
+    }
+}
+
+async fn flush_command_output_sink(
+    output_sink: Option<&DynCommandOutputSink>,
+) -> Result<(), DeployError> {
+    let Some(output_sink) = output_sink else {
+        return Ok(());
+    };
+    timeout(COMMAND_OUTPUT_FLUSH_TIMEOUT, output_sink.flush())
+        .await
+        .map_err(|_| DeployError::Command("刷新命令输出超时".to_owned()))?
+}
+
+enum CommandProcessStop {
+    Canceled,
+    TimedOut,
+    OutputError(DeployError),
+}
+
+enum CommandOutputEvent {
+    Chunk {
+        stream: CommandOutputStream,
+        bytes: Vec<u8>,
+    },
+    ReadError {
+        stream: CommandOutputStream,
+        message: String,
+    },
+}
+
+async fn read_command_output<R>(
+    mut reader: R,
+    stream: CommandOutputStream,
+    sender: mpsc::Sender<CommandOutputEvent>,
+) where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = vec![0_u8; COMMAND_OUTPUT_CHUNK_BYTES];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => return,
+            Ok(read) => {
+                if sender
+                    .send(CommandOutputEvent::Chunk {
+                        stream,
+                        bytes: buffer[..read].to_vec(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = sender
+                    .send(CommandOutputEvent::ReadError {
+                        stream,
+                        message: error.to_string(),
+                    })
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
+async fn handle_command_output_event(
+    event: CommandOutputEvent,
+    output_sink: Option<&DynCommandOutputSink>,
+    stdout_capture: &mut BoundedCommandCapture,
+    stderr_capture: &mut BoundedCommandCapture,
+) -> Result<(), DeployError> {
+    match event {
+        CommandOutputEvent::Chunk { stream, bytes } => {
+            match stream {
+                CommandOutputStream::Stdout => stdout_capture.append(&bytes),
+                CommandOutputStream::Stderr => stderr_capture.append(&bytes),
+                CommandOutputStream::System => {}
+            }
+            if let Some(output_sink) = output_sink {
+                output_sink.write(stream, &bytes).await?;
+            }
+            Ok(())
+        }
+        CommandOutputEvent::ReadError { stream, message } => Err(DeployError::Command(format!(
+            "读取命令 {} 失败: {message}",
+            match stream {
+                CommandOutputStream::Stdout => "stdout",
+                CommandOutputStream::Stderr => "stderr",
+                CommandOutputStream::System => "output",
+            }
+        ))),
+    }
+}
+
+async fn drain_command_output(
+    receiver: &mut mpsc::Receiver<CommandOutputEvent>,
+    output_sink: Option<&DynCommandOutputSink>,
+    stdout_capture: &mut BoundedCommandCapture,
+    stderr_capture: &mut BoundedCommandCapture,
+) -> Result<(), DeployError> {
+    let drain = async {
+        while let Some(event) = receiver.recv().await {
+            handle_command_output_event(event, output_sink, stdout_capture, stderr_capture).await?;
+        }
+        Ok(())
+    };
+    match timeout(Duration::from_secs(1), drain).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!("timed out draining deployment command output");
+            Ok(())
+        }
+    }
+}
+
+struct BoundedCommandCapture {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    dropped_bytes: u64,
+}
+
+impl BoundedCommandCapture {
+    fn new() -> Self {
+        Self {
+            head: Vec::with_capacity(COMMAND_CAPTURE_HEAD_BYTES),
+            tail: VecDeque::with_capacity(COMMAND_CAPTURE_TAIL_BYTES),
+            dropped_bytes: 0,
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        let head_bytes = (COMMAND_CAPTURE_HEAD_BYTES - self.head.len()).min(bytes.len());
+        self.head.extend_from_slice(&bytes[..head_bytes]);
+        let mut remaining = &bytes[head_bytes..];
+        if self.tail.len() < COMMAND_CAPTURE_TAIL_BYTES {
+            let retained = (COMMAND_CAPTURE_TAIL_BYTES - self.tail.len()).min(remaining.len());
+            self.tail.extend(remaining[..retained].iter().copied());
+            remaining = &remaining[retained..];
+        }
+        if remaining.is_empty() {
+            return;
+        }
+        if remaining.len() >= COMMAND_CAPTURE_TAIL_BYTES {
+            self.tail.clear();
+            self.tail.extend(
+                remaining[remaining.len() - COMMAND_CAPTURE_TAIL_BYTES..]
+                    .iter()
+                    .copied(),
+            );
+        } else {
+            self.tail.drain(..remaining.len());
+            self.tail.extend(remaining.iter().copied());
+        }
+        self.dropped_bytes = self.dropped_bytes.saturating_add(remaining.len() as u64);
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        let marker_bytes = if self.dropped_bytes > 0 {
+            COMMAND_CAPTURE_TRUNCATION_MARKER.len()
+        } else {
+            0
+        };
+        let mut output = Vec::with_capacity(self.head.len() + self.tail.len() + marker_bytes);
+        output.extend_from_slice(&self.head);
+        if self.dropped_bytes > 0 {
+            output.extend_from_slice(COMMAND_CAPTURE_TRUNCATION_MARKER.as_bytes());
+        }
+        output.extend(self.tail);
+        output
     }
 }
 
@@ -277,6 +627,7 @@ async fn terminate_process(process_id: Option<u32>, _force: bool) {
 #[derive(Clone)]
 pub struct ComposeExecutor {
     runner: DynCommandRunner,
+    output_sink: Option<DynCommandOutputSink>,
 }
 
 #[derive(Clone)]
@@ -289,6 +640,7 @@ pub struct SystemdExecutor {
 pub struct SshExecutor {
     runner: DynCommandRunner,
     known_hosts_file: Option<PathBuf>,
+    output_sink: Option<DynCommandOutputSink>,
 }
 
 #[derive(Clone)]
@@ -304,6 +656,16 @@ impl CommandRunner for CancellableCommandRunner {
             .run_cancellable(spec, self.cancellation.clone())
             .await
     }
+
+    async fn run_streaming(
+        &self,
+        spec: CommandSpec,
+        output_sink: DynCommandOutputSink,
+    ) -> Result<CommandResult, DeployError> {
+        self.runner
+            .run_cancellable_streaming(spec, self.cancellation.clone(), output_sink)
+            .await
+    }
 }
 
 fn cancellable_runner(
@@ -314,6 +676,24 @@ fn cancellable_runner(
         runner: runner.clone(),
         cancellation,
     })
+}
+
+async fn run_with_output_sink(
+    runner: &DynCommandRunner,
+    output_sink: Option<&DynCommandOutputSink>,
+    spec: CommandSpec,
+    display_command: &str,
+) -> Result<CommandResult, DeployError> {
+    let Some(output_sink) = output_sink else {
+        return runner.run(spec).await;
+    };
+    output_sink
+        .write(
+            CommandOutputStream::System,
+            format!("$ {display_command}\n").as_bytes(),
+        )
+        .await?;
+    runner.run_streaming(spec, output_sink.clone()).await
 }
 
 #[derive(Clone, Debug)]
@@ -347,11 +727,24 @@ pub fn ssh_known_hosts_file(data_dir: impl AsRef<Path>) -> PathBuf {
 
 impl ComposeExecutor {
     pub fn new(runner: DynCommandRunner) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            output_sink: None,
+        }
     }
 
     pub fn with_cancellation(&self, cancellation: CancellationSignal) -> Self {
-        Self::new(cancellable_runner(&self.runner, cancellation))
+        Self {
+            runner: cancellable_runner(&self.runner, cancellation),
+            output_sink: self.output_sink.clone(),
+        }
+    }
+
+    pub fn with_output_sink(&self, output_sink: DynCommandOutputSink) -> Self {
+        Self {
+            runner: self.runner.clone(),
+            output_sink: Some(output_sink),
+        }
     }
 
     pub async fn docker_info(
@@ -402,14 +795,17 @@ impl ComposeExecutor {
         args.push("sh".to_owned());
         args.push(script_relative_path);
         let command = render_command("env", &args);
-        let result = self
-            .runner
-            .run(CommandSpec {
+        let result = run_with_output_sink(
+            &self.runner,
+            self.output_sink.as_ref(),
+            CommandSpec {
                 program: "env".to_owned(),
                 args,
                 current_dir: work_dir,
-            })
-            .await?;
+            },
+            &command,
+        )
+        .await?;
         Ok(ComposeCommandOutput {
             command,
             success: result.success(),
@@ -430,14 +826,17 @@ impl ComposeExecutor {
                 work_dir.to_string_lossy()
             )));
         }
-        let result = self
-            .runner
-            .run(CommandSpec {
+        let result = run_with_output_sink(
+            &self.runner,
+            self.output_sink.as_ref(),
+            CommandSpec {
                 program: "sh".to_owned(),
                 args: vec!["-lc".to_owned(), command.to_owned()],
                 current_dir: work_dir,
-            })
-            .await?;
+            },
+            display_command,
+        )
+        .await?;
         Ok(ComposeCommandOutput {
             command: display_command.to_owned(),
             success: result.success(),
@@ -548,14 +947,17 @@ impl ComposeExecutor {
             )));
         }
         let command = render_command("docker", &docker_args);
-        let result = self
-            .runner
-            .run(CommandSpec {
+        let result = run_with_output_sink(
+            &self.runner,
+            self.output_sink.as_ref(),
+            CommandSpec {
                 program: "docker".to_owned(),
                 args: docker_args,
                 current_dir: work_dir,
-            })
-            .await?;
+            },
+            &command,
+        )
+        .await?;
         Ok(ComposeCommandOutput {
             command,
             success: result.success(),
@@ -813,6 +1215,7 @@ impl SshExecutor {
         Self {
             runner,
             known_hosts_file: None,
+            output_sink: None,
         }
     }
 
@@ -825,6 +1228,15 @@ impl SshExecutor {
         Self {
             runner: cancellable_runner(&self.runner, cancellation),
             known_hosts_file: self.known_hosts_file.clone(),
+            output_sink: self.output_sink.clone(),
+        }
+    }
+
+    pub fn with_output_sink(&self, output_sink: DynCommandOutputSink) -> Self {
+        Self {
+            runner: self.runner.clone(),
+            known_hosts_file: self.known_hosts_file.clone(),
+            output_sink: Some(output_sink),
         }
     }
 
@@ -1347,14 +1759,17 @@ impl SshExecutor {
             )));
         }
         let command = render_command(program, &args);
-        let result = self
-            .runner
-            .run(CommandSpec {
+        let result = run_with_output_sink(
+            &self.runner,
+            self.output_sink.as_ref(),
+            CommandSpec {
                 program: program.to_owned(),
                 args,
                 current_dir: local_work_dir,
-            })
-            .await?;
+            },
+            &command,
+        )
+        .await?;
         Ok(CommandOutput {
             command,
             success: result.success(),
@@ -1825,7 +2240,10 @@ fn normalize_compose_service_name(value: &str) -> Result<String, DeployError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use tempfile::tempdir;
 
@@ -1834,6 +2252,45 @@ mod tests {
     #[derive(Default)]
     struct RecordingRunner {
         specs: Mutex<Vec<CommandSpec>>,
+    }
+
+    #[derive(Default)]
+    struct CountingOutputSink {
+        bytes: AtomicUsize,
+        chunks: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct CollectingOutputSink {
+        content: Mutex<Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl CommandOutputSink for CountingOutputSink {
+        async fn write(
+            &self,
+            _stream: CommandOutputStream,
+            chunk: &[u8],
+        ) -> Result<(), DeployError> {
+            self.bytes.fetch_add(chunk.len(), Ordering::SeqCst);
+            self.chunks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl CommandOutputSink for CollectingOutputSink {
+        async fn write(
+            &self,
+            _stream: CommandOutputStream,
+            chunk: &[u8],
+        ) -> Result<(), DeployError> {
+            self.content
+                .lock()
+                .expect("output lock")
+                .extend_from_slice(chunk);
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -1925,7 +2382,8 @@ mod tests {
     async fn compose_run_shell_redacted_hides_sensitive_command_label() {
         let work_dir = tempdir().expect("temp dir");
         let runner = Arc::new(RecordingRunner::default());
-        let executor = ComposeExecutor::new(runner.clone());
+        let sink = Arc::new(CollectingOutputSink::default());
+        let executor = ComposeExecutor::new(runner.clone()).with_output_sink(sink.clone());
 
         let output = executor
             .run_shell_redacted(
@@ -1942,6 +2400,10 @@ mod tests {
         let specs = runner.specs.lock().expect("lock specs");
         assert_eq!(specs[0].program, "sh");
         assert!(specs[0].args[1].contains("Signature=secret"));
+        let streamed =
+            String::from_utf8_lossy(&sink.content.lock().expect("output lock")).to_string();
+        assert!(streamed.contains("download oss://bucket/test"));
+        assert!(!streamed.contains("Signature=secret"));
     }
 
     #[tokio::test]
@@ -1972,6 +2434,71 @@ mod tests {
 
         assert!(err.message().contains("超时"));
         assert!(err.message().contains("1 秒"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tokio_command_runner_bounds_output_drain_after_parent_exits() {
+        let work_dir = tempdir().expect("temp dir");
+        let runner = TokioCommandRunner::new(10);
+        let started = std::time::Instant::now();
+
+        let result = runner
+            .run(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec!["-c".to_owned(), "sleep 3 &".to_owned()],
+                current_dir: work_dir.path().to_path_buf(),
+            })
+            .await
+            .expect("parent shell exits successfully");
+
+        assert!(result.success());
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn tokio_command_runner_streams_large_output_with_bounded_capture() {
+        let work_dir = tempdir().expect("temp dir");
+        let runner = TokioCommandRunner::new(30);
+        let sink = Arc::new(CountingOutputSink::default());
+        let output_bytes = 4 * 1024 * 1024;
+        let (program, args) = if cfg!(windows) {
+            (
+                "powershell".to_owned(),
+                vec![
+                    "-NoProfile".to_owned(),
+                    "-Command".to_owned(),
+                    format!("[Console]::Out.Write('x' * {output_bytes})"),
+                ],
+            )
+        } else {
+            (
+                "sh".to_owned(),
+                vec!["-c".to_owned(), format!("head -c {output_bytes} /dev/zero")],
+            )
+        };
+
+        let result = runner
+            .run_streaming(
+                CommandSpec {
+                    program,
+                    args,
+                    current_dir: work_dir.path().to_path_buf(),
+                },
+                sink.clone(),
+            )
+            .await
+            .expect("stream large command output");
+
+        assert_eq!(sink.bytes.load(Ordering::SeqCst), output_bytes);
+        assert!(sink.chunks.load(Ordering::SeqCst) > 1);
+        assert!(
+            result.stdout.len()
+                <= COMMAND_CAPTURE_HEAD_BYTES
+                    + COMMAND_CAPTURE_TAIL_BYTES
+                    + COMMAND_CAPTURE_TRUNCATION_MARKER.len()
+        );
+        assert!(result.stdout.contains("命令输出已截断，仅保留开头与结尾"));
     }
 
     #[tokio::test]

@@ -1,6 +1,9 @@
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
-use crate::deploy::ComposeCommandOutput;
+use crate::{
+    deploy::ComposeCommandOutput,
+    deployment_retention::{BoundedTaskLogPreview, DeploymentLogService},
+};
 
 #[derive(Clone)]
 pub struct TaskService {
@@ -123,13 +126,45 @@ pub struct TaskDetailItem {
     pub updated_at: String,
 }
 
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskLogSource {
+    Event(i64),
+    StepOutput { live: bool },
+}
+
+impl TaskLogSource {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Event(id) => format!("日志 #{id}"),
+            Self::StepOutput { live: true } => "命令输出（实时预览）".to_owned(),
+            Self::StepOutput { live: false } => "命令输出预览".to_owned(),
+        }
+    }
+
+    fn sort_order(&self) -> i64 {
+        match self {
+            Self::Event(id) => *id,
+            Self::StepOutput { .. } => i64::MAX,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct TaskLogItem {
-    pub id: i64,
+    pub source: TaskLogSource,
     pub step_id: Option<i64>,
     pub stream: String,
     pub content: String,
     pub created_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct LegacyTaskLogRow {
+    id: i64,
+    step_id: Option<i64>,
+    stream: String,
+    content: String,
+    created_at: String,
 }
 
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -330,7 +365,7 @@ impl TaskService {
     }
 
     pub async fn task_logs(&self, task_id: i64) -> Result<Vec<TaskLogItem>, TaskError> {
-        sqlx::query_as::<_, TaskLogItem>(
+        let logs = sqlx::query_as::<_, LegacyTaskLogRow>(
             r#"
             SELECT id, step_id, stream, content, created_at
             FROM operation_task_logs
@@ -341,8 +376,51 @@ impl TaskService {
         )
         .bind(task_id)
         .fetch_all(&self.db)
-        .await
-        .map_err(TaskError::from)
+        .await?;
+        Ok(logs
+            .into_iter()
+            .map(|log| TaskLogItem {
+                source: TaskLogSource::Event(log.id),
+                step_id: log.step_id,
+                stream: log.stream,
+                content: log.content,
+                created_at: log.created_at,
+            })
+            .collect())
+    }
+
+    pub async fn task_logs_with_deployment(
+        &self,
+        task_id: i64,
+        deployment_logs: &DeploymentLogService,
+    ) -> Result<Vec<TaskLogItem>, TaskError> {
+        let mut logs = self.task_logs(task_id).await?;
+        let previews = deployment_logs
+            .task_previews(task_id)
+            .await
+            .map_err(|error| TaskError::Internal(format!("读取部署日志失败: {error}")))?;
+        for preview in previews {
+            if preview.head.is_empty()
+                && preview.tail.is_empty()
+                && preview.dropped_bytes == 0
+                && preview.preview_omitted_bytes == 0
+            {
+                continue;
+            }
+            logs.push(TaskLogItem {
+                source: TaskLogSource::StepOutput { live: preview.live },
+                step_id: Some(preview.step_id),
+                stream: "combined".to_owned(),
+                content: render_bounded_task_log(&preview),
+                created_at: preview.updated_at,
+            });
+        }
+        logs.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.source.sort_order().cmp(&right.source.sort_order()))
+        });
+        Ok(logs)
     }
 
     pub async fn task_phases(&self, task_id: i64) -> Result<Vec<TaskPhaseItem>, TaskError> {
@@ -1323,6 +1401,32 @@ fn normalize_step_status(status: &str) -> Result<&str, TaskError> {
     }
 }
 
+fn render_bounded_task_log(preview: &BoundedTaskLogPreview) -> String {
+    let mut content = Vec::with_capacity(preview.head.len() + preview.tail.len() + 256);
+    content.extend_from_slice(&preview.head);
+    if preview.preview_omitted_bytes > 0 {
+        content.extend_from_slice(
+            format!(
+                "\n\n[当前页面仅显示日志预览，省略 {} 个已保留字节]\n\n",
+                preview.preview_omitted_bytes
+            )
+            .as_bytes(),
+        );
+    }
+    if preview.truncated {
+        content.extend_from_slice(
+            format!(
+                "\n\n[日志已截断，已丢弃 {} 字节；以下为保留的结尾]\n\n",
+                preview.dropped_bytes
+            )
+            .as_bytes(),
+        );
+    }
+    content.extend_from_slice(&preview.tail);
+    String::from_utf8(content)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+}
+
 fn normalize_log_stream(stream: &str) -> Result<&str, TaskError> {
     match stream {
         "system" | "stdout" | "stderr" | "combined" => Ok(stream),
@@ -1519,6 +1623,61 @@ mod tests {
         assert!(logs.iter().any(|log| log.step_id == Some(step_id)
             && log.stream == "system"
             && log.content.contains("Compose 配置校验通过")));
+    }
+
+    #[tokio::test]
+    async fn task_logs_include_bounded_command_output_and_truncation_summary() {
+        let tasks = task_service().await;
+        let task_id = tasks
+            .create_task(CreateTaskInput {
+                task_kind: "release.deploy".to_owned(),
+                title: "Deploy verbose service".to_owned(),
+                app_id: None,
+                release_id: None,
+                node_id: None,
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect("create task");
+        let step_id = tasks
+            .start_step(StartTaskStepInput {
+                task_id,
+                node_id: None,
+                step_key: "unit.api",
+                title: "Deploy API",
+                command: "docker compose up",
+            })
+            .await
+            .expect("start step");
+        let logs = crate::deployment_retention::DeploymentLogService::with_limits(
+            tasks.db.clone(),
+            4,
+            4,
+            8,
+        );
+        logs.append(task_id, step_id, &[], b"abcdefghijklmnop")
+            .await
+            .expect("append bounded output");
+        logs.finish(task_id, step_id)
+            .await
+            .expect("finish bounded output");
+
+        let task_logs = tasks
+            .task_logs_with_deployment(task_id, &logs)
+            .await
+            .expect("load task logs");
+        let command_log = task_logs
+            .iter()
+            .find(|log| {
+                log.step_id == Some(step_id)
+                    && matches!(log.source, TaskLogSource::StepOutput { .. })
+                    && log.stream == "combined"
+            })
+            .expect("bounded command log");
+        assert!(command_log.content.contains("abcd"));
+        assert!(command_log.content.contains("mnop"));
+        assert!(command_log.content.contains("日志已截断"));
+        assert!(command_log.content.contains("8 字节"));
     }
 
     #[tokio::test]

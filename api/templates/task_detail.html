@@ -126,7 +126,7 @@
                         <article class="task-log-entry">
                           <div class="task-log-meta">
                             <span class="badge tone-{{ log.stream_tone }}">{{ log.stream }}</span>
-                            <span>#{{ log.id }} · {{ log.created_at }}</span>
+                            <span>{{ log.source_label }} · {{ log.created_at }}</span>
                           </div>
                           <pre class="code-block">{{ log.content }}</pre>
                         </article>
@@ -157,7 +157,7 @@
           <article class="task-log-entry">
             <div class="task-log-meta">
               <span class="badge tone-{{ log.stream_tone }}">{{ log.stream }}</span>
-              <span>#{{ log.id }} · {{ log.created_at }}</span>
+              <span>{{ log.source_label }} · {{ log.created_at }}</span>
             </div>
             <pre class="code-block">{{ log.content }}</pre>
           </article>

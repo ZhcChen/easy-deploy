@@ -3,6 +3,11 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use flate2::read::GzDecoder;
@@ -11,14 +16,18 @@ use sqlx::{FromRow, SqlitePool};
 use tar::Archive;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     application_config::{ApplicationConfigService, ConfigUnit},
-    deploy::{ComposeCommandOutput, ComposeExecutor, DeployError, SshExecutor, SshTarget},
+    deploy::{
+        CommandOutputSink, CommandOutputStream, ComposeCommandOutput, ComposeExecutor, DeployError,
+        DynCommandOutputSink, SshExecutor, SshTarget,
+    },
     deployment_orchestrator::{
         DeploymentAction, DeploymentUnitExecutor, UnitExecutionContext, UnitExecutionOutcome,
     },
-    deployment_retention::DeploymentLogService,
+    deployment_retention::{DeploymentLogService, StreamingRedactor, redact_log_text},
     health::{HealthCheckKind, normalize_health_config},
     platform::PlatformConfigService,
 };
@@ -38,6 +47,212 @@ pub struct ComposeDeploymentUnitExecutor {
     logs: DeploymentLogService,
     platform: PlatformConfigService,
     http: reqwest::Client,
+}
+
+struct DeploymentStepOutputSink {
+    sender: mpsc::Sender<DeploymentLogWriterMessage>,
+    dropped_bytes: Arc<AtomicU64>,
+    redactor: Mutex<StreamingRedactor>,
+}
+
+enum DeploymentLogWriterMessage {
+    Chunk(Vec<u8>),
+    Barrier(oneshot::Sender<Result<(), String>>),
+}
+
+const DEPLOYMENT_LOG_FLUSH_BYTES: usize = 1024 * 1024;
+const DEPLOYMENT_LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+const DEPLOYMENT_LOG_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
+const DEPLOYMENT_LOG_TRUNCATED_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
+const DEPLOYMENT_LOG_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(2);
+const DEPLOYMENT_LOG_WRITER_CAPACITY: usize = 256;
+const DEPLOYMENT_LOG_WRITER_CHUNK_BYTES: usize = 16 * 1024;
+
+impl DeploymentStepOutputSink {
+    fn new(logs: DeploymentLogService, task_id: i64, step_id: i64, secrets: Vec<String>) -> Self {
+        let (sender, receiver) = mpsc::channel(DEPLOYMENT_LOG_WRITER_CAPACITY);
+        let dropped_bytes = Arc::new(AtomicU64::new(0));
+        tokio::spawn(run_deployment_log_writer(
+            logs,
+            task_id,
+            step_id,
+            receiver,
+            dropped_bytes.clone(),
+        ));
+        Self {
+            sender,
+            dropped_bytes,
+            redactor: Mutex::new(StreamingRedactor::new(secrets)),
+        }
+    }
+
+    fn enqueue(&self, chunk: &[u8]) -> Result<(), DeployError> {
+        for chunk in chunk.chunks(DEPLOYMENT_LOG_WRITER_CHUNK_BYTES) {
+            match self
+                .sender
+                .try_send(DeploymentLogWriterMessage::Chunk(chunk.to_vec()))
+            {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.dropped_bytes
+                        .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(DeployError::Command(
+                        "部署步骤日志 writer 已停止".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish_redaction(&self) -> Result<(), DeployError> {
+        let final_bytes = self
+            .redactor
+            .lock()
+            .map_err(|_| DeployError::Command("部署日志脱敏器状态损坏".to_owned()))?
+            .finish();
+        self.enqueue(&final_bytes)?;
+        self.flush().await
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandOutputSink for DeploymentStepOutputSink {
+    async fn write(&self, _stream: CommandOutputStream, chunk: &[u8]) -> Result<(), DeployError> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let redacted = self
+            .redactor
+            .lock()
+            .map_err(|_| DeployError::Command("部署日志脱敏器状态损坏".to_owned()))?
+            .push(chunk);
+        self.enqueue(&redacted)
+    }
+
+    async fn flush(&self) -> Result<(), DeployError> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(DeploymentLogWriterMessage::Barrier(sender))
+            .await
+            .map_err(|_| DeployError::Command("部署步骤日志 writer 已停止".to_owned()))?;
+        receiver
+            .await
+            .map_err(|_| DeployError::Command("部署步骤日志 writer 未完成刷新".to_owned()))?
+            .map_err(|error| DeployError::Command(format!("写入部署步骤日志失败: {error}")))
+    }
+}
+
+async fn run_deployment_log_writer(
+    logs: DeploymentLogService,
+    task_id: i64,
+    step_id: i64,
+    mut receiver: mpsc::Receiver<DeploymentLogWriterMessage>,
+    dropped_bytes: Arc<AtomicU64>,
+) {
+    let mut pending = Vec::new();
+    let mut dirty = false;
+    let mut last_checkpoint = Instant::now();
+    let mut checkpoint_interval = DEPLOYMENT_LOG_CHECKPOINT_INTERVAL;
+    let mut tick = tokio::time::interval(DEPLOYMENT_LOG_FLUSH_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick.tick().await;
+
+    loop {
+        tokio::select! {
+            message = receiver.recv() => {
+                match message {
+                    Some(DeploymentLogWriterMessage::Chunk(chunk)) => {
+                        pending.extend_from_slice(&chunk);
+                        if pending.len() >= DEPLOYMENT_LOG_FLUSH_BYTES {
+                            match flush_deployment_log_buffer(
+                                &logs,
+                                task_id,
+                                step_id,
+                                &mut pending,
+                                &dropped_bytes,
+                            ).await {
+                                Ok(changed) => dirty |= changed,
+                                Err(error) => tracing::warn!(task_id, step_id, %error, "failed to buffer deployment output"),
+                            }
+                        }
+                    }
+                    Some(DeploymentLogWriterMessage::Barrier(reply)) => {
+                        let result = flush_deployment_log_buffer(
+                            &logs,
+                            task_id,
+                            step_id,
+                            &mut pending,
+                            &dropped_bytes,
+                        ).await;
+                        if result.as_ref().is_ok_and(|changed| *changed) {
+                            dirty = true;
+                        }
+                        let _ = reply.send(result.map(|_| ()));
+                    }
+                    None => break,
+                }
+            }
+            _ = tick.tick() => {
+                match flush_deployment_log_buffer(
+                    &logs,
+                    task_id,
+                    step_id,
+                    &mut pending,
+                    &dropped_bytes,
+                ).await {
+                    Ok(changed) => dirty |= changed,
+                    Err(error) => tracing::warn!(task_id, step_id, %error, "failed to buffer deployment output"),
+                }
+                if dirty && last_checkpoint.elapsed() >= checkpoint_interval {
+                    match tokio::time::timeout(
+                        DEPLOYMENT_LOG_CHECKPOINT_TIMEOUT,
+                        logs.checkpoint(task_id, step_id),
+                    ).await {
+                        Ok(Ok(snapshot)) => {
+                            dirty = false;
+                            last_checkpoint = Instant::now();
+                            checkpoint_interval = if snapshot.truncated {
+                                DEPLOYMENT_LOG_TRUNCATED_CHECKPOINT_INTERVAL
+                            } else {
+                                DEPLOYMENT_LOG_CHECKPOINT_INTERVAL
+                            };
+                        }
+                        Ok(Err(error)) => tracing::warn!(task_id, step_id, %error, "failed to checkpoint deployment output"),
+                        Err(_) => tracing::warn!(task_id, step_id, "timed out checkpointing deployment output"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn flush_deployment_log_buffer(
+    logs: &DeploymentLogService,
+    task_id: i64,
+    step_id: i64,
+    pending: &mut Vec<u8>,
+    dropped_bytes: &AtomicU64,
+) -> Result<bool, String> {
+    let mut changed = false;
+    if !pending.is_empty() {
+        logs.append_buffered(task_id, step_id, &[], pending)
+            .await
+            .map_err(|error| error.to_string())?;
+        pending.clear();
+        changed = true;
+    }
+    let dropped = dropped_bytes.swap(0, Ordering::AcqRel);
+    if dropped > 0 {
+        if let Err(error) = logs.record_dropped(task_id, step_id, &[], dropped).await {
+            dropped_bytes.fetch_add(dropped, Ordering::Release);
+            return Err(error.to_string());
+        }
+        changed = true;
+    }
+    Ok(changed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,7 +341,6 @@ pub struct PreparedUnitRuntime {
 pub struct UnitNodeExecutionResult {
     pub success: bool,
     pub summary: String,
-    pub outputs: Vec<ComposeCommandOutput>,
 }
 
 #[derive(Debug, Clone, FromRow, PartialEq, Eq)]
@@ -383,6 +597,10 @@ impl ComposeDeploymentUnitExecutor {
     ) -> Result<String, DeploymentRuntimeError> {
         let mut spec = self.runtime.load_unit_spec(context).await?;
         let result = self.execute_spec(context, &mut spec).await;
+        let result = merge_execution_and_log_finish(
+            result,
+            self.logs.finish(context.task_id, context.step_id).await,
+        );
         let cleanup = cleanup_execution_staging(&self.staging_root, context, &spec).await;
         merge_execution_and_cleanup(result, cleanup)
     }
@@ -397,47 +615,50 @@ impl ComposeDeploymentUnitExecutor {
         ensure_not_canceled(context)?;
         let prepared = prepare_unit_runtime(spec, &self.staging_root).await?;
         ensure_not_canceled(context)?;
-        let compose = self.compose.with_cancellation(context.cancellation.clone());
-        let ssh = self.ssh.with_cancellation(context.cancellation.clone());
         let secrets = spec
             .environment_variables
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let mut summaries = Vec::new();
-        for node in &spec.target_nodes {
-            ensure_not_canceled(context)?;
-            let result =
-                execute_prepared_unit_on_node(spec, &prepared, node, &compose, &ssh).await?;
-            summaries.push(result.summary.clone());
-            for output in &result.outputs {
-                let rendered = format!("$ {}\n{}\n", output.command, output.output);
-                self.logs
-                    .append(
-                        context.task_id,
-                        context.step_id,
-                        &secrets,
-                        rendered.as_bytes(),
-                    )
+        let step_output_sink = Arc::new(DeploymentStepOutputSink::new(
+            self.logs.clone(),
+            context.task_id,
+            context.step_id,
+            secrets.clone(),
+        ));
+        let output_sink: DynCommandOutputSink = step_output_sink.clone();
+        let compose = self
+            .compose
+            .with_cancellation(context.cancellation.clone())
+            .with_output_sink(output_sink.clone());
+        let ssh = self
+            .ssh
+            .with_cancellation(context.cancellation.clone())
+            .with_output_sink(output_sink);
+        let result = async {
+            let mut summaries = Vec::new();
+            for node in &spec.target_nodes {
+                ensure_not_canceled(context)?;
+                let result = execute_prepared_unit_on_node(spec, &prepared, node, &compose, &ssh)
                     .await
-                    .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
+                    .map_err(|error| redact_runtime_error(error, &secrets))?;
+                let result = redact_node_execution_result(result, &secrets);
+                summaries.push(result.summary.clone());
+                if !result.success {
+                    return Err(DeploymentRuntimeError::Validation(format!(
+                        "节点 {} 执行失败：{}",
+                        node.node_key, result.summary
+                    )));
+                }
             }
-            if !result.success {
-                self.logs
-                    .finish(context.task_id, context.step_id)
-                    .await
-                    .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
-                return Err(DeploymentRuntimeError::Validation(format!(
-                    "节点 {} 执行失败：{}",
-                    node.node_key, result.summary
-                )));
-            }
+            Ok(summaries.join("；"))
         }
-        self.logs
-            .finish(context.task_id, context.step_id)
+        .await;
+        let finish = step_output_sink
+            .finish_redaction()
             .await
-            .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
-        Ok(summaries.join("；"))
+            .map_err(DeploymentRuntimeError::from);
+        merge_execution_and_output_finish(result, finish)
     }
 
     async fn materialize_oss_release(
@@ -545,6 +766,69 @@ impl ComposeDeploymentUnitExecutor {
         release.package_path = destination;
         release.storage_provider = "local".to_owned();
         Ok(())
+    }
+}
+
+fn redact_runtime_error(
+    error: DeploymentRuntimeError,
+    secrets: &[String],
+) -> DeploymentRuntimeError {
+    let message = redact_log_text(secrets, &error.to_string());
+    match error {
+        DeploymentRuntimeError::Validation(_) => DeploymentRuntimeError::Validation(message),
+        DeploymentRuntimeError::NotFound(_) => DeploymentRuntimeError::NotFound(message),
+        DeploymentRuntimeError::Config(_) => DeploymentRuntimeError::Config(message),
+        DeploymentRuntimeError::Database(_) => DeploymentRuntimeError::Database(message),
+        DeploymentRuntimeError::Canceled(_) => DeploymentRuntimeError::Canceled(message),
+    }
+}
+
+fn redact_node_execution_result(
+    mut result: UnitNodeExecutionResult,
+    secrets: &[String],
+) -> UnitNodeExecutionResult {
+    result.summary = redact_log_text(secrets, &result.summary);
+    result
+}
+
+fn merge_execution_and_log_finish(
+    result: Result<String, DeploymentRuntimeError>,
+    finish: Result<
+        crate::deployment_retention::BoundedLogSnapshot,
+        crate::deployment_retention::DeploymentRetentionError,
+    >,
+) -> Result<String, DeploymentRuntimeError> {
+    match (result, finish) {
+        (Ok(summary), Ok(_)) => Ok(summary),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(error)) => Err(DeploymentRuntimeError::Database(format!(
+            "部署完成，但步骤日志收口失败：{error}"
+        ))),
+        (Err(DeploymentRuntimeError::Canceled(message)), Err(log_error)) => Err(
+            DeploymentRuntimeError::Canceled(format!("{message}；步骤日志收口失败：{log_error}")),
+        ),
+        (Err(error), Err(log_error)) => Err(DeploymentRuntimeError::Database(format!(
+            "部署失败：{error}；步骤日志收口失败：{log_error}"
+        ))),
+    }
+}
+
+fn merge_execution_and_output_finish(
+    result: Result<String, DeploymentRuntimeError>,
+    finish: Result<(), DeploymentRuntimeError>,
+) -> Result<String, DeploymentRuntimeError> {
+    match (result, finish) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(DeploymentRuntimeError::Canceled(message)), Err(output_error)) => {
+            Err(DeploymentRuntimeError::Canceled(format!(
+                "{message}；部署日志脱敏收口失败：{output_error}"
+            )))
+        }
+        (Err(error), Err(output_error)) => Err(DeploymentRuntimeError::Database(format!(
+            "部署失败：{error}；部署日志脱敏收口失败：{output_error}"
+        ))),
     }
 }
 
@@ -737,7 +1021,6 @@ pub async fn execute_prepared_unit_on_node(
     ssh: &SshExecutor,
 ) -> Result<UnitNodeExecutionResult, DeploymentRuntimeError> {
     let work_dir = validated_target_work_dir(&spec.unit.work_dir)?;
-    let mut outputs = Vec::new();
     let ssh_target = if node.node_type == "ssh" {
         Some(
             SshTarget::new(&node.ssh_user, &node.address, node.ssh_port)
@@ -762,7 +1045,7 @@ pub async fn execute_prepared_unit_on_node(
     if spec.action != DeploymentAction::Stop {
         match &ssh_target {
             Some(target) => {
-                sync_runtime_to_ssh(prepared, target, ssh, &work_dir, &mut outputs).await?;
+                sync_runtime_to_ssh(prepared, target, ssh, &work_dir).await?;
             }
             None => copy_runtime_tree(&prepared.root, Path::new(&work_dir)).await?,
         }
@@ -777,7 +1060,7 @@ pub async fn execute_prepared_unit_on_node(
             &work_dir,
         )
         .await?;
-        return result_from_output(output, outputs, "Compose 服务已停止");
+        return Ok(result_from_output(output, "Compose 服务已停止"));
     }
 
     let env = execution_environment(spec);
@@ -795,13 +1078,8 @@ pub async fn execute_prepared_unit_on_node(
             .await?;
             let success = output.success;
             let summary = command_summary(&output, &format!("脚本 {slot} 执行失败"));
-            outputs.push(output);
             if !success {
-                return Ok(UnitNodeExecutionResult {
-                    success,
-                    summary,
-                    outputs,
-                });
+                return Ok(UnitNodeExecutionResult { success, summary });
             }
         } else if slot == "deploy" {
             let output = run_compose_action(
@@ -815,13 +1093,8 @@ pub async fn execute_prepared_unit_on_node(
             .await?;
             let success = output.success;
             let summary = command_summary(&output, "Docker Compose 部署失败");
-            outputs.push(output);
             if !success {
-                return Ok(UnitNodeExecutionResult {
-                    success,
-                    summary,
-                    outputs,
-                });
+                return Ok(UnitNodeExecutionResult { success, summary });
             }
         }
     }
@@ -836,14 +1109,10 @@ pub async fn execute_prepared_unit_on_node(
         &work_dir,
     )
     .await?;
-    if let Some(output) = health_result.output {
-        outputs.push(output);
-    }
     if !health_result.healthy {
         return Ok(UnitNodeExecutionResult {
             success: false,
             summary: health_result.message,
-            outputs,
         });
     }
 
@@ -861,27 +1130,20 @@ pub async fn execute_prepared_unit_on_node(
             .await?;
             let success = output.success;
             let summary = command_summary(&output, &format!("脚本 {slot} 执行失败"));
-            outputs.push(output);
             if !success {
-                return Ok(UnitNodeExecutionResult {
-                    success,
-                    summary,
-                    outputs,
-                });
+                return Ok(UnitNodeExecutionResult { success, summary });
             }
         }
     }
     Ok(UnitNodeExecutionResult {
         success: true,
         summary: format!("节点 {} 部署成功：{}", node.node_key, health_result.message),
-        outputs,
     })
 }
 
 struct NodeHealthResult {
     healthy: bool,
     message: String,
-    output: Option<ComposeCommandOutput>,
 }
 
 async fn run_node_health_check(
@@ -913,14 +1175,12 @@ async fn run_node_health_check(
             } else {
                 command_summary(&output, "容器运行状态检查失败")
             },
-            output: Some(output),
         });
     }
     if config.kind == HealthCheckKind::None {
         return Ok(NodeHealthResult {
             healthy: true,
             message: "未配置健康检查".to_owned(),
-            output: None,
         });
     }
     if let Some(target) = target {
@@ -964,11 +1224,7 @@ async fn run_node_health_check(
         } else {
             command_summary(&output, &format!("{} 健康检查失败", config.kind.label()))
         };
-        return Ok(NodeHealthResult {
-            healthy,
-            message,
-            output: Some(output),
-        });
+        return Ok(NodeHealthResult { healthy, message });
     }
     if config.kind == HealthCheckKind::SystemdActive {
         return Err(DeploymentRuntimeError::Validation(
@@ -983,7 +1239,6 @@ async fn run_node_health_check(
     Ok(NodeHealthResult {
         healthy: outcome.healthy,
         message: outcome.message,
-        output: None,
     })
 }
 
@@ -1053,7 +1308,6 @@ async fn sync_runtime_to_ssh(
     target: &SshTarget,
     ssh: &SshExecutor,
     remote_root: &str,
-    outputs: &mut Vec<ComposeCommandOutput>,
 ) -> Result<(), DeploymentRuntimeError> {
     let files = collect_runtime_files(&prepared.root)?;
     for (local_path, relative_path) in files {
@@ -1072,7 +1326,6 @@ async fn sync_runtime_to_ssh(
                 "SSH 创建部署目录失败",
             )));
         }
-        outputs.push(mkdir);
         let copy = ssh
             .copy_file(target, prepared.root.clone(), local_path, &remote_path)
             .await
@@ -1083,7 +1336,6 @@ async fn sync_runtime_to_ssh(
                 "SSH 同步部署文件失败",
             )));
         }
-        outputs.push(copy);
     }
     Ok(())
 }
@@ -1211,21 +1463,15 @@ fn validated_target_work_dir(work_dir: &str) -> Result<String, DeploymentRuntime
 
 fn result_from_output(
     output: ComposeCommandOutput,
-    mut outputs: Vec<ComposeCommandOutput>,
     success_message: &str,
-) -> Result<UnitNodeExecutionResult, DeploymentRuntimeError> {
+) -> UnitNodeExecutionResult {
     let success = output.success;
     let summary = if success {
         success_message.to_owned()
     } else {
         command_summary(&output, "Docker Compose 命令失败")
     };
-    outputs.push(output);
-    Ok(UnitNodeExecutionResult {
-        success,
-        summary,
-        outputs,
-    })
+    UnitNodeExecutionResult { success, summary }
 }
 
 fn command_summary(output: &ComposeCommandOutput, fallback: &str) -> String {
@@ -1359,6 +1605,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use flate2::{Compression, write::GzEncoder};
+    use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
@@ -1393,6 +1640,129 @@ mod tests {
             environment_variables(&values, "production", "api"),
             BTreeMap::from([("DATABASE_URL".to_owned(), "prod".to_owned())])
         );
+    }
+
+    #[test]
+    fn deployment_result_and_error_summaries_are_redacted() {
+        let secrets = vec!["very-sensitive-value".to_owned()];
+        let result = redact_node_execution_result(
+            UnitNodeExecutionResult {
+                success: false,
+                summary: "deploy failed with very-sensitive-value".to_owned(),
+            },
+            &secrets,
+        );
+        assert!(!result.summary.contains("very-sensitive-value"));
+
+        let error = redact_runtime_error(
+            DeploymentRuntimeError::Validation(
+                "command env TOKEN=very-sensitive-value failed".to_owned(),
+            ),
+            &secrets,
+        );
+        assert!(!error.to_string().contains("very-sensitive-value"));
+        assert!(error.to_string().contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn deployment_output_sink_redacts_secrets_across_chunks() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect database");
+        sqlx::migrate!("./migrations")
+            .run(&db)
+            .await
+            .expect("run migrations");
+        let task_id = sqlx::query(
+            "INSERT INTO operation_tasks(task_kind, title, status, created_by) VALUES ('release.deploy', 'stream logs', 'running', 'admin')",
+        )
+        .execute(&db)
+        .await
+        .expect("create task")
+        .last_insert_rowid();
+        let step_id = sqlx::query(
+            "INSERT INTO operation_task_steps(task_id, step_no, step_key, title, status) VALUES (?1, 1, 'unit-api', 'Deploy API', 'running')",
+        )
+        .bind(task_id)
+        .execute(&db)
+        .await
+        .expect("create step")
+        .last_insert_rowid();
+        let logs = DeploymentLogService::with_limits(db, 1024, 1024, 2048);
+        let sink = DeploymentStepOutputSink::new(
+            logs.clone(),
+            task_id,
+            step_id,
+            vec!["very-sensitive-value".to_owned()],
+        );
+
+        sink.write(CommandOutputStream::Stdout, b"token=very-sensi")
+            .await
+            .expect("write first chunk");
+        sink.write(
+            CommandOutputStream::Stdout,
+            b"tive-value\npassword=hunter2\nready\n",
+        )
+        .await
+        .expect("write second chunk");
+        sink.finish_redaction().await.expect("finish output sink");
+        let snapshot = logs.finish(task_id, step_id).await.expect("finish log");
+        let stored =
+            String::from_utf8_lossy(&[snapshot.head.as_slice(), snapshot.tail.as_slice()].concat())
+                .into_owned();
+        assert!(!stored.contains("very-sensitive-value"));
+        assert!(!stored.contains("hunter2"));
+        assert!(stored.contains("[REDACTED]"));
+        assert!(stored.contains("ready"));
+    }
+
+    #[tokio::test]
+    async fn deployment_output_sink_drops_with_accounting_instead_of_backpressuring() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect database");
+        sqlx::migrate!("./migrations")
+            .run(&db)
+            .await
+            .expect("run migrations");
+        let task_id = sqlx::query(
+            "INSERT INTO operation_tasks(task_kind, title, status, created_by) VALUES ('release.deploy', 'backpressure', 'running', 'admin')",
+        )
+        .execute(&db)
+        .await
+        .expect("create task")
+        .last_insert_rowid();
+        let step_id = sqlx::query(
+            "INSERT INTO operation_task_steps(task_id, step_no, step_key, title, status) VALUES (?1, 1, 'unit-api', 'Deploy API', 'running')",
+        )
+        .bind(task_id)
+        .execute(&db)
+        .await
+        .expect("create step")
+        .last_insert_rowid();
+        let logs =
+            DeploymentLogService::with_limits(db.clone(), 8 * 1024 * 1024, 0, 8 * 1024 * 1024);
+        let held_connection = db.acquire().await.expect("hold only database connection");
+        let sink = DeploymentStepOutputSink::new(logs.clone(), task_id, step_id, vec![]);
+        let chunk = vec![b'x'; DEPLOYMENT_LOG_WRITER_CHUNK_BYTES];
+
+        for _ in 0..400 {
+            sink.write(CommandOutputStream::Stdout, &chunk)
+                .await
+                .expect("queue output");
+        }
+        assert!(sink.dropped_bytes.load(Ordering::Acquire) > 0);
+
+        drop(held_connection);
+        sink.finish_redaction().await.expect("finish output sink");
+        let snapshot = logs.finish(task_id, step_id).await.expect("finish log");
+        assert!(snapshot.truncated);
+        assert!(snapshot.dropped_bytes > 0);
+        assert!(snapshot.stored_bytes <= 8 * 1024 * 1024);
     }
 
     #[tokio::test]
@@ -1498,7 +1868,6 @@ mod tests {
             .await
             .expect("execute prepared runtime");
         assert!(result.success);
-        assert_eq!(result.outputs.len(), 5);
         assert!(target_work_dir.join("compose.yaml").is_file());
         assert!(target_work_dir.join("release.txt").is_file());
         {

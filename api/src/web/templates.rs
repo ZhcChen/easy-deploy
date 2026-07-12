@@ -1353,7 +1353,7 @@ pub struct TaskNodeResultRow<'a> {
 
 #[derive(Clone)]
 pub struct TaskLogRow<'a> {
-    pub id: i64,
+    pub source_label: String,
     pub stream: &'a str,
     pub stream_tone: &'a str,
     pub content: &'a str,
