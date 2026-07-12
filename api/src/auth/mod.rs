@@ -9,8 +9,9 @@ pub use permissions::{
     ARTIFACTS_VIEW, AUDIT_VIEW, DASHBOARD_VIEW, NODE_CREDENTIALS_MANAGE, NODE_CREDENTIALS_VIEW,
     NODES_INSTALL, NODES_MANAGE, NODES_VIEW, PROFILE_VIEW, PermissionDef, PermissionResourceType,
     PermissionView, RBAC_ACCOUNTS_VIEW, RBAC_PERMISSIONS_VIEW, RBAC_ROLES_VIEW, RBAC_SESSIONS_VIEW,
-    SERVICES_DEPLOY, SERVICES_LOGS, SERVICES_VIEW, SETTINGS_UPDATE, SETTINGS_VIEW, TASKS_RETRY,
-    TASKS_VIEW, TEMPLATES_VIEW, all_permissions, nav_permission, permission_dependencies,
+    SERVICES_DEPLOY, SERVICES_DEPLOY_CANCEL, SERVICES_DEPLOY_RECONCILE, SERVICES_LOGS,
+    SERVICES_VIEW, SETTINGS_UPDATE, SETTINGS_VIEW, TASKS_RETRY, TASKS_VIEW, TEMPLATES_VIEW,
+    all_permissions, nav_permission, permission_dependencies,
 };
 pub use service::{
     AccountListItem, ApiTokenAuthSession, ApiTokenListItem, AuditLogFilter, AuthAccount, AuthError,

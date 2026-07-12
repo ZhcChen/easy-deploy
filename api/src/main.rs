@@ -161,14 +161,20 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
     let deployment_orchestrator = DeploymentOrchestratorService::new(db.clone());
     let deployment_logs = DeploymentLogService::new(db.clone());
     let deployment_retention = DeploymentRetentionService::new(db.clone());
-    let reconciled_runs = deployment_orchestrator
+    let interrupted_recovery = deployment_orchestrator
         .reconcile_interrupted_runs()
         .await
         .context("reconcile interrupted environment deployments")?;
-    if reconciled_runs > 0 {
+    if interrupted_recovery.reconciling_runs > 0 {
         tracing::warn!(
-            reconciled_runs,
+            reconciled_runs = interrupted_recovery.reconciling_runs,
             "environment deployments require operator reconciliation after restart"
+        );
+    }
+    if interrupted_recovery.canceled_queued_runs > 0 {
+        tracing::info!(
+            canceled_runs = interrupted_recovery.canceled_queued_runs,
+            "queued environment deployments were canceled after restart"
         );
     }
     let application_config = if settings.config_master_keys.trim().is_empty() {

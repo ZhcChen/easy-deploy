@@ -1,4 +1,5 @@
 use std::{
+    future::pending,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -6,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tokio::{fs, io::AsyncWriteExt, process::Command, time::timeout};
+use tokio::{fs, io::AsyncWriteExt, process::Command, sync::watch, time::timeout};
 
 use crate::settings::DEFAULT_COMMAND_TIMEOUT_SECS;
 
@@ -16,12 +17,15 @@ pub type DynCommandRunner = Arc<dyn CommandRunner>;
 pub enum DeployError {
     InvalidInput(String),
     Command(String),
+    Canceled(String),
 }
 
 impl DeployError {
     pub fn message(&self) -> &str {
         match self {
-            Self::InvalidInput(message) | Self::Command(message) => message,
+            Self::InvalidInput(message) | Self::Command(message) | Self::Canceled(message) => {
+                message
+            }
         }
     }
 }
@@ -48,6 +52,44 @@ pub struct CommandResult {
     pub stderr: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct CancellationSignal {
+    sender: watch::Sender<bool>,
+}
+
+impl CancellationSignal {
+    pub fn new() -> Self {
+        let (sender, _) = watch::channel(false);
+        Self { sender }
+    }
+
+    pub fn cancel(&self) -> bool {
+        !self.sender.send_replace(true)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.sender.borrow()
+    }
+
+    pub async fn cancelled(&self) {
+        let mut receiver = self.sender.subscribe();
+        if *receiver.borrow_and_update() {
+            return;
+        }
+        while receiver.changed().await.is_ok() {
+            if *receiver.borrow_and_update() {
+                return;
+            }
+        }
+    }
+}
+
+impl Default for CancellationSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CommandResult {
     pub fn success(&self) -> bool {
         self.status_code == Some(0)
@@ -68,6 +110,23 @@ impl CommandResult {
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
     async fn run(&self, spec: CommandSpec) -> Result<CommandResult, DeployError>;
+
+    async fn run_cancellable(
+        &self,
+        spec: CommandSpec,
+        cancellation: CancellationSignal,
+    ) -> Result<CommandResult, DeployError> {
+        let command = render_command(&spec.program, &spec.args);
+        if cancellation.is_cancelled() {
+            return Err(DeployError::Canceled(format!(
+                "命令 {command} 在启动前已取消"
+            )));
+        }
+        tokio::select! {
+            result = self.run(spec) => result,
+            _ = cancellation.cancelled() => Err(DeployError::Canceled(format!("命令 {command} 已取消"))),
+        }
+    }
 }
 
 pub struct TokioCommandRunner {
@@ -91,20 +150,74 @@ impl Default for TokioCommandRunner {
 #[async_trait]
 impl CommandRunner for TokioCommandRunner {
     async fn run(&self, spec: CommandSpec) -> Result<CommandResult, DeployError> {
+        self.run_process(spec, None).await
+    }
+
+    async fn run_cancellable(
+        &self,
+        spec: CommandSpec,
+        cancellation: CancellationSignal,
+    ) -> Result<CommandResult, DeployError> {
+        self.run_process(spec, Some(&cancellation)).await
+    }
+}
+
+impl TokioCommandRunner {
+    async fn run_process(
+        &self,
+        spec: CommandSpec,
+        cancellation: Option<&CancellationSignal>,
+    ) -> Result<CommandResult, DeployError> {
         let command = render_command(&spec.program, &spec.args);
-        let child = Command::new(&spec.program)
+        if cancellation.is_some_and(CancellationSignal::is_cancelled) {
+            return Err(DeployError::Canceled(format!(
+                "命令 {command} 在启动前已取消"
+            )));
+        }
+        let mut process = Command::new(&spec.program);
+        process
             .args(&spec.args)
             .current_dir(&spec.current_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            process.as_std_mut().process_group(0);
+        }
+        let child = process
             .spawn()
             .map_err(|err| DeployError::Command(format!("执行命令 {command} 失败: {err}")))?;
-        let output = match timeout(self.timeout, child.wait_with_output()).await {
-            Ok(output) => output
+        let process_id = child.id();
+        let mut wait = Box::pin(child.wait_with_output());
+        let deadline = tokio::time::sleep(self.timeout);
+        tokio::pin!(deadline);
+        enum Completion {
+            Finished(std::io::Result<std::process::Output>),
+            Canceled,
+            TimedOut,
+        }
+        let completion = tokio::select! {
+            output = &mut wait => Completion::Finished(output),
+            _ = wait_for_cancellation(cancellation) => Completion::Canceled,
+            _ = &mut deadline => Completion::TimedOut,
+        };
+        let output = match completion {
+            Completion::Finished(output) => output
                 .map_err(|err| DeployError::Command(format!("执行命令 {command} 失败: {err}")))?,
-            Err(_) => {
+            Completion::Canceled => {
+                terminate_process(process_id, false).await;
+                if timeout(Duration::from_secs(5), &mut wait).await.is_err() {
+                    terminate_process(process_id, true).await;
+                    let _ = timeout(Duration::from_secs(5), &mut wait).await;
+                }
+                return Err(DeployError::Canceled(format!("命令 {command} 已取消")));
+            }
+            Completion::TimedOut => {
+                terminate_process(process_id, true).await;
+                let _ = timeout(Duration::from_secs(5), &mut wait).await;
                 return Err(DeployError::Command(format!(
                     "执行命令 {command} 超时（{} 秒）",
                     self.timeout.as_secs()
@@ -116,6 +229,48 @@ impl CommandRunner for TokioCommandRunner {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         })
+    }
+}
+
+async fn wait_for_cancellation(cancellation: Option<&CancellationSignal>) {
+    match cancellation {
+        Some(cancellation) => cancellation.cancelled().await,
+        None => pending::<()>().await,
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_process(process_id: Option<u32>, force: bool) {
+    let Some(process_id) = process_id else {
+        return;
+    };
+    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+    // The child starts in its own process group, so scripts and their local descendants stop together.
+    let result = unsafe { libc::kill(-(process_id as i32), signal) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            tracing::warn!(process_id, force, error = %error, "failed to signal deployment command process group");
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn terminate_process(process_id: Option<u32>, _force: bool) {
+    let Some(process_id) = process_id else {
+        return;
+    };
+    let mut command = Command::new("taskkill");
+    command
+        .arg("/PID")
+        .arg(process_id.to_string())
+        .arg("/T")
+        .arg("/F")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Err(error) = command.status().await {
+        tracing::warn!(process_id, error = %error, "failed to terminate deployment command process tree");
     }
 }
 
@@ -134,6 +289,31 @@ pub struct SystemdExecutor {
 pub struct SshExecutor {
     runner: DynCommandRunner,
     known_hosts_file: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct CancellableCommandRunner {
+    runner: DynCommandRunner,
+    cancellation: CancellationSignal,
+}
+
+#[async_trait]
+impl CommandRunner for CancellableCommandRunner {
+    async fn run(&self, spec: CommandSpec) -> Result<CommandResult, DeployError> {
+        self.runner
+            .run_cancellable(spec, self.cancellation.clone())
+            .await
+    }
+}
+
+fn cancellable_runner(
+    runner: &DynCommandRunner,
+    cancellation: CancellationSignal,
+) -> DynCommandRunner {
+    Arc::new(CancellableCommandRunner {
+        runner: runner.clone(),
+        cancellation,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -168,6 +348,10 @@ pub fn ssh_known_hosts_file(data_dir: impl AsRef<Path>) -> PathBuf {
 impl ComposeExecutor {
     pub fn new(runner: DynCommandRunner) -> Self {
         Self { runner }
+    }
+
+    pub fn with_cancellation(&self, cancellation: CancellationSignal) -> Self {
+        Self::new(cancellable_runner(&self.runner, cancellation))
     }
 
     pub async fn docker_info(
@@ -635,6 +819,13 @@ impl SshExecutor {
     pub fn with_known_hosts_file(mut self, known_hosts_file: impl Into<PathBuf>) -> Self {
         self.known_hosts_file = Some(known_hosts_file.into());
         self
+    }
+
+    pub fn with_cancellation(&self, cancellation: CancellationSignal) -> Self {
+        Self {
+            runner: cancellable_runner(&self.runner, cancellation),
+            known_hosts_file: self.known_hosts_file.clone(),
+        }
     }
 
     pub async fn mkdir_all(
@@ -1781,6 +1972,55 @@ mod tests {
 
         assert!(err.message().contains("超时"));
         assert!(err.message().contains("1 秒"));
+    }
+
+    #[tokio::test]
+    async fn tokio_command_runner_cancels_running_process() {
+        let work_dir = tempdir().expect("temp dir");
+        let runner = Arc::new(TokioCommandRunner::new(30));
+        let cancellation = CancellationSignal::new();
+        let (program, args) = if cfg!(windows) {
+            (
+                "powershell".to_owned(),
+                vec![
+                    "-NoProfile".to_owned(),
+                    "-Command".to_owned(),
+                    "Start-Sleep -Seconds 20".to_owned(),
+                ],
+            )
+        } else {
+            (
+                "sh".to_owned(),
+                vec!["-c".to_owned(), "sleep 20".to_owned()],
+            )
+        };
+        let handle = tokio::spawn({
+            let runner = runner.clone();
+            let cancellation = cancellation.clone();
+            let current_dir = work_dir.path().to_path_buf();
+            async move {
+                runner
+                    .run_cancellable(
+                        CommandSpec {
+                            program,
+                            args,
+                            current_dir,
+                        },
+                        cancellation,
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(cancellation.cancel());
+
+        let error = timeout(Duration::from_secs(8), handle)
+            .await
+            .expect("canceled command must stop within grace period")
+            .expect("command task must not panic")
+            .expect_err("canceled command must fail");
+
+        assert!(matches!(error, DeployError::Canceled(_)));
     }
 
     #[tokio::test]

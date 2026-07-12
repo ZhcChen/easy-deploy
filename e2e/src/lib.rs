@@ -2711,7 +2711,8 @@ async fn run_checks(
         "successful task detail should not render retry action"
     );
     anyhow::ensure!(
-        !task_detail.contains("http-equiv=\"refresh\""),
+        !task_detail.contains("http-equiv=\"refresh\"")
+            && !task_detail.contains("data-task-auto-refresh"),
         "completed task detail should not keep auto-refreshing"
     );
     sqlx::query(
@@ -2734,9 +2735,10 @@ async fn run_checks(
         .text()
         .await?;
     anyhow::ensure!(
-        running_task_detail.contains("http-equiv=\"refresh\" content=\"3\"")
+        running_task_detail.contains("data-task-auto-refresh=\"3000\"")
+            && !running_task_detail.contains("http-equiv=\"refresh\"")
             && running_task_detail.contains("docker compose up -d --remove-orphans"),
-        "running task detail should auto-refresh while execution is in progress"
+        "running task detail should use dialog-safe auto-refresh while execution is in progress"
     );
     sqlx::query(
         r#"

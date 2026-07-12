@@ -670,6 +670,12 @@ impl TaskService {
                 finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE id = ?1 AND status = 'queued'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM environment_deployment_runs runs
+                  WHERE runs.task_id = operation_tasks.id
+                    AND runs.status IN ('queued', 'running', 'reconciling')
+              )
             "#,
         )
         .bind(task_id)
@@ -677,6 +683,22 @@ impl TaskService {
         .execute(&self.db)
         .await?;
         if result.rows_affected() == 0 {
+            let active_deployment: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM environment_deployment_runs
+                    WHERE task_id = ?1 AND status IN ('queued', 'running', 'reconciling')
+                )
+                "#,
+            )
+            .bind(task_id)
+            .fetch_one(&self.db)
+            .await?;
+            if active_deployment {
+                return Err(TaskError::InvalidState(
+                    "环境部署任务必须通过部署取消入口处理".to_owned(),
+                ));
+            }
             let status = self.raw_status(task_id).await?;
             return Err(TaskError::InvalidState(format!(
                 "任务当前状态为 {status}，只能取消等待中的任务"

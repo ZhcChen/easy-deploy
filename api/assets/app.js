@@ -171,6 +171,30 @@
     }, 180);
   };
 
+  const initTaskAutoRefresh = () => {
+    const root = document.querySelector("[data-task-auto-refresh]");
+    if (!root) return;
+
+    const configuredDelay = Number(root.getAttribute("data-task-auto-refresh"));
+    const delay = Number.isFinite(configuredDelay)
+      ? Math.max(1000, configuredDelay)
+      : 3000;
+    const schedule = () => window.setTimeout(refresh, delay);
+    const refresh = () => {
+      const modalOpen = document.querySelector("dialog.modal-dialog[open]");
+      const submitting = document.querySelector(
+        '[data-single-submit][data-submitting="true"]',
+      );
+      if (modalOpen || submitting) {
+        schedule();
+        return;
+      }
+      window.location.reload();
+    };
+
+    schedule();
+  };
+
   const textForCopy = (target) => {
     if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
       return target.value;
@@ -1122,6 +1146,18 @@
   document.addEventListener("submit", (event) => {
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
+    if (form.matches("[data-single-submit]")) {
+      if (form.dataset.submitting === "true") {
+        event.preventDefault();
+        return;
+      }
+      form.dataset.submitting = "true";
+      const submitter = event.submitter;
+      if (submitter instanceof HTMLButtonElement) {
+        submitter.disabled = true;
+        submitter.setAttribute("aria-busy", "true");
+      }
+    }
     if (!form.matches("[data-node-check-form]")) return;
 
     event.preventDefault();
@@ -1242,5 +1278,6 @@
   observeEast8Timestamps();
   initSearchableSelects();
   initHostMetrics();
+  initTaskAutoRefresh();
   openHashModal();
 })();

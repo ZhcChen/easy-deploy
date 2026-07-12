@@ -39,6 +39,8 @@ pub const APPS_UPDATE: &str = "apps.update";
 pub const APPS_STATUS: &str = "apps.status";
 pub const SERVICES_VIEW: &str = "services.view";
 pub const SERVICES_DEPLOY: &str = "services.deploy";
+pub const SERVICES_DEPLOY_CANCEL: &str = "services.deploy.cancel";
+pub const SERVICES_DEPLOY_RECONCILE: &str = "services.deploy.reconcile";
 pub const SERVICES_LOGS: &str = "services.logs";
 pub const TASKS_RETRY: &str = "tasks.retry";
 pub const NODES_VIEW: &str = "nodes.view";
@@ -117,6 +119,22 @@ pub fn all_permissions() -> &'static [PermissionDef] {
             description: "发起服务部署任务。",
             resource_type: PermissionResourceType::Action,
             resource_key: SERVICES_DEPLOY,
+            module: "服务",
+        },
+        PermissionDef {
+            key: SERVICES_DEPLOY_CANCEL,
+            name: "取消部署",
+            description: "终止运行中的环境部署并保留目标状态未知记录。",
+            resource_type: PermissionResourceType::Action,
+            resource_key: SERVICES_DEPLOY_CANCEL,
+            module: "服务",
+        },
+        PermissionDef {
+            key: SERVICES_DEPLOY_RECONCILE,
+            name: "核对并解锁部署",
+            description: "人工确认中断的远端执行已停止并释放环境部署锁。",
+            resource_type: PermissionResourceType::Action,
+            resource_key: SERVICES_DEPLOY_RECONCILE,
             module: "服务",
         },
         PermissionDef {
@@ -341,7 +359,10 @@ pub fn all_permissions() -> &'static [PermissionDef] {
 pub fn permission_dependencies(permission_key: &str) -> &'static [&'static str] {
     match permission_key {
         "apps.create" | "apps.update" | APPS_STATUS => &[APPS_VIEW],
-        SERVICES_DEPLOY | "services.rollback" => &[APPS_VIEW, SERVICES_VIEW, TASKS_VIEW],
+        SERVICES_DEPLOY
+        | SERVICES_DEPLOY_CANCEL
+        | SERVICES_DEPLOY_RECONCILE
+        | "services.rollback" => &[APPS_VIEW, SERVICES_VIEW, TASKS_VIEW],
         SERVICES_LOGS => &[SERVICES_VIEW],
         NODES_MANAGE => &[NODES_VIEW],
         NODES_INSTALL => &[NODES_VIEW, TASKS_VIEW],

@@ -42,13 +42,16 @@ use crate::{
         API_TOKENS_MANAGE, API_TOKENS_VIEW, APPS_STATUS, APPS_VIEW, ARTIFACTS_UPLOAD,
         ARTIFACTS_VIEW, AUDIT_VIEW, AuditLogFilter, AuthService, CurrentSession, DASHBOARD_VIEW,
         LoginInput, NODES_INSTALL, NODES_MANAGE, NODES_VIEW, PROFILE_VIEW, RBAC_ACCOUNTS_VIEW,
-        RBAC_PERMISSIONS_VIEW, RBAC_ROLES_VIEW, RBAC_SESSIONS_VIEW, SERVICES_DEPLOY, SERVICES_LOGS,
-        SERVICES_VIEW, SETTINGS_UPDATE, SETTINGS_VIEW, SessionTokens, TASKS_RETRY, TASKS_VIEW,
-        TEMPLATES_VIEW, nav_permission, permission_dependencies,
+        RBAC_PERMISSIONS_VIEW, RBAC_ROLES_VIEW, RBAC_SESSIONS_VIEW, SERVICES_DEPLOY,
+        SERVICES_DEPLOY_CANCEL, SERVICES_DEPLOY_RECONCILE, SERVICES_LOGS, SERVICES_VIEW,
+        SETTINGS_UPDATE, SETTINGS_VIEW, SessionTokens, TASKS_RETRY, TASKS_VIEW, TEMPLATES_VIEW,
+        nav_permission, permission_dependencies,
     },
     catalog::compose_templates,
     deployment_console::DeploymentConsoleService,
-    deployment_orchestrator::{CreateDeploymentRunInput, DeploymentUnitExecutor},
+    deployment_orchestrator::{
+        CreateDeploymentRunInput, DeploymentCancellationRegistry, DeploymentUnitExecutor,
+    },
     deployment_orchestrator::{DeploymentAction, DeploymentMode, DeploymentOrchestratorService},
     deployment_retention::{DeploymentLogService, DeploymentRetentionService},
     events::{EventLogError, EventLogFilter, EventLogService},
@@ -72,15 +75,15 @@ use templates::{
     ArtifactPageRow, ArtifactsTemplate, AuditFilterOptionRow, AuditLogRow, AuditTemplate,
     ComposeResultView, DashboardTemplate, DeployConfirmTargetNodeRow, DeployConfirmTemplate,
     DeployPlanFileRow, DeployPlanStepRow, DeployPreflightActionRow, DeployPreflightCheckRow,
-    DeployPreflightRow, DeploymentEnvironmentRow, DeploymentUnitRow, EnvironmentDeploymentRunRow,
-    EventLogRow, EventsTemplate, LoginTemplate, NavItem, NavSection, NodeAppRuntimeRow,
-    NodeCapabilityGuideRow, NodeCheckHistoryRow, NodeCredentialOptionRow, NodeCredentialPageRow,
-    NodeCredentialsTemplate, NodeDetailModalRow, NodeDetailTemplate, NodePageRow, NodeRow,
-    NodeTaskRow, NodesTemplate, PermissionGroup, PermissionRow, PermissionsTemplate,
-    ProfileTemplate, RbacFilterOptionRow, ReleaseQueueRow, RoleRow, RolesTemplate,
-    ServiceLogTailOptionRow, ServiceLogsTemplate, ServiceNodeLinkRow, ServicePageRow,
-    ServicesTemplate, SessionRow, SessionsTemplate, SettingsRow, SettingsTemplate, SummaryItem,
-    TaskAppFilterRow, TaskDetailTemplate, TaskDetailView, TaskExecutionGuideView,
+    DeployPreflightRow, DeploymentEnvironmentRow, DeploymentTaskControlView, DeploymentUnitRow,
+    EnvironmentDeploymentRunRow, EventLogRow, EventsTemplate, LoginTemplate, NavItem, NavSection,
+    NodeAppRuntimeRow, NodeCapabilityGuideRow, NodeCheckHistoryRow, NodeCredentialOptionRow,
+    NodeCredentialPageRow, NodeCredentialsTemplate, NodeDetailModalRow, NodeDetailTemplate,
+    NodePageRow, NodeRow, NodeTaskRow, NodesTemplate, PermissionGroup, PermissionRow,
+    PermissionsTemplate, ProfileTemplate, RbacFilterOptionRow, ReleaseQueueRow, RoleRow,
+    RolesTemplate, ServiceLogTailOptionRow, ServiceLogsTemplate, ServiceNodeLinkRow,
+    ServicePageRow, ServicesTemplate, SessionRow, SessionsTemplate, SettingsRow, SettingsTemplate,
+    SummaryItem, TaskAppFilterRow, TaskDetailTemplate, TaskDetailView, TaskExecutionGuideView,
     TaskFilterOptionRow, TaskLogRow, TaskNodeResultRow, TaskPageRow, TaskPhaseGroupRow,
     TaskPhaseStepRow, TaskReturnActionView, TaskRow, TaskStepRow, TasksTemplate, TemplateCardRow,
     TemplatesTemplate, render_html,
@@ -88,7 +91,7 @@ use templates::{
 
 const LOGO_SVG: &str = include_str!("../../assets/logo.svg");
 const APP_JS: &str = include_str!("../../assets/app.js");
-const ASSET_VERSION: &str = "20260711-auth-redirect";
+const ASSET_VERSION: &str = "20260712-deployment-controls";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -129,6 +132,7 @@ struct AppStateInner {
     deployment_executor: Option<Arc<dyn DeploymentUnitExecutor>>,
     deployment_logs: DeploymentLogService,
     deployment_retention: DeploymentRetentionService,
+    deployment_cancellations: DeploymentCancellationRegistry,
     host_metrics: HostMetricsService,
     api_token_flashes: Mutex<HashMap<String, crate::auth::CreatedApiToken>>,
 }
@@ -154,6 +158,7 @@ impl AppState {
                 deployment_executor: services.deployment_executor,
                 deployment_logs: services.deployment_logs,
                 deployment_retention: services.deployment_retention,
+                deployment_cancellations: DeploymentCancellationRegistry::default(),
                 api_token_flashes: Mutex::new(HashMap::new()),
             }),
         }
@@ -221,6 +226,10 @@ impl AppState {
 
     pub fn deployment_retention(&self) -> &DeploymentRetentionService {
         &self.inner.deployment_retention
+    }
+
+    pub fn deployment_cancellations(&self) -> &DeploymentCancellationRegistry {
+        &self.inner.deployment_cancellations
     }
 
     pub fn host_metrics(&self) -> &HostMetricsService {
@@ -294,6 +303,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/tasks/{task_id}", get(task_detail_page))
         .route("/tasks/{task_id}/cancel", post(task_cancel_submit))
         .route("/tasks/{task_id}/retry", post(task_retry_submit))
+        .route(
+            "/deployments/{deployment_run_id}/cancel",
+            post(deployment_cancel_submit),
+        )
+        .route(
+            "/deployments/{deployment_run_id}/confirm-stopped",
+            post(deployment_confirm_stopped_submit),
+        )
         .route("/templates", get(templates_page))
         .route("/artifacts", get(artifacts_page))
         .route("/artifacts/upload", post(artifact_upload_submit))
@@ -846,6 +863,12 @@ struct TaskDetailQuery {
 struct TaskRetryForm {
     csrf_token: String,
     return_to: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeploymentReconciliationForm {
+    csrf_token: String,
+    note: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1619,8 +1642,13 @@ async fn application_deploy_submit(
     let deployment_run_id = created.deployment_run_id;
     let task_id = created.task_id;
     let orchestrator = state.deployment_orchestrator().clone();
+    let cancellations = state.deployment_cancellations().clone();
+    let cancellation = cancellations.register(deployment_run_id);
     tokio::spawn(async move {
-        if let Err(error) = orchestrator.execute_run(deployment_run_id, executor).await {
+        if let Err(error) = orchestrator
+            .execute_run_with_cancellation(deployment_run_id, executor, cancellation)
+            .await
+        {
             tracing::error!(deployment_run_id, error = %error, "environment deployment execution failed");
             if let Err(finalize_error) = orchestrator
                 .fail_run_on_internal_error(deployment_run_id, &error.to_string())
@@ -1629,6 +1657,7 @@ async fn application_deploy_submit(
                 tracing::error!(deployment_run_id, error = %finalize_error, "failed to finalize broken environment deployment");
             }
         }
+        cancellations.remove(deployment_run_id);
     });
     redirect(&format!("/tasks/{task_id}"))
 }
@@ -3492,6 +3521,33 @@ async fn task_detail_page(
         Ok(task) => task,
         Err(err) => return task_error_response(err),
     };
+    let deployment_control = match state
+        .deployment_orchestrator()
+        .run_control_for_task(task_id)
+        .await
+    {
+        Ok(Some(control)) => {
+            let cancel_requested = control.cancel_requested_at.is_some();
+            let cancel_in_progress =
+                cancel_requested && matches!(control.status.as_str(), "queued" | "running");
+            DeploymentTaskControlView {
+                has_run: true,
+                run_id: control.deployment_run_id,
+                status: console_deployment_status_label(&control.status),
+                status_tone: console_deployment_status_tone(&control.status),
+                cancel_in_progress,
+                cancel_requested_by: control.cancel_requested_by,
+                cancel_requested_at: control.cancel_requested_at.unwrap_or_default(),
+                show_cancel_action: session.can(SERVICES_DEPLOY_CANCEL)
+                    && matches!(control.status.as_str(), "queued" | "running")
+                    && !cancel_requested,
+                show_reconcile_action: session.can(SERVICES_DEPLOY_RECONCILE)
+                    && control.status == "reconciling",
+            }
+        }
+        Ok(None) => DeploymentTaskControlView::default(),
+        Err(error) => return deployment_orchestrator_error_response(error),
+    };
     let logs = match state.tasks().task_logs(task_id).await {
         Ok(logs) => logs,
         Err(err) => return task_error_response(err),
@@ -3679,6 +3735,7 @@ async fn task_detail_page(
         csrf_token: &session.csrf_token,
         nav_sections: &nav_sections,
         task: task_view,
+        deployment_control,
         execution_guide,
         return_action,
         phases: &phase_rows,
@@ -3702,6 +3759,42 @@ async fn task_cancel_submit(
     if !valid_csrf(&session, &form.csrf_token) {
         return forbidden();
     }
+    let deployment_control = match state
+        .deployment_orchestrator()
+        .run_control_for_task(task_id)
+        .await
+    {
+        Ok(control) => control,
+        Err(error) => return deployment_orchestrator_error_response(error),
+    };
+    if let Some(control) = deployment_control {
+        if !session.can(SERVICES_DEPLOY_CANCEL) {
+            return forbidden();
+        }
+        let requested = match state
+            .deployment_orchestrator()
+            .request_cancellation(control.deployment_run_id, &session.account.username)
+            .await
+        {
+            Ok(requested) => requested,
+            Err(error) => return deployment_orchestrator_error_response(error),
+        };
+        state
+            .deployment_cancellations()
+            .cancel(control.deployment_run_id);
+        if requested {
+            record_audit_event(
+                &state,
+                &session,
+                SERVICES_DEPLOY_CANCEL,
+                "environment_deployment_run",
+                &control.deployment_run_id.to_string(),
+                "通过任务详情请求取消环境部署",
+            )
+            .await;
+        }
+        return redirect(&format!("/tasks/{task_id}"));
+    }
     if !session.can("tasks.cancel") {
         return forbidden();
     }
@@ -3723,6 +3816,95 @@ async fn task_cancel_submit(
             redirect(&format!("/tasks/{task_id}"))
         }
         Err(err) => app_error_response(err),
+    }
+}
+
+async fn deployment_cancel_submit(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Path(deployment_run_id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    if !valid_csrf(&session, &form.csrf_token) {
+        return forbidden();
+    }
+    if !session.can(SERVICES_DEPLOY_CANCEL) {
+        return forbidden();
+    }
+    let task_id = match deployment_task_id(state.db(), deployment_run_id).await {
+        Ok(task_id) => task_id,
+        Err(response) => return response,
+    };
+    let requested = match state
+        .deployment_orchestrator()
+        .request_cancellation(deployment_run_id, &session.account.username)
+        .await
+    {
+        Ok(requested) => requested,
+        Err(error) => return deployment_orchestrator_error_response(error),
+    };
+    state.deployment_cancellations().cancel(deployment_run_id);
+    if requested {
+        record_audit_event(
+            &state,
+            &session,
+            SERVICES_DEPLOY_CANCEL,
+            "environment_deployment_run",
+            &deployment_run_id.to_string(),
+            "请求取消运行中的环境部署",
+        )
+        .await;
+    }
+    redirect(&format!("/tasks/{task_id}"))
+}
+
+async fn deployment_confirm_stopped_submit(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Path(deployment_run_id): Path<i64>,
+    Form(form): Form<DeploymentReconciliationForm>,
+) -> Response {
+    if !valid_csrf(&session, &form.csrf_token) {
+        return forbidden();
+    }
+    if !session.can(SERVICES_DEPLOY_RECONCILE) {
+        return forbidden();
+    }
+    let task_id = match deployment_task_id(state.db(), deployment_run_id).await {
+        Ok(task_id) => task_id,
+        Err(response) => return response,
+    };
+    if let Err(error) = state
+        .deployment_orchestrator()
+        .confirm_interrupted_run_stopped(deployment_run_id, &session.account.username, &form.note)
+        .await
+    {
+        return deployment_orchestrator_error_response(error);
+    }
+    let message = format!("确认中断部署的远端执行已停止：{}", form.note.trim());
+    record_audit_event(
+        &state,
+        &session,
+        SERVICES_DEPLOY_RECONCILE,
+        "environment_deployment_run",
+        &deployment_run_id.to_string(),
+        &message,
+    )
+    .await;
+    redirect(&format!("/tasks/{task_id}"))
+}
+
+async fn deployment_task_id(db: &SqlitePool, deployment_run_id: i64) -> Result<i64, Response> {
+    match sqlx::query_scalar::<_, i64>(
+        "SELECT task_id FROM environment_deployment_runs WHERE id = ?1 AND task_id IS NOT NULL",
+    )
+    .bind(deployment_run_id)
+    .fetch_optional(db)
+    .await
+    {
+        Ok(Some(task_id)) => Ok(task_id),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "部署执行不存在").into_response()),
+        Err(error) => Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()),
     }
 }
 
@@ -10954,6 +11136,325 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deployment_cancel_route_requires_csrf_and_records_request() {
+        let app = test_web_app().await;
+        let app_id = create_compose_test_app(&app.apps, "cancel-deployment-app").await;
+        let (environment_id, app_release_id) =
+            seed_deployable_application_release(&app.db, app_id).await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+        let orchestrator = DeploymentOrchestratorService::new(app.db.clone());
+        let preview = orchestrator
+            .preview(environment_id, app_release_id, DeploymentMode::Normal)
+            .await
+            .expect("preview deployment");
+        let run = orchestrator
+            .create_run(CreateDeploymentRunInput {
+                environment_id,
+                app_release_id,
+                mode: DeploymentMode::Normal,
+                expected_plan_hash: preview.plan_hash,
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect("create deployment run");
+
+        let task_page = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/tasks/{}", run.task_id))
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build task page request"),
+            )
+            .await
+            .expect("load task page");
+        assert_eq!(task_page.status(), StatusCode::OK);
+        let html = String::from_utf8_lossy(
+            &to_bytes(task_page.into_body(), usize::MAX)
+                .await
+                .expect("read task page"),
+        )
+        .into_owned();
+        assert!(html.contains("取消部署"));
+        assert!(html.contains("当前单元结果未知，不会自动回滚"));
+
+        let invalid = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/deployments/{}/cancel", run.deployment_run_id))
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("csrf_token=wrong"))
+                    .expect("build invalid cancel request"),
+            )
+            .await
+            .expect("send invalid cancel request");
+        assert_eq!(invalid.status(), StatusCode::FORBIDDEN);
+        let cancel_requested_at: Option<String> = sqlx::query_scalar(
+            "SELECT cancel_requested_at FROM environment_deployment_runs WHERE id = ?1",
+        )
+        .bind(run.deployment_run_id)
+        .fetch_one(&app.db)
+        .await
+        .expect("load cancellation state");
+        assert!(cancel_requested_at.is_none());
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/deployments/{}/cancel", run.deployment_run_id))
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={}",
+                        login.session.csrf_token
+                    )))
+                    .expect("build cancel request"),
+            )
+            .await
+            .expect("send cancel request");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cancellation: (Option<String>, String, String) = sqlx::query_as(
+            "SELECT cancel_requested_at, cancel_requested_by, status FROM environment_deployment_runs WHERE id = ?1",
+        )
+        .bind(run.deployment_run_id)
+        .fetch_one(&app.db)
+        .await
+        .expect("load recorded cancellation");
+        assert!(cancellation.0.is_some());
+        assert_eq!(cancellation.1, "admin");
+        assert_eq!(cancellation.2, "canceled");
+
+        let legacy_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{}/cancel", run.task_id))
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={}",
+                        login.session.csrf_token
+                    )))
+                    .expect("build legacy task cancel request"),
+            )
+            .await
+            .expect("send legacy task cancel request");
+        assert_eq!(legacy_response.status(), StatusCode::CONFLICT);
+        let task_status: String =
+            sqlx::query_scalar("SELECT status FROM operation_tasks WHERE id = ?1")
+                .bind(run.task_id)
+                .fetch_one(&app.db)
+                .await
+                .expect("load task status after legacy cancel route");
+        assert_eq!(task_status, "canceled");
+    }
+
+    #[tokio::test]
+    async fn deployment_reconciliation_requires_dedicated_permission_and_note() {
+        let app = test_web_app().await;
+        let app_id = create_compose_test_app(&app.apps, "reconcile-deployment-app").await;
+        let (environment_id, app_release_id) =
+            seed_deployable_application_release(&app.db, app_id).await;
+        let admin = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let admin_cookie = format!("ed_access={}", admin.tokens.access_token);
+        let deployer_role_id: i64 =
+            sqlx::query_scalar("SELECT id FROM admin_roles WHERE role_code = 'deployer'")
+                .fetch_one(&app.db)
+                .await
+                .expect("load deployer role");
+        app.auth
+            .create_account(
+                &admin.session,
+                "deployer_user",
+                "Deployer",
+                "password123",
+                &[deployer_role_id],
+            )
+            .await
+            .expect("create deployer account");
+        let deployer = app
+            .auth
+            .login(LoginInput {
+                username: "deployer_user".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("login deployer");
+        let deployer_cookie = format!("ed_access={}", deployer.tokens.access_token);
+        let orchestrator = DeploymentOrchestratorService::new(app.db.clone());
+        let preview = orchestrator
+            .preview(environment_id, app_release_id, DeploymentMode::Force)
+            .await
+            .expect("preview deployment");
+        let run = orchestrator
+            .create_run(CreateDeploymentRunInput {
+                environment_id,
+                app_release_id,
+                mode: DeploymentMode::Force,
+                expected_plan_hash: preview.plan_hash,
+                created_by: "admin".to_owned(),
+            })
+            .await
+            .expect("create deployment run");
+        sqlx::query(
+            "UPDATE environment_deployment_runs SET status = 'running', started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+        )
+        .bind(run.deployment_run_id)
+        .execute(&app.db)
+        .await
+        .expect("mark run running");
+        sqlx::query("UPDATE operation_tasks SET status = 'running' WHERE id = ?1")
+            .bind(run.task_id)
+            .execute(&app.db)
+            .await
+            .expect("mark task running");
+        sqlx::query(
+            "UPDATE deployment_unit_run_results SET status = 'running' WHERE deployment_run_id = ?1",
+        )
+        .bind(run.deployment_run_id)
+        .execute(&app.db)
+        .await
+        .expect("mark unit running");
+        let recovery = orchestrator
+            .reconcile_interrupted_runs()
+            .await
+            .expect("reconcile interrupted run");
+        assert_eq!(recovery.reconciling_runs, 1);
+
+        let task_page = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/tasks/{}", run.task_id))
+                    .header(header::COOKIE, &admin_cookie)
+                    .body(Body::empty())
+                    .expect("build task page request"),
+            )
+            .await
+            .expect("load task page");
+        let html = String::from_utf8_lossy(
+            &to_bytes(task_page.into_body(), usize::MAX)
+                .await
+                .expect("read task page"),
+        )
+        .into_owned();
+        assert!(html.contains("确认远端已停止"));
+        assert!(html.contains("确认并释放环境锁"));
+
+        let forbidden_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/deployments/{}/confirm-stopped",
+                        run.deployment_run_id
+                    ))
+                    .header(header::COOKIE, &deployer_cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={}&note=checked+all+nodes",
+                        deployer.session.csrf_token
+                    )))
+                    .expect("build deployer reconciliation request"),
+            )
+            .await
+            .expect("send deployer reconciliation request");
+        assert_eq!(forbidden_response.status(), StatusCode::FORBIDDEN);
+
+        let invalid_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/deployments/{}/confirm-stopped",
+                        run.deployment_run_id
+                    ))
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={}&note=",
+                        admin.session.csrf_token
+                    )))
+                    .expect("build invalid reconciliation request"),
+            )
+            .await
+            .expect("send invalid reconciliation request");
+        assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/deployments/{}/confirm-stopped",
+                        run.deployment_run_id
+                    ))
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={}&note=checked+all+target+nodes",
+                        admin.session.csrf_token
+                    )))
+                    .expect("build reconciliation request"),
+            )
+            .await
+            .expect("send reconciliation request");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let reconciliation: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT status, reconciled_by, reconciled_at FROM environment_deployment_runs WHERE id = ?1",
+        )
+        .bind(run.deployment_run_id)
+        .fetch_one(&app.db)
+        .await
+        .expect("load reconciliation result");
+        assert_eq!(reconciliation.0, "canceled");
+        assert_eq!(reconciliation.1, "admin");
+        assert!(reconciliation.2.is_some());
+    }
+
+    #[tokio::test]
     async fn app_create_route_forces_compose_app_type() {
         let app = test_web_app().await;
         let login = app
@@ -13160,6 +13661,17 @@ mod tests {
             expired_secure,
             "ed_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"
         );
+    }
+
+    #[test]
+    fn live_task_refresh_waits_while_confirmation_dialog_is_open() {
+        let template = include_str!("../../templates/task_detail.html");
+        let script = include_str!("../../assets/app.js");
+
+        assert!(template.contains("data-task-auto-refresh=\"3000\""));
+        assert!(!template.contains("http-equiv=\"refresh\""));
+        assert!(script.contains("dialog.modal-dialog[open]"));
+        assert!(script.contains("initTaskAutoRefresh();"));
     }
 
     #[test]

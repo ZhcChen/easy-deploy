@@ -17,6 +17,7 @@ encoding_rs.workspace = true
 flate2.workspace = true
 fs2.workspace = true
 hmac.workspace = true
+libc.workspace = true
 rand_core.workspace = true
 reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
 quick-xml = { version = "0.37", features = ["serialize"] }

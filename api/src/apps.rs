@@ -218,7 +218,9 @@ impl From<DeployError> for AppError {
     fn from(value: DeployError) -> Self {
         match value {
             DeployError::InvalidInput(message) => Self::InvalidInput(message),
-            DeployError::Command(message) => Self::Internal(message),
+            DeployError::Command(message) | DeployError::Canceled(message) => {
+                Self::Internal(message)
+            }
         }
     }
 }

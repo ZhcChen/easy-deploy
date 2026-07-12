@@ -14,7 +14,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::{
     application_config::{ApplicationConfigService, ConfigUnit},
-    deploy::{ComposeCommandOutput, ComposeExecutor, SshExecutor, SshTarget},
+    deploy::{ComposeCommandOutput, ComposeExecutor, DeployError, SshExecutor, SshTarget},
     deployment_orchestrator::{
         DeploymentAction, DeploymentUnitExecutor, UnitExecutionContext, UnitExecutionOutcome,
     },
@@ -46,6 +46,7 @@ pub enum DeploymentRuntimeError {
     NotFound(String),
     Config(String),
     Database(String),
+    Canceled(String),
 }
 
 impl std::fmt::Display for DeploymentRuntimeError {
@@ -54,7 +55,8 @@ impl std::fmt::Display for DeploymentRuntimeError {
             Self::Validation(message)
             | Self::NotFound(message)
             | Self::Config(message)
-            | Self::Database(message) => formatter.write_str(message),
+            | Self::Database(message)
+            | Self::Canceled(message) => formatter.write_str(message),
         }
     }
 }
@@ -64,6 +66,17 @@ impl std::error::Error for DeploymentRuntimeError {}
 impl From<sqlx::Error> for DeploymentRuntimeError {
     fn from(error: sqlx::Error) -> Self {
         Self::Database(error.to_string())
+    }
+}
+
+impl From<DeployError> for DeploymentRuntimeError {
+    fn from(error: DeployError) -> Self {
+        match error {
+            DeployError::Canceled(message) => Self::Canceled(message),
+            DeployError::InvalidInput(message) | DeployError::Command(message) => {
+                Self::Validation(message)
+            }
+        }
     }
 }
 
@@ -371,14 +384,7 @@ impl ComposeDeploymentUnitExecutor {
         let mut spec = self.runtime.load_unit_spec(context).await?;
         let result = self.execute_spec(context, &mut spec).await;
         let cleanup = cleanup_execution_staging(&self.staging_root, context, &spec).await;
-        match (result, cleanup) {
-            (Ok(summary), Ok(())) => Ok(summary),
-            (Ok(_), Err(error)) => Err(error),
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(cleanup_error)) => Err(DeploymentRuntimeError::Database(format!(
-                "deployment failed: {error}; staging cleanup failed: {cleanup_error}"
-            ))),
-        }
+        merge_execution_and_cleanup(result, cleanup)
     }
 
     async fn execute_spec(
@@ -386,8 +392,13 @@ impl ComposeDeploymentUnitExecutor {
         context: &UnitExecutionContext,
         spec: &mut UnitExecutionSpec,
     ) -> Result<String, DeploymentRuntimeError> {
+        ensure_not_canceled(context)?;
         self.materialize_oss_release(context, spec).await?;
+        ensure_not_canceled(context)?;
         let prepared = prepare_unit_runtime(spec, &self.staging_root).await?;
+        ensure_not_canceled(context)?;
+        let compose = self.compose.with_cancellation(context.cancellation.clone());
+        let ssh = self.ssh.with_cancellation(context.cancellation.clone());
         let secrets = spec
             .environment_variables
             .values()
@@ -395,9 +406,9 @@ impl ComposeDeploymentUnitExecutor {
             .collect::<Vec<_>>();
         let mut summaries = Vec::new();
         for node in &spec.target_nodes {
+            ensure_not_canceled(context)?;
             let result =
-                execute_prepared_unit_on_node(spec, &prepared, node, &self.compose, &self.ssh)
-                    .await?;
+                execute_prepared_unit_on_node(spec, &prepared, node, &compose, &ssh).await?;
             summaries.push(result.summary.clone());
             for output in &result.outputs {
                 let rendered = format!("$ {}\n{}\n", output.command, output.output);
@@ -434,6 +445,7 @@ impl ComposeDeploymentUnitExecutor {
         context: &UnitExecutionContext,
         spec: &mut UnitExecutionSpec,
     ) -> Result<(), DeploymentRuntimeError> {
+        ensure_not_canceled(context)?;
         let Some(release) = spec.release.as_mut() else {
             return Ok(());
         };
@@ -491,9 +503,21 @@ impl ComposeDeploymentUnitExecutor {
             .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
         let mut hasher = Sha256::new();
         let mut received = 0_u64;
-        while let Some(chunk) = response.chunk().await.map_err(|error| {
-            DeploymentRuntimeError::NotFound(format!("read OSS unit release failed: {error}"))
-        })? {
+        loop {
+            let chunk = tokio::select! {
+                _ = context.cancellation.cancelled() => {
+                    let _ = fs::remove_file(&destination).await;
+                    return Err(DeploymentRuntimeError::Canceled(
+                        "部署已取消，停止下载 OSS 单元发布包".to_owned(),
+                    ));
+                }
+                chunk = response.chunk() => chunk.map_err(|error| {
+                    DeploymentRuntimeError::NotFound(format!("read OSS unit release failed: {error}"))
+                })?,
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             received = received.saturating_add(chunk.len() as u64);
             if release.size_bytes > 0 && received > release.size_bytes as u64 {
                 let _ = fs::remove_file(&destination).await;
@@ -521,6 +545,25 @@ impl ComposeDeploymentUnitExecutor {
         release.package_path = destination;
         release.storage_provider = "local".to_owned();
         Ok(())
+    }
+}
+
+fn merge_execution_and_cleanup(
+    result: Result<String, DeploymentRuntimeError>,
+    cleanup: Result<(), DeploymentRuntimeError>,
+) -> Result<String, DeploymentRuntimeError> {
+    match (result, cleanup) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(DeploymentRuntimeError::Canceled(message)), Err(cleanup_error)) => {
+            Err(DeploymentRuntimeError::Canceled(format!(
+                "{message}；staging 清理失败：{cleanup_error}"
+            )))
+        }
+        (Err(error), Err(cleanup_error)) => Err(DeploymentRuntimeError::Database(format!(
+            "deployment failed: {error}; staging cleanup failed: {cleanup_error}"
+        ))),
     }
 }
 
@@ -553,6 +596,16 @@ async fn cleanup_execution_staging(
     Ok(())
 }
 
+fn ensure_not_canceled(context: &UnitExecutionContext) -> Result<(), DeploymentRuntimeError> {
+    if context.cancellation.is_cancelled() {
+        Err(DeploymentRuntimeError::Canceled(
+            "部署取消请求已生效，停止执行当前单元".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl DeploymentUnitExecutor for ComposeDeploymentUnitExecutor {
     async fn execute(&self, context: UnitExecutionContext) -> UnitExecutionOutcome {
@@ -569,16 +622,22 @@ impl DeploymentUnitExecutor for ComposeDeploymentUnitExecutor {
                     )
                     .await;
                 let _ = self.logs.finish(context.task_id, context.step_id).await;
-                UnitExecutionOutcome::Failed {
-                    failure_kind: match error {
-                        DeploymentRuntimeError::Validation(_) => "validation",
-                        DeploymentRuntimeError::NotFound(_) => "resource_not_found",
-                        DeploymentRuntimeError::Config(_) => "config_error",
-                        DeploymentRuntimeError::Database(_) => "database_error",
+                match error {
+                    DeploymentRuntimeError::Canceled(summary) => {
+                        UnitExecutionOutcome::CanceledUnknown { summary }
                     }
-                    .to_owned(),
-                    summary: error.to_string(),
-                    exit_code: None,
+                    error => UnitExecutionOutcome::Failed {
+                        failure_kind: match &error {
+                            DeploymentRuntimeError::Validation(_) => "validation",
+                            DeploymentRuntimeError::NotFound(_) => "resource_not_found",
+                            DeploymentRuntimeError::Config(_) => "config_error",
+                            DeploymentRuntimeError::Database(_) => "database_error",
+                            DeploymentRuntimeError::Canceled(_) => unreachable!(),
+                        }
+                        .to_owned(),
+                        summary: error.to_string(),
+                        exit_code: None,
+                    },
                 }
             }
         }
@@ -841,7 +900,7 @@ async fn run_node_health_check(
             }
             None => compose.ps_running(PathBuf::from(work_dir)).await,
         }
-        .map_err(|error| DeploymentRuntimeError::Validation(error.to_string()))?;
+        .map_err(DeploymentRuntimeError::from)?;
         let healthy = output.success
             && output
                 .output
@@ -892,7 +951,7 @@ async fn run_node_health_check(
             }
             HealthCheckKind::None | HealthCheckKind::ComposeRunning => unreachable!(),
         }
-        .map_err(|error| DeploymentRuntimeError::Validation(error.to_string()))?;
+        .map_err(DeploymentRuntimeError::from)?;
         let healthy = match config.kind {
             HealthCheckKind::Http => {
                 output.success && output.output.trim() == config.expected_status.to_string()
@@ -962,7 +1021,7 @@ async fn run_compose_action(
         (None, DeploymentAction::Stop) => compose.down(PathBuf::from(work_dir)).await,
         (None, _) => compose.up(PathBuf::from(work_dir)).await,
     };
-    output.map_err(|error| DeploymentRuntimeError::Validation(error.to_string()))
+    output.map_err(DeploymentRuntimeError::from)
 }
 
 async fn run_script(
@@ -986,7 +1045,7 @@ async fn run_script(
                 .await
         }
     };
-    output.map_err(|error| DeploymentRuntimeError::Validation(error.to_string()))
+    output.map_err(DeploymentRuntimeError::from)
 }
 
 async fn sync_runtime_to_ssh(
@@ -1006,7 +1065,7 @@ async fn sync_runtime_to_ssh(
         let mkdir = ssh
             .mkdir_all(target, prepared.root.clone(), remote_parent)
             .await
-            .map_err(|error| DeploymentRuntimeError::Validation(error.to_string()))?;
+            .map_err(DeploymentRuntimeError::from)?;
         if !mkdir.success {
             return Err(DeploymentRuntimeError::Validation(command_summary(
                 &mkdir,
@@ -1017,7 +1076,7 @@ async fn sync_runtime_to_ssh(
         let copy = ssh
             .copy_file(target, prepared.root.clone(), local_path, &remote_path)
             .await
-            .map_err(|error| DeploymentRuntimeError::Validation(error.to_string()))?;
+            .map_err(DeploymentRuntimeError::from)?;
         if !copy.success {
             return Err(DeploymentRuntimeError::Validation(command_summary(
                 &copy,
@@ -1470,6 +1529,22 @@ mod tests {
         assert!(safe_package_name("package.tar.gz").is_ok());
     }
 
+    #[test]
+    fn staging_cleanup_failure_does_not_hide_cancellation_state() {
+        let result = merge_execution_and_cleanup(
+            Err(DeploymentRuntimeError::Canceled(
+                "部署命令已取消".to_owned(),
+            )),
+            Err(DeploymentRuntimeError::Database("目录仍被占用".to_owned())),
+        );
+
+        assert!(matches!(
+            result,
+            Err(DeploymentRuntimeError::Canceled(message))
+                if message.contains("部署命令已取消") && message.contains("目录仍被占用")
+        ));
+    }
+
     #[tokio::test]
     async fn removes_secret_staging_and_downloaded_release_after_execution() {
         let temp = tempdir().expect("create temp dir");
@@ -1493,6 +1568,7 @@ mod tests {
                 target_fingerprint: "target".to_owned(),
                 previous_fingerprint: String::new(),
             },
+            cancellation: crate::deploy::CancellationSignal::new(),
         };
         let spec = UnitExecutionSpec {
             app_id: 1,

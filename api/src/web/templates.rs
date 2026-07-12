@@ -554,6 +554,7 @@ pub struct TaskDetailTemplate<'a> {
     pub csrf_token: &'a str,
     pub nav_sections: &'a [NavSection<'a>],
     pub task: TaskDetailView<'a>,
+    pub deployment_control: DeploymentTaskControlView,
     pub execution_guide: TaskExecutionGuideView,
     pub return_action: TaskReturnActionView,
     pub phases: &'a [TaskPhaseStepRow],
@@ -595,6 +596,19 @@ pub struct SettingsTemplate<'a> {
     pub aliyun_oss_secret_status: &'a str,
     pub aliyun_oss_upload_url_ttl_seconds: i64,
     pub aliyun_oss_download_url_ttl_seconds: i64,
+}
+
+#[derive(Default)]
+pub struct DeploymentTaskControlView {
+    pub has_run: bool,
+    pub run_id: i64,
+    pub status: &'static str,
+    pub status_tone: &'static str,
+    pub cancel_in_progress: bool,
+    pub cancel_requested_by: String,
+    pub cancel_requested_at: String,
+    pub show_cancel_action: bool,
+    pub show_reconcile_action: bool,
 }
 
 #[derive(Template)]

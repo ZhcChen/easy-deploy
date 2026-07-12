@@ -1,11 +1,5 @@
 ﻿{% extends "layout.html" %}
 
-{% block head_extra %}
-{% if task.is_live %}
-  <meta http-equiv="refresh" content="3">
-{% endif %}
-{% endblock %}
-
 {% block title %}#{{ task.id }} {{ task.title }} - {{ product_name }}{% endblock %}
 
 {% block topbar_actions %}
@@ -14,7 +8,7 @@
 {% endblock %}
 
 {% block content %}
-<section class="main-grid">
+<section class="main-grid"{% if task.is_live %} data-task-auto-refresh="3000"{% endif %}>
   <section class="panel panel-large" aria-labelledby="task-logs-title">
     <section class="task-execution-guide tone-{{ execution_guide.tone }}" aria-labelledby="task-execution-guide-title">
       <div>
@@ -49,6 +43,12 @@
         <span class="badge tone-{{ task.status_tone }}">{{ task.status }}</span>
         <span class="badge tone-{{ task.phase_tone }}">{{ task.phase }}</span>
         <span class="badge tone-{{ task.queue_tone }}">{{ task.queue_state }}</span>
+        {% if deployment_control.has_run %}
+          <span class="badge tone-{{ deployment_control.status_tone }}">部署 {{ deployment_control.status }}</span>
+        {% endif %}
+        {% if deployment_control.cancel_in_progress %}
+          <span class="badge tone-warning" title="{{ deployment_control.cancel_requested_by }} · {{ deployment_control.cancel_requested_at }}">正在取消</span>
+        {% endif %}
         {% if return_action.has_return %}
           <span class="return-action-hint">{{ return_action.hint }}</span>
           <a class="ghost-button" href="{{ return_action.path }}">{{ return_action.back_label }}</a>
@@ -72,11 +72,17 @@
             <button class="primary-button" type="submit">重试</button>
           </form>
         {% endif %}
-        {% if can_cancel && task.is_queued %}
+        {% if can_cancel && task.is_queued && !deployment_control.has_run %}
           <form method="post" action="/tasks/{{ task.id }}/cancel">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <button class="ghost-button" type="submit">取消</button>
           </form>
+        {% endif %}
+        {% if deployment_control.show_cancel_action %}
+          <button class="ghost-button danger-action" type="button" data-modal-target="deployment-cancel-modal">取消部署</button>
+        {% endif %}
+        {% if deployment_control.show_reconcile_action %}
+          <button class="primary-button" type="button" data-modal-target="deployment-reconcile-modal">确认远端已停止</button>
         {% endif %}
       </div>
     </div>
@@ -327,5 +333,61 @@
     </section>
   </aside>
 </section>
+
+{% if deployment_control.show_cancel_action %}
+  <dialog class="modal-dialog" id="deployment-cancel-modal" aria-labelledby="deployment-cancel-title">
+    <section class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2 id="deployment-cancel-title">取消部署 #{{ deployment_control.run_id }}</h2>
+          <p>平台会终止当前命令并停止后续部署单元。</p>
+        </div>
+        <button class="modal-close" type="button" data-modal-close aria-label="关闭">×</button>
+      </div>
+      <form class="panel-form" method="post" action="/deployments/{{ deployment_control.run_id }}/cancel" data-single-submit>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="deploy-risk-summary tone-warning">
+          <span>取消后的状态</span>
+          <strong>当前单元结果未知，不会自动回滚</strong>
+          <p>已成功单元保持现状；取消后请先核对目标节点，再发起新的部署。</p>
+        </div>
+        <div class="panel-actions">
+          <button class="ghost-button" type="button" data-modal-close>返回</button>
+          <button class="primary-button danger-action" type="submit">确认取消部署</button>
+        </div>
+      </form>
+    </section>
+  </dialog>
+{% endif %}
+
+{% if deployment_control.show_reconcile_action %}
+  <dialog class="modal-dialog" id="deployment-reconcile-modal" aria-labelledby="deployment-reconcile-title">
+    <section class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2 id="deployment-reconcile-title">核对中断部署 #{{ deployment_control.run_id }}</h2>
+          <p>只有确认目标节点不存在残留部署进程后，才能释放环境锁。</p>
+        </div>
+        <button class="modal-close" type="button" data-modal-close aria-label="关闭">×</button>
+      </div>
+      <form class="panel-form" method="post" action="/deployments/{{ deployment_control.run_id }}/confirm-stopped" data-single-submit>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="deploy-risk-summary tone-warning">
+          <span>人工确认</span>
+          <strong>解锁不会修改目标服务器</strong>
+          <p>平台只结束本次部署记录并释放锁，环境运行状态仍保持未知。</p>
+        </div>
+        <label>
+          核对说明
+          <textarea name="note" rows="4" maxlength="1000" placeholder="例如：已登录所有目标节点，确认部署脚本和 Docker Compose 命令均已退出" required></textarea>
+        </label>
+        <div class="panel-actions">
+          <button class="ghost-button" type="button" data-modal-close>返回</button>
+          <button class="primary-button" type="submit">确认并释放环境锁</button>
+        </div>
+      </form>
+    </section>
+  </dialog>
+{% endif %}
 {% endblock %}
 

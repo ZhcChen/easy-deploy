@@ -20,6 +20,7 @@ encoding_rs = "0.8"
 fs2 = "0.4"
 flate2 = "1"
 hmac = "0.12"
+libc = "0.2"
 reqwest = { version = "0.12", default-features = false }
 tar = "0.4"
 url = "2"

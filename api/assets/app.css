@@ -1047,6 +1047,32 @@ td span,
     #ffffff;
 }
 
+.ghost-button.danger-action {
+  border-color: rgba(161, 29, 51, 0.24);
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+}
+
+.ghost-button.danger-action:hover,
+.ghost-button.danger-action:focus-visible {
+  border-color: rgba(161, 29, 51, 0.42);
+  background: #ffe4e8;
+  box-shadow: 0 8px 18px rgba(161, 29, 51, 0.1);
+}
+
+.primary-button.danger-action {
+  border-color: var(--danger-fg);
+  background: var(--danger-fg);
+  box-shadow: 0 10px 22px rgba(161, 29, 51, 0.18);
+}
+
+.primary-button.danger-action:hover,
+.primary-button.danger-action:focus-visible {
+  border-color: #86162a;
+  background: #86162a;
+  box-shadow: 0 13px 28px rgba(161, 29, 51, 0.24);
+}
+
 .metric-card-action {
   cursor: pointer;
   transition:
@@ -4415,6 +4441,16 @@ tbody tr:last-child td {
 }
 
 @media (max-width: 760px) {
+  .deploy-risk-summary {
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .deploy-risk-summary strong,
+  .deploy-risk-summary p {
+    margin-top: 0;
+  }
+
   .deployment-console-grid,
   .unit-row {
     grid-template-columns: minmax(0, 1fr);

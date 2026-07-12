@@ -1,13 +1,15 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, VecDeque},
-    sync::Arc,
+    collections::{BTreeMap, HashMap, VecDeque},
+    sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
+
+use crate::deploy::CancellationSignal;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -109,6 +111,41 @@ pub struct DeploymentOrchestratorService {
     db: SqlitePool,
 }
 
+#[derive(Clone, Default)]
+pub struct DeploymentCancellationRegistry {
+    active: Arc<Mutex<HashMap<i64, CancellationSignal>>>,
+}
+
+impl DeploymentCancellationRegistry {
+    pub fn register(&self, deployment_run_id: i64) -> CancellationSignal {
+        let cancellation = CancellationSignal::new();
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(deployment_run_id, cancellation.clone());
+        cancellation
+    }
+
+    pub fn cancel(&self, deployment_run_id: i64) -> bool {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(cancellation) = active.get(&deployment_run_id) else {
+            return false;
+        };
+        cancellation.cancel();
+        true
+    }
+
+    pub fn remove(&self, deployment_run_id: i64) {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&deployment_run_id);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeploymentOrchestratorError {
     Validation(String),
@@ -174,6 +211,7 @@ pub struct UnitExecutionContext {
     pub environment_id: i64,
     pub target_node_ids: Vec<i64>,
     pub item: DeploymentPlanItem,
+    pub cancellation: CancellationSignal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +239,20 @@ pub struct DeploymentRunOutcome {
     pub deployment_run_id: i64,
     pub status: String,
     pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub struct DeploymentRunControl {
+    pub deployment_run_id: i64,
+    pub status: String,
+    pub cancel_requested_at: Option<String>,
+    pub cancel_requested_by: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterruptedRunRecovery {
+    pub reconciling_runs: u64,
+    pub canceled_queued_runs: u64,
 }
 
 #[derive(Debug, FromRow)]
@@ -242,6 +294,14 @@ struct ExecutionRunRow {
     plan_hash: String,
     plan_json: String,
     max_parallel_units: i64,
+    cancel_requested_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaveOutcome {
+    Success,
+    Failed,
+    Canceled,
 }
 
 impl DeploymentOrchestratorService {
@@ -399,7 +459,20 @@ impl DeploymentOrchestratorService {
         deployment_run_id: i64,
         executor: Arc<dyn DeploymentUnitExecutor>,
     ) -> Result<DeploymentRunOutcome, DeploymentOrchestratorError> {
+        self.execute_run_with_cancellation(deployment_run_id, executor, CancellationSignal::new())
+            .await
+    }
+
+    pub async fn execute_run_with_cancellation(
+        &self,
+        deployment_run_id: i64,
+        executor: Arc<dyn DeploymentUnitExecutor>,
+        cancellation: CancellationSignal,
+    ) -> Result<DeploymentRunOutcome, DeploymentOrchestratorError> {
         let run = claim_deployment_run(&self.db, deployment_run_id).await?;
+        if !run.cancel_requested_at.is_empty() {
+            cancellation.cancel();
+        }
         let plan: DeploymentPlan = serde_json::from_str(&run.plan_json).map_err(|error| {
             DeploymentOrchestratorError::Validation(format!("部署计划快照损坏: {error}"))
         })?;
@@ -410,11 +483,17 @@ impl DeploymentOrchestratorService {
         }
         let mut waves = execution_waves(&plan.items);
         let mut failed = false;
+        let mut canceled = cancellation.is_cancelled();
         while let Some(items) = waves.pop_front() {
-            if failed {
+            if failed || canceled {
                 break;
             }
-            failed = execute_wave(
+            if cancellation_requested(&self.db, deployment_run_id).await? {
+                cancellation.cancel();
+                canceled = true;
+                break;
+            }
+            match execute_wave(
                 &self.db,
                 deployment_run_id,
                 run.task_id,
@@ -423,43 +502,325 @@ impl DeploymentOrchestratorService {
                 items,
                 run.max_parallel_units.max(1) as usize,
                 executor.clone(),
+                cancellation.clone(),
             )
-            .await?;
+            .await?
+            {
+                WaveOutcome::Success => {}
+                WaveOutcome::Failed => failed = true,
+                WaveOutcome::Canceled => canceled = true,
+            }
         }
-        if failed {
+        if failed || canceled {
+            let (failure_kind, failure_summary) = if canceled {
+                ("canceled_before_start", "部署已取消，本单元未启动")
+            } else {
+                (
+                    "blocked_by_previous_failure",
+                    "前序部署单元失败，本单元未启动",
+                )
+            };
             sqlx::query(
                 r#"
                 UPDATE deployment_unit_run_results
-                SET status = 'not_started', failure_kind = 'blocked_by_previous_failure',
-                    failure_summary = '前序部署单元失败，本单元未启动',
+                SET status = 'not_started', failure_kind = ?2,
+                    failure_summary = ?3,
                     finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 WHERE deployment_run_id = ?1 AND status = 'pending'
                 "#,
             )
             .bind(deployment_run_id)
+            .bind(failure_kind)
+            .bind(failure_summary)
             .execute(&self.db)
             .await?;
         }
-        finalize_deployment_run(&self.db, deployment_run_id, &plan).await
+        finalize_deployment_run(&self.db, deployment_run_id, &plan, canceled).await
     }
 
-    pub async fn reconcile_interrupted_runs(&self) -> Result<u64, DeploymentOrchestratorError> {
+    pub async fn run_control_for_task(
+        &self,
+        task_id: i64,
+    ) -> Result<Option<DeploymentRunControl>, DeploymentOrchestratorError> {
+        sqlx::query_as::<_, DeploymentRunControl>(
+            r#"
+            SELECT id AS deployment_run_id, status, cancel_requested_at, cancel_requested_by
+            FROM environment_deployment_runs
+            WHERE task_id = ?1
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(DeploymentOrchestratorError::from)
+    }
+
+    pub async fn request_cancellation(
+        &self,
+        deployment_run_id: i64,
+        actor: &str,
+    ) -> Result<bool, DeploymentOrchestratorError> {
+        let actor = actor.trim();
+        if actor.is_empty() {
+            return Err(DeploymentOrchestratorError::Validation(
+                "取消部署必须记录操作人".to_owned(),
+            ));
+        }
         let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
-        let run_ids = sqlx::query_scalar::<_, i64>(
+        let run: Option<(i64, String, Option<String>)> = sqlx::query_as(
+            "SELECT task_id, status, cancel_requested_at FROM environment_deployment_runs WHERE id = ?1 AND task_id IS NOT NULL",
+        )
+        .bind(deployment_run_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((task_id, status, cancel_requested_at)) = run else {
+            return Err(DeploymentOrchestratorError::NotFound(
+                "部署执行不存在".to_owned(),
+            ));
+        };
+        if !matches!(status.as_str(), "queued" | "running") {
+            return Err(DeploymentOrchestratorError::Conflict(format!(
+                "部署当前状态为 {status}，不能取消"
+            )));
+        }
+        if cancel_requested_at.is_some() {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            r#"
+            UPDATE environment_deployment_runs
+            SET cancel_requested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                cancel_requested_by = ?2,
+                summary = '运维已请求取消，正在终止当前命令并等待执行收口',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1 AND status IN ('queued', 'running') AND cancel_requested_at IS NULL
+            "#,
+        )
+        .bind(deployment_run_id)
+        .bind(actor)
+        .execute(&mut *tx)
+        .await?;
+        if status == "queued" {
+            sqlx::query(
+                r#"
+                UPDATE deployment_unit_run_results
+                SET status = 'not_started', failure_kind = 'canceled_before_start',
+                    failure_summary = '部署在执行器领取前已取消，本单元未启动',
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE deployment_run_id = ?1 AND status = 'pending'
+                "#,
+            )
+            .bind(deployment_run_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                UPDATE environment_deployment_runs
+                SET status = 'canceled', summary = '部署在执行器领取前已取消，未向目标节点执行命令',
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1 AND status = 'queued'
+                "#,
+            )
+            .bind(deployment_run_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                UPDATE operation_tasks
+                SET status = 'canceled', phase = 'canceled',
+                    summary = ?2, exit_code = 1,
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1 AND status = 'queued'
+                "#,
+            )
+            .bind(task_id)
+            .bind(format!("{actor} 在部署开始前取消了任务"))
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                UPDATE operation_task_phases
+                SET status = 'skipped',
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE task_id = ?1 AND status IN ('pending', 'running')
+                "#,
+            )
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                UPDATE app_environments
+                SET last_deployment_status = 'canceled',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = (
+                    SELECT environment_id FROM environment_deployment_runs WHERE id = ?1
+                )
+                "#,
+            )
+            .bind(deployment_run_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO operation_task_logs(task_id, stream, content) VALUES (?1, 'system', ?2)",
+            )
+            .bind(task_id)
+            .bind(format!("{actor} 在执行器领取前取消部署，未执行目标节点命令"))
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(true);
+        }
+        sqlx::query(
+            r#"
+            UPDATE operation_tasks
+            SET summary = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1 AND status IN ('queued', 'running')
+            "#,
+        )
+        .bind(task_id)
+        .bind(format!("{actor} 请求取消部署，正在等待当前命令退出"))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO operation_task_logs(task_id, stream, content) VALUES (?1, 'system', ?2)",
+        )
+        .bind(task_id)
+        .bind(format!(
+            "{actor} 请求取消部署；仍在执行的单元将标记为目标状态未知，已完成结果保持不变"
+        ))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn reconcile_interrupted_runs(
+        &self,
+    ) -> Result<InterruptedRunRecovery, DeploymentOrchestratorError> {
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let queued_run_ids = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM environment_deployment_runs WHERE status = 'queued' ORDER BY id",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for run_id in &queued_run_ids {
+            sqlx::query(
+                r#"
+                UPDATE deployment_unit_run_results
+                SET status = 'not_started', failure_kind = 'process_restarted_before_start',
+                    failure_summary = '控制台进程在部署开始前重启，本单元未执行',
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE deployment_run_id = ?1 AND status = 'pending'
+                "#,
+            )
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                UPDATE environment_deployment_runs
+                SET status = 'canceled', summary = '控制台进程在部署开始前重启，已安全取消等待中的部署',
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1 AND status = 'queued'
+                "#,
+            )
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                UPDATE operation_tasks
+                SET status = 'canceled', phase = 'canceled',
+                    summary = '控制台进程在部署开始前重启，任务未执行', exit_code = 1,
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = (SELECT task_id FROM environment_deployment_runs WHERE id = ?1)
+                  AND status IN ('queued', 'running')
+                "#,
+            )
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                UPDATE operation_task_phases
+                SET status = 'skipped', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE task_id = (SELECT task_id FROM environment_deployment_runs WHERE id = ?1)
+                  AND status IN ('pending', 'running')
+                "#,
+            )
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                UPDATE app_environments
+                SET last_deployment_status = 'canceled',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = (SELECT environment_id FROM environment_deployment_runs WHERE id = ?1)
+                "#,
+            )
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let running_run_ids = sqlx::query_scalar::<_, i64>(
             "SELECT id FROM environment_deployment_runs WHERE status = 'running' ORDER BY id",
         )
         .fetch_all(&mut *tx)
         .await?;
-        for run_id in &run_ids {
+        for run_id in &running_run_ids {
             sqlx::query(
                 r#"
                 UPDATE deployment_unit_run_results
-                SET status = 'canceled_unknown', failure_kind = 'process_interrupted',
-                    failure_summary = '控制台进程重启，无法确认远端执行是否已经停止',
+                SET status = CASE WHEN status = 'running' THEN 'canceled_unknown' ELSE 'not_started' END,
+                    failure_kind = 'process_interrupted',
+                    failure_summary = CASE
+                        WHEN status = 'running' THEN '控制台进程重启，无法确认远端执行是否已经停止'
+                        ELSE '控制台进程重启，后续部署单元未执行'
+                    END,
                     finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                WHERE deployment_run_id = ?1 AND status = 'running'
+                WHERE deployment_run_id = ?1 AND status IN ('pending', 'running')
+                "#,
+            )
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                UPDATE operation_task_steps
+                SET status = 'failed', exit_code = 1,
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE task_id = (SELECT task_id FROM environment_deployment_runs WHERE id = ?1)
+                  AND status = 'running'
+                "#,
+            )
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                UPDATE operation_task_phases
+                SET status = CASE WHEN status = 'running' THEN 'failed' ELSE 'skipped' END,
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE task_id = (SELECT task_id FROM environment_deployment_runs WHERE id = ?1)
+                  AND status IN ('pending', 'running')
                 "#,
             )
             .bind(run_id)
@@ -504,7 +865,142 @@ impl DeploymentOrchestratorService {
             .await?;
         }
         tx.commit().await?;
-        Ok(run_ids.len() as u64)
+        Ok(InterruptedRunRecovery {
+            reconciling_runs: running_run_ids.len() as u64,
+            canceled_queued_runs: queued_run_ids.len() as u64,
+        })
+    }
+
+    pub async fn confirm_interrupted_run_stopped(
+        &self,
+        deployment_run_id: i64,
+        actor: &str,
+        note: &str,
+    ) -> Result<DeploymentRunOutcome, DeploymentOrchestratorError> {
+        let actor = actor.trim();
+        let note = note.trim();
+        if actor.is_empty() {
+            return Err(DeploymentOrchestratorError::Validation(
+                "人工核对必须记录操作人".to_owned(),
+            ));
+        }
+        if note.is_empty() || note.chars().count() > 1000 {
+            return Err(DeploymentOrchestratorError::Validation(
+                "人工核对说明不能为空且不能超过 1000 个字符".to_owned(),
+            ));
+        }
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let run: Option<(Option<i64>, i64, String)> = sqlx::query_as(
+            "SELECT task_id, environment_id, status FROM environment_deployment_runs WHERE id = ?1",
+        )
+        .bind(deployment_run_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((task_id, environment_id, status)) = run else {
+            return Err(DeploymentOrchestratorError::NotFound(
+                "部署执行不存在".to_owned(),
+            ));
+        };
+        if status != "reconciling" {
+            return Err(DeploymentOrchestratorError::Conflict(format!(
+                "部署当前状态为 {status}，不需要人工解锁"
+            )));
+        }
+        let counts = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            r#"
+            SELECT
+                SUM(CASE WHEN status IN ('success', 'skipped') THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status IN ('failed', 'not_started') THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'canceled_unknown' THEN 1 ELSE 0 END),
+                COUNT(*)
+            FROM deployment_unit_run_results
+            WHERE deployment_run_id = ?1
+            "#,
+        )
+        .bind(deployment_run_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let final_status = if counts.0 > 0 {
+            "partial_failed"
+        } else if counts.2 > 0 {
+            "canceled"
+        } else {
+            "all_failed"
+        };
+        let summary = format!(
+            "人工确认旧执行已停止；共 {} 个部署单元：成功或跳过 {}，失败或未启动 {}，取消状态未知 {}；核对说明：{}",
+            counts.3, counts.0, counts.1, counts.2, note
+        );
+        sqlx::query(
+            r#"
+            UPDATE environment_deployment_runs
+            SET status = ?2, summary = ?3,
+                reconciled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                reconciled_by = ?4, reconciliation_note = ?5,
+                finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1 AND status = 'reconciling'
+            "#,
+        )
+        .bind(deployment_run_id)
+        .bind(final_status)
+        .bind(&summary)
+        .bind(actor)
+        .bind(note)
+        .execute(&mut *tx)
+        .await?;
+        if let Some(task_id) = task_id {
+            let task_status = if final_status == "canceled" {
+                "canceled"
+            } else {
+                "failed"
+            };
+            let task_phase = if task_status == "canceled" {
+                "canceled"
+            } else {
+                "failed"
+            };
+            sqlx::query(
+                r#"
+                UPDATE operation_tasks
+                SET status = ?2, phase = ?3, summary = ?4, exit_code = 1,
+                    finished_at = COALESCE(finished_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                "#,
+            )
+            .bind(task_id)
+            .bind(task_status)
+            .bind(task_phase)
+            .bind(&summary)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO operation_task_logs(task_id, stream, content) VALUES (?1, 'system', ?2)",
+            )
+            .bind(task_id)
+            .bind(format!("{actor} 确认旧执行已停止：{note}"))
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            r#"
+            UPDATE app_environments
+            SET runtime_status = 'unknown', last_deployment_status = ?2,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+            "#,
+        )
+        .bind(environment_id)
+        .bind(final_status)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(DeploymentRunOutcome {
+            deployment_run_id,
+            status: final_status.to_owned(),
+            summary,
+        })
     }
 
     pub async fn fail_run_on_internal_error(
@@ -541,14 +1037,22 @@ impl DeploymentOrchestratorService {
         .bind(&summary)
         .execute(&mut *tx)
         .await?;
-        let succeeded: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM deployment_unit_run_results WHERE deployment_run_id = ?1 AND status IN ('success', 'skipped')",
+        let (succeeded, canceled_unknown): (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+                SUM(CASE WHEN status IN ('success', 'skipped') THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'canceled_unknown' THEN 1 ELSE 0 END)
+            FROM deployment_unit_run_results
+            WHERE deployment_run_id = ?1
+            "#,
         )
         .bind(deployment_run_id)
         .fetch_one(&mut *tx)
         .await?;
         let run_status = if succeeded > 0 {
             "partial_failed"
+        } else if canceled_unknown > 0 {
+            "canceled"
         } else {
             "all_failed"
         };
@@ -590,16 +1094,22 @@ impl DeploymentOrchestratorService {
         .bind(task_id)
         .execute(&mut *tx)
         .await?;
+        let task_status = if run_status == "canceled" {
+            "canceled"
+        } else {
+            "failed"
+        };
         sqlx::query(
             r#"
             UPDATE operation_tasks
-            SET status = 'failed', phase = 'failed', summary = ?2, exit_code = 1,
+            SET status = ?2, phase = ?2, summary = ?3, exit_code = 1,
                 finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE id = ?1 AND status IN ('queued', 'running')
             "#,
         )
         .bind(task_id)
+        .bind(task_status)
         .bind(&summary)
         .execute(&mut *tx)
         .await?;
@@ -630,7 +1140,7 @@ async fn claim_deployment_run(
     let run = sqlx::query_as::<_, ExecutionRunRow>(
         r#"
         SELECT runs.task_id, runs.environment_id, runs.plan_hash, runs.plan_json,
-               environments.max_parallel_units
+               environments.max_parallel_units, COALESCE(runs.cancel_requested_at, '') AS cancel_requested_at
         FROM environment_deployment_runs runs
         JOIN app_environments environments ON environments.id = runs.environment_id
         WHERE runs.id = ?1 AND runs.status = 'queued' AND runs.task_id IS NOT NULL
@@ -682,6 +1192,19 @@ async fn claim_deployment_run(
     Ok(run)
 }
 
+async fn cancellation_requested(
+    db: &SqlitePool,
+    deployment_run_id: i64,
+) -> Result<bool, DeploymentOrchestratorError> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT cancel_requested_at IS NOT NULL FROM environment_deployment_runs WHERE id = ?1",
+    )
+    .bind(deployment_run_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| DeploymentOrchestratorError::NotFound("部署执行不存在".to_owned()))
+}
+
 fn execution_waves(items: &[DeploymentPlanItem]) -> VecDeque<Vec<DeploymentPlanItem>> {
     let mut waves = VecDeque::new();
     let executable = items
@@ -718,12 +1241,17 @@ async fn execute_wave(
     items: Vec<DeploymentPlanItem>,
     max_parallel: usize,
     executor: Arc<dyn DeploymentUnitExecutor>,
-) -> Result<bool, DeploymentOrchestratorError> {
+    cancellation: CancellationSignal,
+) -> Result<WaveOutcome, DeploymentOrchestratorError> {
     let mut pending = VecDeque::from(items);
     let mut running = tokio::task::JoinSet::new();
     let mut failure_seen = false;
+    let mut cancellation_seen = cancellation.is_cancelled();
     while !pending.is_empty() || !running.is_empty() {
-        while !failure_seen && running.len() < max_parallel {
+        if cancellation.is_cancelled() {
+            cancellation_seen = true;
+        }
+        while !failure_seen && !cancellation_seen && running.len() < max_parallel {
             let Some(item) = pending.pop_front() else {
                 break;
             };
@@ -736,6 +1264,7 @@ async fn execute_wave(
                 environment_id,
                 target_node_ids: target_node_ids.to_vec(),
                 item: item.clone(),
+                cancellation: cancellation.clone(),
             };
             running.spawn(async move {
                 let outcome = executor.execute(context).await;
@@ -748,8 +1277,10 @@ async fn execute_wave(
         let (item, step_id, outcome) = joined.map_err(|error| {
             DeploymentOrchestratorError::Database(format!("部署单元执行任务异常终止: {error}"))
         })?;
-        if !matches!(outcome, UnitExecutionOutcome::Success { .. }) {
-            failure_seen = true;
+        match &outcome {
+            UnitExecutionOutcome::Success { .. } => {}
+            UnitExecutionOutcome::Failed { .. } => failure_seen = true,
+            UnitExecutionOutcome::CanceledUnknown { .. } => cancellation_seen = true,
         }
         persist_unit_outcome(
             db,
@@ -763,7 +1294,13 @@ async fn execute_wave(
         )
         .await?;
     }
-    Ok(failure_seen)
+    Ok(if cancellation_seen {
+        WaveOutcome::Canceled
+    } else if failure_seen {
+        WaveOutcome::Failed
+    } else {
+        WaveOutcome::Success
+    })
 }
 
 async fn start_unit_result(
@@ -954,6 +1491,7 @@ async fn finalize_deployment_run(
     db: &SqlitePool,
     deployment_run_id: i64,
     plan: &DeploymentPlan,
+    cancellation_requested: bool,
 ) -> Result<DeploymentRunOutcome, DeploymentOrchestratorError> {
     let counts = sqlx::query_as::<_, (i64, i64, i64, i64)>(
         r#"
@@ -972,18 +1510,21 @@ async fn finalize_deployment_run(
         "success"
     } else if counts.0 > 0 {
         "partial_failed"
-    } else if counts.2 > 0 {
+    } else if cancellation_requested || counts.2 > 0 {
         "canceled"
     } else {
         "all_failed"
     };
-    let summary = format!(
+    let mut summary = format!(
         "共 {} 个部署单元：成功或跳过 {}，失败或未启动 {}，取消状态未知 {}",
         counts.3, counts.0, counts.1, counts.2
     );
-    let task_status = match status {
-        "success" => "success",
-        "canceled" => "canceled",
+    if cancellation_requested && status != "success" {
+        summary.push_str("；部署由运维主动取消");
+    }
+    let task_status = match (status, cancellation_requested) {
+        ("success", _) => "success",
+        (_, true) | ("canceled", false) => "canceled",
         _ => "failed",
     };
     let environment_runtime = if status == "success" {
@@ -1747,6 +2288,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_error_during_unit_execution_preserves_unknown_cancellation_state() {
+        let db = database().await;
+        let fixture = DatabaseFixture::create(&db).await;
+        let service = DeploymentOrchestratorService::new(db.clone());
+        let preview = service
+            .preview(
+                fixture.environment_id,
+                fixture.app_release_id,
+                DeploymentMode::Force,
+            )
+            .await
+            .expect("preview deployment");
+        let run = service
+            .create_run(CreateDeploymentRunInput {
+                environment_id: fixture.environment_id,
+                app_release_id: fixture.app_release_id,
+                mode: DeploymentMode::Force,
+                expected_plan_hash: preview.plan_hash,
+                created_by: "operator".to_owned(),
+            })
+            .await
+            .expect("create run");
+        claim_deployment_run(&db, run.deployment_run_id)
+            .await
+            .expect("claim run");
+        sqlx::query(
+            "UPDATE deployment_unit_run_results SET status = 'running' WHERE deployment_run_id = ?1",
+        )
+        .bind(run.deployment_run_id)
+        .execute(&db)
+        .await
+        .expect("mark unit running");
+
+        assert!(
+            service
+                .fail_run_on_internal_error(run.deployment_run_id, "executor join failed")
+                .await
+                .expect("finalize running error")
+        );
+
+        let (run_status, task_status, unit_status, environment_status): (
+            String,
+            String,
+            String,
+            String,
+        ) = sqlx::query_as(
+            r#"
+            SELECT runs.status, tasks.status, results.status, environments.last_deployment_status
+            FROM environment_deployment_runs runs
+            JOIN operation_tasks tasks ON tasks.id = runs.task_id
+            JOIN deployment_unit_run_results results ON results.deployment_run_id = runs.id
+            JOIN app_environments environments ON environments.id = runs.environment_id
+            WHERE runs.id = ?1
+            "#,
+        )
+        .bind(run.deployment_run_id)
+        .fetch_one(&db)
+        .await
+        .expect("load finalized states");
+        assert_eq!(run_status, "canceled");
+        assert_eq!(task_status, "canceled");
+        assert_eq!(unit_status, "canceled_unknown");
+        assert_eq!(environment_status, "canceled");
+
+        let next_preview = service
+            .preview(
+                fixture.environment_id,
+                fixture.app_release_id,
+                DeploymentMode::Force,
+            )
+            .await
+            .expect("preview after failure finalization");
+        service
+            .create_run(CreateDeploymentRunInput {
+                environment_id: fixture.environment_id,
+                app_release_id: fixture.app_release_id,
+                mode: DeploymentMode::Force,
+                expected_plan_hash: next_preview.plan_hash,
+                created_by: "operator".to_owned(),
+            })
+            .await
+            .expect("finalized run must release lock");
+    }
+
+    #[tokio::test]
     async fn executes_same_stage_with_configured_parallel_limit() {
         let db = database().await;
         let fixture = DatabaseFixture::create(&db).await;
@@ -1862,6 +2488,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn running_deployment_cancellation_stops_executor_and_releases_lock() {
+        let db = database().await;
+        let fixture = DatabaseFixture::create(&db).await;
+        let service = DeploymentOrchestratorService::new(db.clone());
+        let preview = service
+            .preview(
+                fixture.environment_id,
+                fixture.app_release_id,
+                DeploymentMode::Force,
+            )
+            .await
+            .expect("preview");
+        let run = service
+            .create_run(CreateDeploymentRunInput {
+                environment_id: fixture.environment_id,
+                app_release_id: fixture.app_release_id,
+                mode: DeploymentMode::Force,
+                expected_plan_hash: preview.plan_hash,
+                created_by: "operator".to_owned(),
+            })
+            .await
+            .expect("create run");
+        let executor = Arc::new(WaitForCancellationExecutor::default());
+        let cancellation = CancellationSignal::new();
+        let execution = tokio::spawn({
+            let service = service.clone();
+            let executor = executor.clone();
+            let cancellation = cancellation.clone();
+            async move {
+                service
+                    .execute_run_with_cancellation(run.deployment_run_id, executor, cancellation)
+                    .await
+            }
+        });
+        executor
+            .started
+            .acquire()
+            .await
+            .expect("wait for unit execution")
+            .forget();
+
+        assert!(
+            service
+                .request_cancellation(run.deployment_run_id, "operator")
+                .await
+                .expect("request cancellation")
+        );
+        assert!(
+            !service
+                .request_cancellation(run.deployment_run_id, "operator")
+                .await
+                .expect("repeat cancellation is idempotent")
+        );
+        cancellation.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), execution)
+            .await
+            .expect("canceled execution must finish")
+            .expect("execution task must not panic")
+            .expect("canceled execution must finalize");
+        assert_eq!(outcome.status, "canceled");
+        let state = service
+            .run_control_for_task(run.task_id)
+            .await
+            .expect("load run control")
+            .expect("run control exists");
+        assert_eq!(state.status, "canceled");
+        assert_eq!(state.cancel_requested_by, "operator");
+        assert!(state.cancel_requested_at.is_some());
+        let unit_status: String = sqlx::query_scalar(
+            "SELECT status FROM deployment_unit_run_results WHERE deployment_run_id = ?1",
+        )
+        .bind(run.deployment_run_id)
+        .fetch_one(&db)
+        .await
+        .expect("load unit status");
+        assert_eq!(unit_status, "canceled_unknown");
+        let task_status: String =
+            sqlx::query_scalar("SELECT status FROM operation_tasks WHERE id = ?1")
+                .bind(run.task_id)
+                .fetch_one(&db)
+                .await
+                .expect("load task status");
+        assert_eq!(task_status, "canceled");
+
+        let next_preview = service
+            .preview(
+                fixture.environment_id,
+                fixture.app_release_id,
+                DeploymentMode::Force,
+            )
+            .await
+            .expect("preview after cancellation");
+        service
+            .create_run(CreateDeploymentRunInput {
+                environment_id: fixture.environment_id,
+                app_release_id: fixture.app_release_id,
+                mode: DeploymentMode::Force,
+                expected_plan_hash: next_preview.plan_hash,
+                created_by: "operator".to_owned(),
+            })
+            .await
+            .expect("canceled run must release environment lock");
+    }
+
+    #[tokio::test]
+    async fn restart_safely_cancels_unclaimed_queued_run() {
+        let db = database().await;
+        let fixture = DatabaseFixture::create(&db).await;
+        let service = DeploymentOrchestratorService::new(db.clone());
+        let preview = service
+            .preview(
+                fixture.environment_id,
+                fixture.app_release_id,
+                DeploymentMode::Normal,
+            )
+            .await
+            .expect("preview");
+        let run = service
+            .create_run(CreateDeploymentRunInput {
+                environment_id: fixture.environment_id,
+                app_release_id: fixture.app_release_id,
+                mode: DeploymentMode::Normal,
+                expected_plan_hash: preview.plan_hash,
+                created_by: "operator".to_owned(),
+            })
+            .await
+            .expect("create queued run");
+        let direct_cancel = crate::tasks::TaskService::new(db.clone())
+            .cancel_queued(run.task_id, "operator")
+            .await
+            .expect_err("generic task cancellation must not orphan deployment run");
+        assert!(direct_cancel.message().contains("部署取消入口"));
+
+        let recovery = service
+            .reconcile_interrupted_runs()
+            .await
+            .expect("recover interrupted runs");
+        assert_eq!(recovery.canceled_queued_runs, 1);
+        assert_eq!(recovery.reconciling_runs, 0);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM environment_deployment_runs WHERE id = ?1")
+                .bind(run.deployment_run_id)
+                .fetch_one(&db)
+                .await
+                .expect("load recovered run");
+        assert_eq!(status, "canceled");
+        let unit_status: String = sqlx::query_scalar(
+            "SELECT status FROM deployment_unit_run_results WHERE deployment_run_id = ?1",
+        )
+        .bind(run.deployment_run_id)
+        .fetch_one(&db)
+        .await
+        .expect("load recovered unit");
+        assert_eq!(unit_status, "not_started");
+    }
+
+    #[tokio::test]
     async fn interrupted_running_run_becomes_reconciling_and_keeps_lock() {
         let db = database().await;
         let fixture = DatabaseFixture::create(&db).await;
@@ -1895,13 +2678,12 @@ mod tests {
         .await
         .expect("mark unit running");
 
-        assert_eq!(
-            service
-                .reconcile_interrupted_runs()
-                .await
-                .expect("reconcile"),
-            1
-        );
+        let recovery = service
+            .reconcile_interrupted_runs()
+            .await
+            .expect("reconcile");
+        assert_eq!(recovery.reconciling_runs, 1);
+        assert_eq!(recovery.canceled_queued_runs, 0);
         let status: String =
             sqlx::query_scalar("SELECT status FROM environment_deployment_runs WHERE id = ?1")
                 .bind(run.deployment_run_id)
@@ -1929,6 +2711,68 @@ mod tests {
             .await
             .expect_err("reconciling run must retain lock");
         assert!(matches!(blocked, DeploymentOrchestratorError::Conflict(_)));
+
+        let outcome = service
+            .confirm_interrupted_run_stopped(
+                run.deployment_run_id,
+                "admin",
+                "已登录目标节点确认没有残留部署进程",
+            )
+            .await
+            .expect("confirm interrupted run stopped");
+        assert_eq!(outcome.status, "canceled");
+        let reconciliation: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT reconciled_by, reconciliation_note, reconciled_at FROM environment_deployment_runs WHERE id = ?1",
+        )
+        .bind(run.deployment_run_id)
+        .fetch_one(&db)
+        .await
+        .expect("load reconciliation audit");
+        assert_eq!(reconciliation.0, "admin");
+        assert!(reconciliation.1.contains("没有残留部署进程"));
+        assert!(reconciliation.2.is_some());
+
+        let next_preview = service
+            .preview(
+                fixture.environment_id,
+                fixture.app_release_id,
+                DeploymentMode::Force,
+            )
+            .await
+            .expect("preview after reconciliation");
+        service
+            .create_run(CreateDeploymentRunInput {
+                environment_id: fixture.environment_id,
+                app_release_id: fixture.app_release_id,
+                mode: DeploymentMode::Force,
+                expected_plan_hash: next_preview.plan_hash,
+                created_by: "operator".to_owned(),
+            })
+            .await
+            .expect("confirmed reconciliation must release lock");
+    }
+
+    struct WaitForCancellationExecutor {
+        started: tokio::sync::Semaphore,
+    }
+
+    impl Default for WaitForCancellationExecutor {
+        fn default() -> Self {
+            Self {
+                started: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DeploymentUnitExecutor for WaitForCancellationExecutor {
+        async fn execute(&self, context: UnitExecutionContext) -> UnitExecutionOutcome {
+            self.started.add_permits(1);
+            context.cancellation.cancelled().await;
+            UnitExecutionOutcome::CanceledUnknown {
+                summary: "模拟执行收到取消信号".to_owned(),
+            }
+        }
     }
 
     struct RecordingExecutor {

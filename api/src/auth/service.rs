@@ -37,6 +37,7 @@ const DEPLOYER_PERMISSION_KEYS: &[&str] = &[
     "apps.view",
     "services.view",
     "services.deploy",
+    "services.deploy.cancel",
     "services.logs",
     "services.rollback",
     "nodes.view",
@@ -2893,6 +2894,8 @@ mod tests {
 
         let deployer_permission_keys = role_permission_keys(&auth, "deployer").await;
         assert!(deployer_permission_keys.contains(&"tasks.retry".to_owned()));
+        assert!(deployer_permission_keys.contains(&"services.deploy.cancel".to_owned()));
+        assert!(!deployer_permission_keys.contains(&"services.deploy.reconcile".to_owned()));
         assert!(!deployer_permission_keys.contains(&"artifacts.upload".to_owned()));
         assert!(!deployer_permission_keys.contains(&"apps.status".to_owned()));
 
@@ -2902,6 +2905,8 @@ mod tests {
         assert!(operator_permission_keys.contains(&"nodes.install".to_owned()));
         assert!(!operator_permission_keys.contains(&"tasks.retry".to_owned()));
         assert!(!operator_permission_keys.contains(&"services.deploy".to_owned()));
+        assert!(!operator_permission_keys.contains(&"services.deploy.cancel".to_owned()));
+        assert!(!operator_permission_keys.contains(&"services.deploy.reconcile".to_owned()));
         assert!(!operator_permission_keys.contains(&"settings.update".to_owned()));
 
         let viewer_permission_keys = role_permission_keys(&auth, "viewer").await;
@@ -2910,6 +2915,8 @@ mod tests {
         assert!(!viewer_permission_keys.contains(&"artifacts.upload".to_owned()));
         assert!(!viewer_permission_keys.contains(&"nodes.install".to_owned()));
         assert!(!viewer_permission_keys.contains(&"settings.update".to_owned()));
+        assert!(!viewer_permission_keys.contains(&"services.deploy.cancel".to_owned()));
+        assert!(!viewer_permission_keys.contains(&"services.deploy.reconcile".to_owned()));
 
         let legacy_permission_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM admin_permissions WHERE permission_key = 'apps.delete'",
