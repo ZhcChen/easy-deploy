@@ -1,6 +1,15 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
+use flate2::read::GzDecoder;
+use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
+use tar::Archive;
+use tokio::fs;
 
 use crate::{
     application_config::{ApplicationConfigService, ConfigUnit},
@@ -71,6 +80,15 @@ pub struct UnitReleaseSpec {
     pub storage_object_key: String,
     pub storage_endpoint: String,
     pub storage_object_version_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedUnitRuntime {
+    pub root: PathBuf,
+    pub compose_path: PathBuf,
+    pub env_path: PathBuf,
+    pub package_path: Option<PathBuf>,
+    pub script_paths: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone, FromRow, PartialEq, Eq)]
@@ -301,6 +319,178 @@ impl DeploymentRuntimeService {
     }
 }
 
+pub async fn prepare_unit_runtime(
+    spec: &UnitExecutionSpec,
+    staging_root: &Path,
+) -> Result<PreparedUnitRuntime, DeploymentRuntimeError> {
+    validate_environment_variables(&spec.environment_variables)?;
+    let root = staging_root
+        .join(spec.app_id.to_string())
+        .join(spec.environment_id.to_string())
+        .join(spec.unit_id.to_string());
+    if fs::try_exists(&root)
+        .await
+        .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?
+    {
+        fs::remove_dir_all(&root)
+            .await
+            .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
+    }
+    fs::create_dir_all(&root)
+        .await
+        .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
+
+    let package_path = match &spec.release {
+        Some(release) if release.storage_provider == "local" => {
+            let source = release.package_path.clone();
+            let expected_checksum = release.checksum_sha256.clone();
+            let expected_size = release.size_bytes;
+            let extract_root = root.clone();
+            tokio::task::spawn_blocking(move || {
+                verify_and_extract_package(
+                    &source,
+                    &extract_root,
+                    &expected_checksum,
+                    expected_size,
+                )
+            })
+            .await
+            .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))??;
+            Some(release.package_path.clone())
+        }
+        Some(release) if release.storage_provider == "aliyun_oss" => {
+            return Err(DeploymentRuntimeError::Validation(
+                "OSS unit release must be downloaded before runtime preparation".to_owned(),
+            ));
+        }
+        Some(_) => {
+            return Err(DeploymentRuntimeError::Validation(
+                "unsupported unit release storage provider".to_owned(),
+            ));
+        }
+        None => None,
+    };
+
+    let compose_path = root.join("compose.yaml");
+    fs::write(&compose_path, spec.unit.compose_content.as_bytes())
+        .await
+        .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
+    let env_path = root.join(".env");
+    fs::write(
+        &env_path,
+        render_environment_file(&spec.environment_variables),
+    )
+    .await
+    .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
+    let scripts_root = root.join(".easy-deploy").join("scripts");
+    fs::create_dir_all(&scripts_root)
+        .await
+        .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
+    let mut script_paths = BTreeMap::new();
+    for (slot, content) in &spec.unit.scripts {
+        let file_name = script_file_name(slot)?;
+        let path = scripts_root.join(file_name);
+        fs::write(&path, content.as_bytes())
+            .await
+            .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
+        script_paths.insert(slot.clone(), path);
+    }
+    Ok(PreparedUnitRuntime {
+        root,
+        compose_path,
+        env_path,
+        package_path,
+        script_paths,
+    })
+}
+
+fn verify_and_extract_package(
+    package_path: &Path,
+    destination: &Path,
+    expected_checksum: &str,
+    expected_size: i64,
+) -> Result<(), DeploymentRuntimeError> {
+    let metadata = std::fs::metadata(package_path).map_err(|error| {
+        DeploymentRuntimeError::NotFound(format!("unit release package is unavailable: {error}"))
+    })?;
+    if expected_size > 0 && metadata.len() != expected_size as u64 {
+        return Err(DeploymentRuntimeError::Validation(format!(
+            "unit release package size mismatch: expected {expected_size}, got {}",
+            metadata.len()
+        )));
+    }
+    let mut file = File::open(package_path)
+        .map_err(|error| DeploymentRuntimeError::NotFound(error.to_string()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual_checksum = format!("{:x}", hasher.finalize());
+    if !expected_checksum.eq_ignore_ascii_case(&actual_checksum) {
+        return Err(DeploymentRuntimeError::Validation(
+            "unit release package checksum mismatch".to_owned(),
+        ));
+    }
+    let file = File::open(package_path)
+        .map_err(|error| DeploymentRuntimeError::NotFound(error.to_string()))?;
+    Archive::new(GzDecoder::new(file))
+        .unpack(destination)
+        .map_err(|error| {
+            DeploymentRuntimeError::Validation(format!(
+                "unit release package cannot be extracted safely: {error}"
+            ))
+        })
+}
+
+fn validate_environment_variables(
+    variables: &BTreeMap<String, String>,
+) -> Result<(), DeploymentRuntimeError> {
+    for (name, value) in variables {
+        let valid_name = !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            && !name.as_bytes()[0].is_ascii_digit();
+        if !valid_name || value.contains(['\r', '\n']) {
+            return Err(DeploymentRuntimeError::Validation(format!(
+                "invalid deployment environment variable {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn render_environment_file(variables: &BTreeMap<String, String>) -> Vec<u8> {
+    let mut output = String::new();
+    for (name, value) in variables {
+        output.push_str(name);
+        output.push('=');
+        output.push_str(value);
+        output.push('\n');
+    }
+    output.into_bytes()
+}
+
+fn script_file_name(slot: &str) -> Result<&'static str, DeploymentRuntimeError> {
+    match slot {
+        "pre_deploy" => Ok("pre-deploy.sh"),
+        "deploy" => Ok("deploy.sh"),
+        "post_deploy" => Ok("post-deploy.sh"),
+        "switch_traffic" => Ok("switch-traffic.sh"),
+        "cleanup" => Ok("cleanup.sh"),
+        _ => Err(DeploymentRuntimeError::Validation(format!(
+            "unsupported deployment script slot {slot}"
+        ))),
+    }
+}
+
 fn environment_variables(
     secrets: &BTreeMap<String, String>,
     environment_key: &str,
@@ -319,6 +509,8 @@ fn environment_variables(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{Compression, write::GzEncoder};
+    use tempfile::tempdir;
 
     #[test]
     fn extracts_only_selected_environment_and_unit_secrets() {
@@ -331,5 +523,101 @@ mod tests {
             environment_variables(&values, "production", "api"),
             BTreeMap::from([("DATABASE_URL".to_owned(), "prod".to_owned())])
         );
+    }
+
+    #[tokio::test]
+    async fn prepares_verified_package_compose_environment_and_scripts() {
+        let temp = tempdir().expect("create temp dir");
+        let package_path = temp.path().join("api.tar.gz");
+        let package = File::create(&package_path).expect("create package");
+        let encoder = GzEncoder::new(package, Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let payload = b"release-content";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("release.txt").expect("set path");
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append(&header, payload.as_slice())
+            .expect("append payload");
+        let encoder = archive.into_inner().expect("finish archive");
+        encoder.finish().expect("finish gzip");
+        let bytes = std::fs::read(&package_path).expect("read package");
+        let checksum = format!("{:x}", Sha256::digest(&bytes));
+        let spec = UnitExecutionSpec {
+            app_id: 1,
+            app_key: "orders".to_owned(),
+            environment_id: 2,
+            environment_key: "production".to_owned(),
+            config_revision_id: 3,
+            config_hash: "config-hash".to_owned(),
+            unit_id: 4,
+            unit_key: "api".to_owned(),
+            unit: ConfigUnit {
+                key: "api".to_owned(),
+                name: "API".to_owned(),
+                required: true,
+                status: "active".to_owned(),
+                work_dir: "/srv/orders/api".to_owned(),
+                compose_content: "services:\n  api:\n    image: example/api".to_owned(),
+                scripts: BTreeMap::from([("deploy".to_owned(), "docker compose up -d".to_owned())]),
+                health_check: serde_json::json!({}),
+            },
+            action: DeploymentAction::Deploy,
+            release: Some(UnitReleaseSpec {
+                id: 5,
+                version: "1.0.0".to_owned(),
+                version_code: 100,
+                package_name: "api.tar.gz".to_owned(),
+                package_path: package_path.clone(),
+                checksum_sha256: checksum,
+                size_bytes: bytes.len() as i64,
+                storage_provider: "local".to_owned(),
+                storage_bucket: String::new(),
+                storage_object_key: String::new(),
+                storage_endpoint: String::new(),
+                storage_object_version_id: String::new(),
+            }),
+            target_nodes: Vec::new(),
+            environment_variables: BTreeMap::from([("APP_SECRET".to_owned(), "secret".to_owned())]),
+        };
+
+        let prepared = prepare_unit_runtime(&spec, &temp.path().join("staging"))
+            .await
+            .expect("prepare runtime");
+        assert_eq!(
+            fs::read_to_string(prepared.root.join("release.txt"))
+                .await
+                .expect("read extracted payload"),
+            "release-content"
+        );
+        assert_eq!(
+            fs::read_to_string(prepared.env_path)
+                .await
+                .expect("read env"),
+            "APP_SECRET=secret\n"
+        );
+        assert!(prepared.compose_path.is_file());
+        assert!(prepared.script_paths["deploy"].is_file());
+
+        let mut corrupted = spec;
+        corrupted.release.as_mut().expect("release").checksum_sha256 = "0".repeat(64);
+        assert!(matches!(
+            prepare_unit_runtime(&corrupted, &temp.path().join("bad-staging")).await,
+            Err(DeploymentRuntimeError::Validation(message)) if message.contains("checksum")
+        ));
+    }
+
+    #[test]
+    fn rejects_environment_file_injection_and_unknown_script_slots() {
+        assert!(
+            validate_environment_variables(&BTreeMap::from([(
+                "TOKEN".to_owned(),
+                "value\nINJECTED=true".to_owned()
+            )]))
+            .is_err()
+        );
+        assert!(script_file_name("unknown").is_err());
     }
 }
