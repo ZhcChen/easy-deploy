@@ -55,6 +55,8 @@
             <th class="sticky-col sticky-col-start">应用</th>
             <th>环境</th>
             <th>运行状态</th>
+            <th>目标版本</th>
+            <th>部署状态</th>
             <th>启用状态</th>
             <th>最近更新</th>
             {% if can_toggle_status %}
@@ -65,7 +67,7 @@
         <tbody>
           {% if apps.len() == 0 %}
             <tr>
-              <td colspan="{% if can_toggle_status %}6{% else %}5{% endif %}">
+              <td colspan="{% if can_toggle_status %}8{% else %}7{% endif %}">
                 <div class="empty-state">
                   <strong>没有匹配的应用</strong>
                   <span>调整筛选条件，或创建 Compose 应用后再查看。</span>
@@ -85,11 +87,31 @@
               <td>
                 <span class="badge tone-{{ app.runtime_status_tone }}">{{ app.runtime_status }}</span>
               </td>
+              <td>
+                <strong>{{ app.latest_version }}</strong>
+                <span>{{ app.unit_count }} 个部署单元</span>
+              </td>
+              <td>
+                <span class="badge tone-{{ app.deployment_status_tone }}">{{ app.deployment_status }}</span>
+                {% match app.active_run_id %}
+                  {% when Some with (run_id) %}<a class="text-link" href="/apps/{{ app.id }}#environment-deployment-history-title">查看过程 #{{ run_id }}</a>
+                  {% when None %}
+                {% endmatch %}
+              </td>
               <td><span class="badge tone-{{ app.enabled_status_tone }}">{{ app.enabled_status }}</span></td>
               <td><strong>{{ app.updated_at }}</strong></td>
               {% if can_toggle_status %}
                 <td class="app-actions-col sticky-col sticky-col-end">
                   <div class="inline-actions row-actions">
+                    {% if app.can_deploy %}
+                      {% match app.environment_id %}
+                        {% when Some with (environment_id) %}
+                          <a class="primary-button compact-button" href="/apps/{{ app.id }}/deploy?environment_id={{ environment_id }}">部署</a>
+                        {% when None %}
+                      {% endmatch %}
+                    {% else %}
+                      <span class="ghost-button compact-button is-disabled" aria-disabled="true">部署</span>
+                    {% endif %}
                     <form method="post" action="/apps/{{ app.id }}/status">
                       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                       <input type="hidden" name="status" value="{{ app.toggle_status }}">

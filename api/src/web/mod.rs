@@ -48,7 +48,7 @@ use crate::{
     },
     catalog::compose_templates,
     deployment_console::DeploymentConsoleService,
-    deployment_orchestrator::DeploymentOrchestratorService,
+    deployment_orchestrator::{DeploymentAction, DeploymentMode, DeploymentOrchestratorService},
     deployment_retention::{DeploymentLogService, DeploymentRetentionService},
     events::{EventLogError, EventLogFilter, EventLogService},
     health::{HealthCheckKind, normalize_health_config},
@@ -66,18 +66,20 @@ use crate::{
 use templates::{
     AccountRow, AccountsTemplate, ApiTokenPageRow, ApiTokensTemplate, AppConfigSnapshotRow,
     AppDeployDiffRow, AppDeployDiffView, AppDeploymentRunRow, AppDetailTemplate, AppNodeChoiceRow,
-    AppPageRow, AppRow, AppRuntimeStateRow, AppTargetChoiceRow, AppsTemplate, ArtifactAppOptionRow,
+    AppPageRow, AppRow, AppRuntimeStateRow, AppTargetChoiceRow, ApplicationDeployPlanRow,
+    ApplicationDeployTemplate, ApplicationReleaseRow, AppsTemplate, ArtifactAppOptionRow,
     ArtifactPageRow, ArtifactsTemplate, AuditFilterOptionRow, AuditLogRow, AuditTemplate,
     ComposeResultView, DashboardTemplate, DeployConfirmTargetNodeRow, DeployConfirmTemplate,
     DeployPlanFileRow, DeployPlanStepRow, DeployPreflightActionRow, DeployPreflightCheckRow,
-    DeployPreflightRow, EventLogRow, EventsTemplate, LoginTemplate, NavItem, NavSection,
-    NodeAppRuntimeRow, NodeCapabilityGuideRow, NodeCheckHistoryRow, NodeCredentialOptionRow,
-    NodeCredentialPageRow, NodeCredentialsTemplate, NodeDetailModalRow, NodeDetailTemplate,
-    NodePageRow, NodeRow, NodeTaskRow, NodesTemplate, PermissionGroup, PermissionRow,
-    PermissionsTemplate, ProfileTemplate, RbacFilterOptionRow, ReleaseQueueRow, RoleRow,
-    RolesTemplate, ServiceLogTailOptionRow, ServiceLogsTemplate, ServiceNodeLinkRow,
-    ServicePageRow, ServicesTemplate, SessionRow, SessionsTemplate, SettingsRow, SettingsTemplate,
-    SummaryItem, TaskAppFilterRow, TaskDetailTemplate, TaskDetailView, TaskExecutionGuideView,
+    DeployPreflightRow, DeploymentEnvironmentRow, DeploymentUnitRow, EnvironmentDeploymentRunRow,
+    EventLogRow, EventsTemplate, LoginTemplate, NavItem, NavSection, NodeAppRuntimeRow,
+    NodeCapabilityGuideRow, NodeCheckHistoryRow, NodeCredentialOptionRow, NodeCredentialPageRow,
+    NodeCredentialsTemplate, NodeDetailModalRow, NodeDetailTemplate, NodePageRow, NodeRow,
+    NodeTaskRow, NodesTemplate, PermissionGroup, PermissionRow, PermissionsTemplate,
+    ProfileTemplate, RbacFilterOptionRow, ReleaseQueueRow, RoleRow, RolesTemplate,
+    ServiceLogTailOptionRow, ServiceLogsTemplate, ServiceNodeLinkRow, ServicePageRow,
+    ServicesTemplate, SessionRow, SessionsTemplate, SettingsRow, SettingsTemplate, SummaryItem,
+    TaskAppFilterRow, TaskDetailTemplate, TaskDetailView, TaskExecutionGuideView,
     TaskFilterOptionRow, TaskLogRow, TaskNodeResultRow, TaskPageRow, TaskPhaseGroupRow,
     TaskPhaseStepRow, TaskReturnActionView, TaskRow, TaskStepRow, TasksTemplate, TemplateCardRow,
     TemplatesTemplate, render_html,
@@ -229,6 +231,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/apps", get(apps_page))
         .route("/apps", post(create_app_submit))
         .route("/apps/{app_id}", get(app_detail_page))
+        .route("/apps/{app_id}/deploy", get(application_deploy_page))
         .route("/apps/{app_id}/status", post(app_status_submit))
         .route("/apps/{app_id}/metadata", post(app_metadata_submit))
         .route("/apps/{app_id}/config", post(app_config_submit))
@@ -896,6 +899,14 @@ struct AppsQuery {
 #[derive(Clone, Debug, Default, Deserialize)]
 struct AppDetailQuery {
     notice: Option<String>,
+    environment_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ApplicationDeployQuery {
+    environment_id: i64,
+    app_release_id: Option<i64>,
+    mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1128,9 +1139,22 @@ async fn apps_page(
     let page = normalize_page(query.page, total_pages);
     let page_start_index = (page - 1) * page_size;
     let page_end_index = (page_start_index + page_size).min(total_count);
-    let rows = filtered_apps[page_start_index..page_end_index]
-        .iter()
-        .map(|app| AppPageRow {
+    let mut rows = Vec::new();
+    for app in &filtered_apps[page_start_index..page_end_index] {
+        let deployment_environment = match state
+            .deployment_console()
+            .application_environments(app.id)
+            .await
+        {
+            Ok(environments) => environments.into_iter().next(),
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+            }
+        };
+        let active = deployment_environment
+            .as_ref()
+            .and_then(|environment| environment.active_run_id);
+        rows.push(AppPageRow {
             id: app.id,
             name: &app.name,
             app_key: &app.app_key,
@@ -1146,10 +1170,41 @@ async fn apps_page(
             enabled_status: app_enabled_status_label(&app.status),
             enabled_status_tone: app_enabled_status_tone(&app.status),
             updated_at: &app.updated_at,
+            latest_version: deployment_environment
+                .as_ref()
+                .and_then(|environment| environment.latest_version.clone())
+                .unwrap_or_else(|| "尚无应用版本".to_owned()),
+            deployment_status: deployment_environment
+                .as_ref()
+                .map(|environment| {
+                    console_deployment_status_label(&environment.last_deployment_status)
+                })
+                .unwrap_or("等待发布"),
+            deployment_status_tone: deployment_environment
+                .as_ref()
+                .map(|environment| {
+                    console_deployment_status_tone(&environment.last_deployment_status)
+                })
+                .unwrap_or("neutral"),
+            active_run_id: active,
+            environment_id: deployment_environment
+                .as_ref()
+                .map(|environment| environment.environment_id),
+            unit_count: deployment_environment
+                .as_ref()
+                .map(|environment| environment.unit_count)
+                .unwrap_or(0),
+            can_deploy: session.can(SERVICES_DEPLOY)
+                && app.status != "disabled"
+                && active.is_none()
+                && deployment_environment
+                    .as_ref()
+                    .and_then(|environment| environment.latest_release_id)
+                    .is_some(),
             toggle_status: app_status_toggle_value(&app.status),
             toggle_label: app_status_toggle_label(&app.status),
-        })
-        .collect::<Vec<_>>();
+        });
+    }
     let node_choices = node_options
         .iter()
         .map(|node| AppNodeChoiceRow {
@@ -1335,19 +1390,275 @@ async fn app_detail_page(
         Err(err) => return app_error_response(err),
     };
     render_app_detail(
+        &state,
         &session,
         detail,
         None,
         app_detail_notice_message(query.notice.as_deref()),
+        query.environment_id,
     )
+    .await
 }
 
-fn render_app_detail(
+async fn application_deploy_page(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Path(app_id): Path<i64>,
+    Query(query): Query<ApplicationDeployQuery>,
+) -> Response {
+    if !session.can(SERVICES_DEPLOY) {
+        return forbidden();
+    }
+    let detail = match state.apps().app_detail(app_id).await {
+        Ok(detail) => detail,
+        Err(error) => return app_error_response(error),
+    };
+    if detail.app.status == "disabled" {
+        return bad_request("应用已停用，不能创建部署".to_owned());
+    }
+    let console = match state
+        .deployment_console()
+        .application_detail(app_id, Some(query.environment_id))
+        .await
+    {
+        Ok(console) => console,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    let Some(environment) = console
+        .environments
+        .iter()
+        .find(|environment| environment.environment_id == query.environment_id)
+    else {
+        return (StatusCode::NOT_FOUND, "应用环境不存在").into_response();
+    };
+    if environment.environment_status != "ready" {
+        return bad_request("环境配置尚未就绪，不能部署".to_owned());
+    }
+    let selected_release_id = query.app_release_id.unwrap_or_else(|| {
+        console
+            .releases
+            .first()
+            .map(|release| release.release_id)
+            .unwrap_or_default()
+    });
+    if !console
+        .releases
+        .iter()
+        .any(|release| release.release_id == selected_release_id)
+    {
+        return bad_request("应用版本不存在或不可部署".to_owned());
+    }
+    let mode = match query.mode.as_deref().unwrap_or("normal") {
+        "normal" => DeploymentMode::Normal,
+        "force" => DeploymentMode::Force,
+        _ => return bad_request("部署模式必须是 normal 或 force".to_owned()),
+    };
+    let plan = match state
+        .deployment_orchestrator()
+        .preview(query.environment_id, selected_release_id, mode)
+        .await
+    {
+        Ok(plan) => plan,
+        Err(error) => return bad_request(error.to_string()),
+    };
+    let plan_rows = plan
+        .items
+        .iter()
+        .map(|item| ApplicationDeployPlanRow {
+            stage_no: item.stage_no,
+            unit_key: item.unit_key.clone(),
+            version: item
+                .release_version
+                .clone()
+                .unwrap_or_else(|| "停用".to_owned()),
+            action: deployment_action_label(item.action),
+            action_tone: deployment_action_tone(item.action),
+            reason: item.reason.clone(),
+        })
+        .collect::<Vec<_>>();
+    let deploy_count = plan
+        .items
+        .iter()
+        .filter(|item| !matches!(item.action, DeploymentAction::Skip | DeploymentAction::Stop))
+        .count();
+    let skip_count = plan
+        .items
+        .iter()
+        .filter(|item| item.action == DeploymentAction::Skip)
+        .count();
+    let stop_count = plan
+        .items
+        .iter()
+        .filter(|item| item.action == DeploymentAction::Stop)
+        .count();
+    let releases = console
+        .releases
+        .iter()
+        .map(|release| ApplicationReleaseRow {
+            id: release.release_id,
+            version: release.version.clone(),
+            version_code: release.version_code,
+            unit_count: release.unit_count,
+            created_at: release.created_at.clone(),
+        })
+        .collect::<Vec<_>>();
+    let nav_sections = nav_sections("/apps", &session);
+    render_html(ApplicationDeployTemplate {
+        product_name: "Easy Deploy",
+        css: include_str!("../../assets/app.css"),
+        asset_version: ASSET_VERSION,
+        release_version: concat!("v", env!("CARGO_PKG_VERSION")),
+        current_user: session.display_name(),
+        csrf_token: &session.csrf_token,
+        nav_sections: &nav_sections,
+        app_id,
+        app_name: &detail.app.name,
+        environment_id: environment.environment_id,
+        environment_name: &environment.environment_name,
+        releases: &releases,
+        selected_release_id,
+        mode: if mode == DeploymentMode::Force {
+            "force"
+        } else {
+            "normal"
+        },
+        mode_label: if mode == DeploymentMode::Force {
+            "强制全量"
+        } else {
+            "正常部署"
+        },
+        plan_hash: &plan.plan_hash,
+        plan_rows: &plan_rows,
+        deploy_count,
+        skip_count,
+        stop_count,
+        has_active_run: environment.active_run_id.is_some(),
+        active_run_id: environment.active_run_id.unwrap_or_default(),
+    })
+}
+
+async fn render_app_detail(
+    state: &AppState,
     session: &CurrentSession,
     detail: crate::apps::AppConfigDetail,
     compose_result: Option<ComposeResultView>,
     notice: Option<&str>,
+    selected_environment_id: Option<i64>,
 ) -> Response {
+    let console = match state
+        .deployment_console()
+        .application_detail(detail.app.id, selected_environment_id)
+        .await
+    {
+        Ok(console) => console,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    let selected_environment_id = selected_environment_id
+        .filter(|id| {
+            console
+                .environments
+                .iter()
+                .any(|environment| environment.environment_id == *id)
+        })
+        .or_else(|| {
+            console
+                .environments
+                .first()
+                .map(|environment| environment.environment_id)
+        })
+        .unwrap_or_default();
+    let deployment_environments = console
+        .environments
+        .iter()
+        .map(|environment| DeploymentEnvironmentRow {
+            id: environment.environment_id,
+            name: environment.environment_name.clone(),
+            key: environment.environment_key.clone(),
+            status: environment_status_label(&environment.environment_status),
+            status_tone: environment_status_tone(&environment.environment_status),
+            runtime_status: environment_runtime_status_label(&environment.runtime_status),
+            runtime_tone: environment_runtime_status_tone(&environment.runtime_status),
+            latest_version: environment
+                .latest_version
+                .clone()
+                .unwrap_or_else(|| "尚无应用版本".to_owned()),
+            target_count: environment.target_count,
+            active_run_id: environment.active_run_id,
+            active_run_status: environment.active_run_status.clone().unwrap_or_default(),
+            selected: environment.environment_id == selected_environment_id,
+        })
+        .collect::<Vec<_>>();
+    let deployment_units = console
+        .units
+        .iter()
+        .map(|unit| {
+            let (runtime_status, runtime_tone) = unit_runtime_summary(unit);
+            DeploymentUnitRow {
+                key: unit.unit_key.clone(),
+                name: unit.unit_name.clone(),
+                stage: format!("阶段 {} · {}", unit.stage_no, unit.stage_name),
+                lifecycle_status: if unit.lifecycle_status == "active" {
+                    "启用"
+                } else {
+                    "停用"
+                },
+                lifecycle_tone: if unit.lifecycle_status == "active" {
+                    "success"
+                } else {
+                    "neutral"
+                },
+                latest_version: unit
+                    .latest_version
+                    .clone()
+                    .unwrap_or_else(|| "尚无发布包".to_owned()),
+                runtime_status,
+                runtime_tone,
+                work_dir: unit.work_dir.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let application_releases = console
+        .releases
+        .iter()
+        .map(|release| ApplicationReleaseRow {
+            id: release.release_id,
+            version: release.version.clone(),
+            version_code: release.version_code,
+            unit_count: release.unit_count,
+            created_at: release.created_at.clone(),
+        })
+        .collect::<Vec<_>>();
+    let environment_runs = console
+        .runs
+        .iter()
+        .map(|run| EnvironmentDeploymentRunRow {
+            id: run.run_id,
+            task_id: run.task_id,
+            environment_name: run.environment_name.clone(),
+            version: run.release_version.clone(),
+            mode: if run.deployment_mode == "force" {
+                "强制全量"
+            } else {
+                "正常部署"
+            },
+            status: console_deployment_status_label(&run.status),
+            status_tone: console_deployment_status_tone(&run.status),
+            result_summary: format!(
+                "{} 成功 · {} 失败 · {} 跳过 · {} 未完成",
+                run.success_count, run.failed_count, run.skipped_count, run.pending_count
+            ),
+            summary: if run.summary.is_empty() {
+                "暂无执行摘要".to_owned()
+            } else {
+                run.summary.clone()
+            },
+            created_at: run.created_at.clone(),
+        })
+        .collect::<Vec<_>>();
     let nav_sections = nav_sections("/apps", session);
     let app_enabled = detail.app.status != "disabled";
     let app_idle = !app_detail_is_deploying(&detail);
@@ -1515,6 +1826,11 @@ fn render_app_detail(
         health_timeout_secs: detail.health_check.timeout_secs,
         health_expected_status: detail.health_check.expected_status,
         deployment_runs: &deployment_runs,
+        deployment_environments: &deployment_environments,
+        deployment_units: &deployment_units,
+        application_releases: &application_releases,
+        environment_runs: &environment_runs,
+        selected_environment_id,
         config_snapshots: &config_snapshots,
         deploy_diff: &deploy_diff,
         runtime_states: &runtime_states,
@@ -1682,7 +1998,15 @@ async fn app_compose_config_submit(
         Ok(detail) => detail,
         Err(err) => return app_error_response(err),
     };
-    render_app_detail(&session, detail, Some(compose_result_view(command)), None)
+    render_app_detail(
+        &state,
+        &session,
+        detail,
+        Some(compose_result_view(command)),
+        None,
+        None,
+    )
+    .await
 }
 
 async fn app_compose_logs_submit(
@@ -1705,7 +2029,15 @@ async fn app_compose_logs_submit(
         Ok(detail) => detail,
         Err(err) => return app_error_response(err),
     };
-    render_app_detail(&session, detail, Some(compose_result_view(command)), None)
+    render_app_detail(
+        &state,
+        &session,
+        detail,
+        Some(compose_result_view(command)),
+        None,
+        None,
+    )
+    .await
 }
 
 async fn app_compose_confirm_page(
@@ -6917,6 +7249,104 @@ fn deployment_status_tone(status: &str) -> &'static str {
     }
 }
 
+fn environment_status_label(status: &str) -> &'static str {
+    match status {
+        "configuring" => "配置中",
+        "ready" => "可部署",
+        "disabled" => "已停用",
+        _ => "未知",
+    }
+}
+
+fn deployment_action_label(action: DeploymentAction) -> &'static str {
+    match action {
+        DeploymentAction::Deploy => "部署",
+        DeploymentAction::Skip => "跳过",
+        DeploymentAction::Start => "启动",
+        DeploymentAction::Stop => "停止",
+        DeploymentAction::Upgrade => "升级",
+        DeploymentAction::Downgrade => "降级",
+        DeploymentAction::Restore => "恢复结构",
+        DeploymentAction::ApplicationCheck => "应用检查",
+    }
+}
+
+fn deployment_action_tone(action: DeploymentAction) -> &'static str {
+    match action {
+        DeploymentAction::Skip => "neutral",
+        DeploymentAction::Stop | DeploymentAction::Downgrade | DeploymentAction::Restore => {
+            "warning"
+        }
+        _ => "active",
+    }
+}
+
+fn console_deployment_status_label(status: &str) -> &'static str {
+    match status {
+        "waiting" => "等待部署",
+        "queued" => "排队中",
+        "running" => "部署中",
+        "reconciling" => "待人工核对",
+        "success" => "成功",
+        "partial_failed" => "部分失败",
+        "all_failed" | "failed" => "全部失败",
+        "canceled" => "已取消",
+        _ => "未知",
+    }
+}
+
+fn console_deployment_status_tone(status: &str) -> &'static str {
+    match status {
+        "success" => "success",
+        "queued" | "running" => "active",
+        "reconciling" | "partial_failed" | "all_failed" | "failed" => "warning",
+        _ => "neutral",
+    }
+}
+
+fn environment_status_tone(status: &str) -> &'static str {
+    match status {
+        "ready" => "success",
+        "configuring" => "warning",
+        _ => "neutral",
+    }
+}
+
+fn environment_runtime_status_label(status: &str) -> &'static str {
+    match status {
+        "running" => "运行中",
+        "partial_unhealthy" => "部分异常",
+        "stopped" => "已停止",
+        _ => "未部署",
+    }
+}
+
+fn environment_runtime_status_tone(status: &str) -> &'static str {
+    match status {
+        "running" => "success",
+        "partial_unhealthy" => "warning",
+        _ => "neutral",
+    }
+}
+
+fn unit_runtime_summary(
+    unit: &crate::deployment_console::DeploymentUnitSummary,
+) -> (String, &'static str) {
+    if unit.deploying_count > 0 {
+        return (format!("{} 个节点部署中", unit.deploying_count), "active");
+    }
+    if unit.unhealthy_count > 0 {
+        return (format!("{} 个节点异常", unit.unhealthy_count), "warning");
+    }
+    if unit.node_count > 0 && unit.healthy_count == unit.node_count {
+        return (format!("{} 个节点健康", unit.healthy_count), "success");
+    }
+    if unit.node_count > 0 && unit.stopped_count == unit.node_count {
+        return (format!("{} 个节点已停止", unit.stopped_count), "neutral");
+    }
+    ("尚无可信运行状态".to_owned(), "neutral")
+}
+
 fn snapshot_kind_label(kind: &str) -> &'static str {
     match kind {
         "initial" => "初始配置",
@@ -10230,6 +10660,8 @@ mod tests {
         assert!(html.contains("name=\"app_type\" value=\"compose\""));
         assert!(html.contains("name=\"release_source\""));
         assert!(html.contains("value=\"package_upload\""));
+        assert!(html.contains("目标版本"));
+        assert!(html.contains("部署状态"));
         assert!(!html.contains("name=\"private_bucket\""));
         assert!(!html.contains("qfy-sc worker"));
         assert!(!html.contains("二进制直部署"));
@@ -11681,6 +12113,8 @@ mod tests {
             .expect("read body");
         let html = String::from_utf8_lossy(&body);
         assert!(html.contains("运行配置"));
+        assert!(html.contains("部署控制台"));
+        assert!(html.contains("应用部署历史"));
         assert!(!html.contains("versionCode 1002003"));
         assert!(!html.contains(&format!("/apps/{app_id}/binary/upload")));
         assert!(!html.contains("二进制配置"));

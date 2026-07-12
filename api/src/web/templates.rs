@@ -106,6 +106,11 @@ pub struct AppDetailTemplate<'a> {
     pub health_timeout_secs: u64,
     pub health_expected_status: u16,
     pub deployment_runs: &'a [AppDeploymentRunRow],
+    pub deployment_environments: &'a [DeploymentEnvironmentRow],
+    pub deployment_units: &'a [DeploymentUnitRow],
+    pub application_releases: &'a [ApplicationReleaseRow],
+    pub environment_runs: &'a [EnvironmentDeploymentRunRow],
+    pub selected_environment_id: i64,
     pub config_snapshots: &'a [AppConfigSnapshotRow],
     pub deploy_diff: &'a AppDeployDiffView,
     pub runtime_states: &'a [AppRuntimeStateRow],
@@ -592,6 +597,42 @@ pub struct SettingsTemplate<'a> {
     pub aliyun_oss_download_url_ttl_seconds: i64,
 }
 
+#[derive(Template)]
+#[template(path = "application_deploy.html")]
+pub struct ApplicationDeployTemplate<'a> {
+    pub product_name: &'a str,
+    pub css: &'a str,
+    pub asset_version: &'a str,
+    pub release_version: &'a str,
+    pub current_user: &'a str,
+    pub csrf_token: &'a str,
+    pub nav_sections: &'a [NavSection<'a>],
+    pub app_id: i64,
+    pub app_name: &'a str,
+    pub environment_id: i64,
+    pub environment_name: &'a str,
+    pub releases: &'a [ApplicationReleaseRow],
+    pub selected_release_id: i64,
+    pub mode: &'a str,
+    pub mode_label: &'a str,
+    pub plan_hash: &'a str,
+    pub plan_rows: &'a [ApplicationDeployPlanRow],
+    pub deploy_count: usize,
+    pub skip_count: usize,
+    pub stop_count: usize,
+    pub has_active_run: bool,
+    pub active_run_id: i64,
+}
+
+pub struct ApplicationDeployPlanRow {
+    pub stage_no: i64,
+    pub unit_key: String,
+    pub version: String,
+    pub action: &'static str,
+    pub action_tone: &'static str,
+    pub reason: String,
+}
+
 pub struct NavSection<'a> {
     pub label: &'a str,
     pub items: Vec<NavItem<'a>>,
@@ -753,8 +794,63 @@ pub struct AppPageRow<'a> {
     pub enabled_status: &'a str,
     pub enabled_status_tone: &'a str,
     pub updated_at: &'a str,
+    pub latest_version: String,
+    pub deployment_status: &'static str,
+    pub deployment_status_tone: &'static str,
+    pub active_run_id: Option<i64>,
+    pub environment_id: Option<i64>,
+    pub unit_count: i64,
+    pub can_deploy: bool,
     pub toggle_status: &'static str,
     pub toggle_label: &'static str,
+}
+
+pub struct DeploymentEnvironmentRow {
+    pub id: i64,
+    pub name: String,
+    pub key: String,
+    pub status: &'static str,
+    pub status_tone: &'static str,
+    pub runtime_status: &'static str,
+    pub runtime_tone: &'static str,
+    pub latest_version: String,
+    pub target_count: i64,
+    pub active_run_id: Option<i64>,
+    pub active_run_status: String,
+    pub selected: bool,
+}
+
+pub struct DeploymentUnitRow {
+    pub key: String,
+    pub name: String,
+    pub stage: String,
+    pub lifecycle_status: &'static str,
+    pub lifecycle_tone: &'static str,
+    pub latest_version: String,
+    pub runtime_status: String,
+    pub runtime_tone: &'static str,
+    pub work_dir: String,
+}
+
+pub struct ApplicationReleaseRow {
+    pub id: i64,
+    pub version: String,
+    pub version_code: i64,
+    pub unit_count: i64,
+    pub created_at: String,
+}
+
+pub struct EnvironmentDeploymentRunRow {
+    pub id: i64,
+    pub task_id: Option<i64>,
+    pub environment_name: String,
+    pub version: String,
+    pub mode: &'static str,
+    pub status: &'static str,
+    pub status_tone: &'static str,
+    pub result_summary: String,
+    pub summary: String,
+    pub created_at: String,
 }
 
 pub struct AppNodeChoiceRow<'a> {

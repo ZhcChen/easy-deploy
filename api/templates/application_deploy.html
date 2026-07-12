@@ -1,0 +1,26 @@
+{% extends "layout.html" %}
+{% block title %}部署 {{ app_name }} - {{ product_name }}{% endblock %}
+{% block topbar_actions %}<a class="ghost-button" href="/apps/{{ app_id }}?environment_id={{ environment_id }}">返回应用</a>{% endblock %}
+{% block content %}
+<section class="panel panel-large deploy-preview-panel" aria-labelledby="deploy-preview-title">
+  <div class="panel-header">
+    <div><h2 id="deploy-preview-title">部署 {{ app_name }}</h2><p>{{ environment_name }} · {{ mode_label }}</p></div>
+    {% if has_active_run %}<a class="ghost-button compact-button" href="/apps/{{ app_id }}?environment_id={{ environment_id }}#environment-deployment-history-title">查看活动部署 #{{ active_run_id }}</a>{% endif %}
+  </div>
+  <form class="deploy-preview-options" method="get" action="/apps/{{ app_id }}/deploy">
+    <input type="hidden" name="environment_id" value="{{ environment_id }}">
+    <label>应用版本<select name="app_release_id">{% for release in releases %}<option value="{{ release.id }}"{% if release.id == selected_release_id %} selected{% endif %}>{{ release.version }} · versionCode {{ release.version_code }}</option>{% endfor %}</select></label>
+    <fieldset><legend>部署模式</legend><div class="deploy-mode-picker">
+      <label class="deploy-mode-option{% if mode == "normal" %} is-active{% endif %}"><input type="radio" name="mode" value="normal"{% if mode == "normal" %} checked{% endif %}><strong>正常部署</strong><span>一致且健康的单元会跳过</span></label>
+      <label class="deploy-mode-option{% if mode == "force" %} is-active{% endif %}"><input type="radio" name="mode" value="force"{% if mode == "force" %} checked{% endif %}><strong>强制全量</strong><span>全部启用单元重新部署</span></label>
+    </div></fieldset>
+    <button class="ghost-button compact-button" type="submit">重新生成计划</button>
+  </form>
+  {% if has_active_run %}<div class="deploy-risk-summary tone-warning"><span>当前环境不可部署</span><strong>已有部署流程正在进行</strong><p>完成或人工核对后才能创建下一次部署。</p></div>{% endif %}
+  <section class="deploy-plan-summary" aria-label="计划汇总"><div><strong>{{ deploy_count }}</strong><span>执行</span></div><div><strong>{{ skip_count }}</strong><span>跳过</span></div><div><strong>{{ stop_count }}</strong><span>停止</span></div></section>
+  <div class="table-wrap"><table><thead><tr><th>阶段</th><th>部署单元</th><th>目标版本</th><th>动作</th><th>原因</th></tr></thead><tbody>
+    {% for row in plan_rows %}<tr><td>{{ row.stage_no }}</td><td><strong>{{ row.unit_key }}</strong></td><td>{{ row.version }}</td><td><span class="badge tone-{{ row.action_tone }}">{{ row.action }}</span></td><td>{{ row.reason }}</td></tr>{% endfor %}
+  </tbody></table></div>
+  <div class="deploy-preview-footer"><span>计划 hash：<code>{{ plan_hash }}</code></span></div>
+</section>
+{% endblock %}
