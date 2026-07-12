@@ -11,6 +11,7 @@ use api::{
     deploy::{
         CommandResult, CommandRunner, CommandSpec, ComposeExecutor, DeployError, SystemdExecutor,
     },
+    deployment_console::DeploymentConsoleService,
     deployment_orchestrator::DeploymentOrchestratorService,
     deployment_retention::{DeploymentLogService, DeploymentRetentionService},
     events::EventLogService,
@@ -199,6 +200,7 @@ pub async fn smoke_test() -> anyhow::Result<()> {
             application_config: None,
             application_releases: ApplicationReleaseService::new(db.clone()),
             deployment_orchestrator: DeploymentOrchestratorService::new(db.clone()),
+            deployment_console: DeploymentConsoleService::new(db.clone()),
             deployment_logs: DeploymentLogService::new(db.clone()),
             deployment_retention: DeploymentRetentionService::new(db.clone()),
         },

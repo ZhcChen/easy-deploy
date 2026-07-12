@@ -47,6 +47,7 @@ use crate::{
         TEMPLATES_VIEW, nav_permission, permission_dependencies,
     },
     catalog::compose_templates,
+    deployment_console::DeploymentConsoleService,
     deployment_orchestrator::DeploymentOrchestratorService,
     deployment_retention::{DeploymentLogService, DeploymentRetentionService},
     events::{EventLogError, EventLogFilter, EventLogService},
@@ -102,6 +103,7 @@ pub struct AppStateServices {
     pub application_config: Option<ApplicationConfigService>,
     pub application_releases: ApplicationReleaseService,
     pub deployment_orchestrator: DeploymentOrchestratorService,
+    pub deployment_console: DeploymentConsoleService,
     pub deployment_logs: DeploymentLogService,
     pub deployment_retention: DeploymentRetentionService,
 }
@@ -119,6 +121,7 @@ struct AppStateInner {
     application_config: Option<ApplicationConfigService>,
     application_releases: ApplicationReleaseService,
     deployment_orchestrator: DeploymentOrchestratorService,
+    deployment_console: DeploymentConsoleService,
     deployment_logs: DeploymentLogService,
     deployment_retention: DeploymentRetentionService,
     host_metrics: HostMetricsService,
@@ -142,6 +145,7 @@ impl AppState {
                 application_config: services.application_config,
                 application_releases: services.application_releases,
                 deployment_orchestrator: services.deployment_orchestrator,
+                deployment_console: services.deployment_console,
                 deployment_logs: services.deployment_logs,
                 deployment_retention: services.deployment_retention,
                 api_token_flashes: Mutex::new(HashMap::new()),
@@ -195,6 +199,10 @@ impl AppState {
 
     pub fn deployment_orchestrator(&self) -> &DeploymentOrchestratorService {
         &self.inner.deployment_orchestrator
+    }
+
+    pub fn deployment_console(&self) -> &DeploymentConsoleService {
+        &self.inner.deployment_console
     }
 
     pub fn deployment_logs(&self) -> &DeploymentLogService {
@@ -10044,6 +10052,7 @@ mod tests {
                     application_config: None,
                     application_releases: ApplicationReleaseService::new(db.clone()),
                     deployment_orchestrator: DeploymentOrchestratorService::new(db.clone()),
+                    deployment_console: DeploymentConsoleService::new(db.clone()),
                     deployment_logs: DeploymentLogService::new(db.clone()),
                     deployment_retention: DeploymentRetentionService::new(db.clone()),
                 },

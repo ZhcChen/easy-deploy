@@ -7,6 +7,7 @@ pub mod artifact_storage;
 pub mod auth;
 pub mod catalog;
 pub mod deploy;
+pub mod deployment_console;
 pub mod deployment_orchestrator;
 pub mod deployment_retention;
 pub mod events;

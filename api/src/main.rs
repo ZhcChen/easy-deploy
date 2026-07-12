@@ -9,6 +9,7 @@ use api::{
     auth::{AuthService, MemorySessionStore},
     build_router,
     deploy::{ComposeExecutor, SystemdExecutor, TokioCommandRunner, ssh_known_hosts_file},
+    deployment_console::DeploymentConsoleService,
     deployment_orchestrator::DeploymentOrchestratorService,
     deployment_retention::{DeploymentLogService, DeploymentRetentionService},
     events::EventLogService,
@@ -180,6 +181,7 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
         Some(ApplicationConfigService::new(db.clone(), cipher))
     };
     let application_releases = ApplicationReleaseService::new(db.clone());
+    let deployment_console = DeploymentConsoleService::new(db.clone());
     let apps = AppService::new(
         db.clone(),
         RuntimeFs::new(settings.data_dir.clone()),
@@ -208,6 +210,7 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
             application_config,
             application_releases,
             deployment_orchestrator,
+            deployment_console,
             deployment_logs,
             deployment_retention,
         },
