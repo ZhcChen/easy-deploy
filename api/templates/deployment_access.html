@@ -1,0 +1,66 @@
+{% extends "layout.html" %}
+
+{% block title %}部署接入 - {{ product_name }}{% endblock %}
+
+{% block topbar_actions %}
+  <a class="ghost-button" href="/docs/deployment" target="_blank" rel="noreferrer">新标签打开部署规范</a>
+{% endblock %}
+
+{% block content %}
+<section class="panel panel-large panel-full deployment-access-hero" aria-labelledby="deployment-access-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="deployment-access-title">部署接入</h2>
+      <p>面向业务项目 CI、AI 调用方和运维人员的部署配置、版本包、OpenAPI 与发布执行规范。</p>
+    </div>
+    <div class="panel-actions">
+      <a class="ghost-button" href="/docs/openapi" target="_blank" rel="noreferrer">OpenAPI 文档</a>
+      <a class="primary-button" href="/docs/deployment" target="_blank" rel="noreferrer">新标签打开独立文档</a>
+    </div>
+  </div>
+  <div class="deployment-access-summary">
+    <article>
+      <span>接入边界</span>
+      <strong>OpenAPI 只登记版本</strong>
+      <p>外部项目上传部署单元包并创建应用版本，不直接创建应用、不改配置、不触发部署。</p>
+    </article>
+    <article>
+      <span>发布入口</span>
+      <strong>后台手动启动</strong>
+      <p>运维在应用列表或详情中选择版本、环境和 normal/force 模式后启动部署。</p>
+    </article>
+    <article>
+      <span>多模块项目</span>
+      <strong>一个应用，多部署单元</strong>
+      <p>例如 qfy-voucher-hub 作为一个应用，gateway、api、admin、worker 等作为部署单元。</p>
+    </article>
+  </div>
+</section>
+
+<section class="panel panel-full" aria-labelledby="deployment-access-quick-title">
+  <div class="panel-header">
+    <div>
+      <h2 id="deployment-access-quick-title">接入步骤</h2>
+      <p>完整字段、示例 curl、脚本契约和清理策略以独立文档为准。</p>
+    </div>
+  </div>
+  <div class="deployment-access-steps">
+    <div>
+      <strong>1. 后台建应用与部署单元</strong>
+      <p>配置 Compose、独立 .env、目标节点、脚本、健康检查和环境配置版本。</p>
+    </div>
+    <div>
+      <strong>2. CI 上传单元发布包</strong>
+      <p>调用 <code>POST /api/v1/apps/{app_key}/units/{unit_key}/releases</code>，上传 version 与包文件。</p>
+    </div>
+    <div>
+      <strong>3. CI 创建应用版本</strong>
+      <p>调用 <code>POST /api/v1/apps/{app_key}/releases</code>，把多个单元版本拼成不可变 manifest。</p>
+    </div>
+    <div>
+      <strong>4. 运维手动部署</strong>
+      <p>选择 normal 或 force。normal 只执行目标状态不一致或不健康的单元；force 重新执行所有启用单元。</p>
+    </div>
+  </div>
+</section>
+{% endblock %}

@@ -431,6 +431,18 @@ pub struct ApiTokensTemplate<'a> {
 }
 
 #[derive(Template)]
+#[template(path = "deployment_access.html")]
+pub struct DeploymentAccessTemplate<'a> {
+    pub product_name: &'a str,
+    pub css: &'a str,
+    pub asset_version: &'a str,
+    pub release_version: &'a str,
+    pub current_user: &'a str,
+    pub csrf_token: &'a str,
+    pub nav_sections: &'a [NavSection<'a>],
+}
+
+#[derive(Template)]
 #[template(path = "nodes.html")]
 pub struct NodesTemplate<'a> {
     pub product_name: &'a str,

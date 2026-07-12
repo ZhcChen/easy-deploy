@@ -240,6 +240,25 @@ async fn run_checks(
         .await?;
     anyhow::ensure!(health == "ok", "unexpected health response: {health}");
 
+    let deployment_docs = client
+        .get(format!("{base_url}/docs/deployment"))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    ensure_contains_all(
+        &deployment_docs,
+        &[
+            "部署接入规范",
+            "/docs/openapi",
+            "POST /api/v1/apps/{app_key}/units/{unit_key}/releases",
+            "POST /api/v1/apps/{app_key}/releases",
+            "qfy-voucher-hub",
+        ],
+        "deployment docs should be public and describe the multi-unit OpenAPI flow",
+    )?;
+
     let redirect = client.get(&base_url).send().await?;
     anyhow::ensure!(
         redirect.status() == reqwest::StatusCode::SEE_OTHER,
@@ -338,7 +357,9 @@ async fn run_checks(
     );
     anyhow::ensure!(
         dashboard.contains("href=\"/admin/accounts\"")
-            && dashboard.contains("href=\"/admin/roles\""),
+            && dashboard.contains("href=\"/admin/roles\"")
+            && dashboard.contains("href=\"/admin/api-tokens\"")
+            && dashboard.contains("href=\"/deployment-access\""),
         "super admin should see RBAC navigation"
     );
     let settings_page = client
@@ -2209,7 +2230,9 @@ async fn run_checks(
             && !viewer_dashboard.contains("href=\"/admin/accounts\"")
             && !viewer_dashboard.contains("href=\"/admin/roles\"")
             && !viewer_dashboard.contains("href=\"/admin/permissions\"")
-            && !viewer_dashboard.contains("href=\"/admin/sessions\""),
+            && !viewer_dashboard.contains("href=\"/admin/sessions\"")
+            && !viewer_dashboard.contains("href=\"/admin/api-tokens\"")
+            && !viewer_dashboard.contains("href=\"/deployment-access\""),
         "viewer navigation should be permission filtered"
     );
     let forbidden_accounts = viewer_client

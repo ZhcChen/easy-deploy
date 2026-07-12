@@ -414,6 +414,7 @@ pub fn nav_permission(path: &str) -> Option<&'static str> {
         "/admin/permissions" => Some(RBAC_PERMISSIONS_VIEW),
         "/admin/sessions" => Some(RBAC_SESSIONS_VIEW),
         "/admin/api-tokens" => Some(API_TOKENS_VIEW),
+        "/deployment-access" => Some(API_TOKENS_VIEW),
         "/profile" => Some(PROFILE_VIEW),
         "/settings" => Some(SETTINGS_VIEW),
         "/audit" => Some(AUDIT_VIEW),

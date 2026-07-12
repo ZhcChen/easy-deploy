@@ -77,24 +77,24 @@ use templates::{
     ArtifactPageRow, ArtifactsTemplate, AuditFilterOptionRow, AuditLogRow, AuditTemplate,
     ComposeResultView, DashboardTemplate, DeployConfirmTargetNodeRow, DeployConfirmTemplate,
     DeployPlanFileRow, DeployPlanStepRow, DeployPreflightActionRow, DeployPreflightCheckRow,
-    DeployPreflightRow, DeploymentEnvironmentRow, DeploymentHistoryLogRow,
-    DeploymentHistoryTemplate, DeploymentHistoryUnitRow, DeploymentTaskControlView,
-    DeploymentUnitRow, EnvironmentDeploymentRunRow, EventLogRow, EventsTemplate, LoginTemplate,
-    NavItem, NavSection, NodeAppRuntimeRow, NodeCapabilityGuideRow, NodeCheckHistoryRow,
-    NodeCredentialOptionRow, NodeCredentialPageRow, NodeCredentialsTemplate, NodeDetailModalRow,
-    NodeDetailTemplate, NodePageRow, NodeRow, NodeTaskRow, NodesTemplate, PermissionGroup,
-    PermissionRow, PermissionsTemplate, ProfileTemplate, RbacFilterOptionRow, ReleaseQueueRow,
-    RoleRow, RolesTemplate, ServiceLogTailOptionRow, ServiceLogsTemplate, ServiceNodeLinkRow,
-    ServicePageRow, ServicesTemplate, SessionRow, SessionsTemplate, SettingsRow, SettingsTemplate,
-    SummaryItem, TaskAppFilterRow, TaskDetailTemplate, TaskDetailView, TaskExecutionGuideView,
-    TaskFilterOptionRow, TaskLogRow, TaskNodeResultRow, TaskPageRow, TaskPhaseGroupRow,
-    TaskPhaseStepRow, TaskReturnActionView, TaskRow, TaskStepRow, TasksTemplate, TemplateCardRow,
-    TemplatesTemplate, render_html,
+    DeployPreflightRow, DeploymentAccessTemplate, DeploymentEnvironmentRow,
+    DeploymentHistoryLogRow, DeploymentHistoryTemplate, DeploymentHistoryUnitRow,
+    DeploymentTaskControlView, DeploymentUnitRow, EnvironmentDeploymentRunRow, EventLogRow,
+    EventsTemplate, LoginTemplate, NavItem, NavSection, NodeAppRuntimeRow, NodeCapabilityGuideRow,
+    NodeCheckHistoryRow, NodeCredentialOptionRow, NodeCredentialPageRow, NodeCredentialsTemplate,
+    NodeDetailModalRow, NodeDetailTemplate, NodePageRow, NodeRow, NodeTaskRow, NodesTemplate,
+    PermissionGroup, PermissionRow, PermissionsTemplate, ProfileTemplate, RbacFilterOptionRow,
+    ReleaseQueueRow, RoleRow, RolesTemplate, ServiceLogTailOptionRow, ServiceLogsTemplate,
+    ServiceNodeLinkRow, ServicePageRow, ServicesTemplate, SessionRow, SessionsTemplate,
+    SettingsRow, SettingsTemplate, SummaryItem, TaskAppFilterRow, TaskDetailTemplate,
+    TaskDetailView, TaskExecutionGuideView, TaskFilterOptionRow, TaskLogRow, TaskNodeResultRow,
+    TaskPageRow, TaskPhaseGroupRow, TaskPhaseStepRow, TaskReturnActionView, TaskRow, TaskStepRow,
+    TasksTemplate, TemplateCardRow, TemplatesTemplate, render_html,
 };
 
 const LOGO_SVG: &str = include_str!("../../assets/logo.svg");
 const APP_JS: &str = include_str!("../../assets/app.js");
-const ASSET_VERSION: &str = "20260712-history-retention";
+const ASSET_VERSION: &str = "20260712-deployment-access";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -371,6 +371,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/admin/api-tokens", post(api_token_create_submit))
         .route("/admin/api-tokens/revoke", post(api_token_revoke_submit))
         .route("/admin/api-tokens/delete", post(api_token_delete_submit))
+        .route("/deployment-access", get(deployment_access_page))
         .route("/profile", get(profile_page))
         .route("/profile/password", post(profile_password_submit))
         .route("/settings", get(settings_page).post(settings_submit))
@@ -378,6 +379,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/events", get(events_page))
         .route("/openapi.json", get(openapi_json))
         .route("/docs/openapi", get(openapi_docs))
+        .route("/docs/deployment", get(deployment_docs))
         .route(
             "/api/v1/services/{service_key}/packages",
             post(api_v1_upload_service_package),
@@ -5834,6 +5836,22 @@ async fn api_tokens_page(
     render_api_tokens_page(&state, &session, created, query.notice.as_deref()).await
 }
 
+async fn deployment_access_page(session: CurrentSession) -> Response {
+    if !session.can(API_TOKENS_VIEW) {
+        return forbidden();
+    }
+    let nav_sections = nav_sections("/deployment-access", &session);
+    render_html(DeploymentAccessTemplate {
+        product_name: "Easy Deploy",
+        css: include_str!("../../assets/app.css"),
+        asset_version: ASSET_VERSION,
+        release_version: concat!("v", env!("CARGO_PKG_VERSION")),
+        current_user: session.display_name(),
+        csrf_token: &session.csrf_token,
+        nav_sections: &nav_sections,
+    })
+}
+
 async fn api_token_create_submit(
     State(state): State<AppState>,
     session: CurrentSession,
@@ -6388,6 +6406,10 @@ async fn openapi_json() -> impl IntoResponse {
 
 async fn openapi_docs() -> impl IntoResponse {
     Html(openapi_docs_public_html())
+}
+
+async fn deployment_docs() -> impl IntoResponse {
+    Html(deployment_docs_public_html())
 }
 
 async fn render_api_tokens_page(
@@ -9910,7 +9932,7 @@ fn openapi_spec() -> serde_json::Value {
         "info": {
             "title": "Easy Deploy Package Upload API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Easy Deploy OpenAPI 只提供版本包投递能力。应用、节点、环境变量、Compose 配置、部署脚本、自动/手动/定时发布策略都在平台后台维护。推荐流程是申请 OSS 直传地址、PUT 上传到 OSS、完成登记。"
+            "description": "Easy Deploy OpenAPI 只提供版本包与应用版本登记能力。应用、节点、环境变量、Compose 配置、部署脚本、自动/手动/定时发布策略都在平台后台维护。新的 app/unit release 接口只创建不可变版本，不触发部署；旧 services 包接口保留兼容语义，可能按应用发布设置自动入队。"
         },
         "servers": [
             { "url": "http://127.0.0.1:9066", "description": "本机默认地址" },
@@ -9958,7 +9980,7 @@ fn openapi_spec() -> serde_json::Value {
                 "post": {
                     "operationId": "createApplicationRelease",
                     "summary": "创建不可变应用发布版本",
-                    "description": "可基于任意历史应用版本，只提交变化单元；平台展开为完整单元与环境配置快照。只创建 ready 版本，不触发部署。",
+                    "description": "可基于任意历史应用版本，只提交变化单元；平台展开为完整单元与环境配置快照。无 base_app_release_id 时必须覆盖全部已配置部署单元和全部启用环境配置；有 base_app_release_id 时可只提交变化单元和变化环境配置。只创建 ready 版本，不触发部署。",
                     "parameters": [
                         { "name": "app_key", "in": "path", "required": true, "schema": { "type": "string" } },
                         { "name": "Idempotency-Key", "in": "header", "required": true, "schema": { "type": "string", "maxLength": 128 } }
@@ -9969,12 +9991,35 @@ fn openapi_spec() -> serde_json::Value {
                             "application/json": {
                                 "schema": {
                                     "type": "object",
-                                    "required": ["version"],
+                                    "required": ["version", "unit_changes", "environment_configs"],
                                     "properties": {
                                         "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
-                                        "base_app_release_id": { "type": ["integer", "null"] },
-                                        "unit_changes": { "type": "array", "items": { "type": "object" } },
-                                        "environment_configs": { "type": "array", "items": { "type": "object" } }
+                                        "base_app_release_id": { "type": ["integer", "null"], "description": "可选。存在时从该应用版本继承未提交的部署单元和环境配置；兼容 baseAppReleaseId。" },
+                                        "unit_changes": {
+                                            "type": "array",
+                                            "description": "部署单元目标变更。无 base_app_release_id 时必须覆盖全部已配置部署单元；有 base_app_release_id 时可只提交变化单元。兼容 unitChanges。",
+                                            "items": {
+                                                "type": "object",
+                                                "required": ["unit_id", "desired_status"],
+                                                "properties": {
+                                                    "unit_id": { "type": "integer", "description": "部署单元 ID；兼容 unitId。" },
+                                                    "unit_release_id": { "type": ["integer", "null"], "description": "desired_status=active 时必填；desired_status=disabled 时为空。兼容 unitReleaseId。" },
+                                                    "desired_status": { "type": "string", "enum": ["active", "disabled"], "description": "目标单元状态；兼容 desiredStatus。" }
+                                                }
+                                            }
+                                        },
+                                        "environment_configs": {
+                                            "type": "array",
+                                            "description": "环境配置版本选择。无 base_app_release_id 时必须覆盖全部启用环境；有 base_app_release_id 时可只提交变化环境。兼容 environmentConfigs。",
+                                            "items": {
+                                                "type": "object",
+                                                "required": ["environment_id", "config_revision_id"],
+                                                "properties": {
+                                                    "environment_id": { "type": "integer", "description": "环境 ID；兼容 environmentId。" },
+                                                    "config_revision_id": { "type": "integer", "description": "已发布配置版本 ID；兼容 configRevisionId。" }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -10080,7 +10125,7 @@ fn openapi_spec() -> serde_json::Value {
                 "post": {
                     "operationId": "uploadServicePackageLegacy",
                     "summary": "兼容：multipart 直接上传到平台",
-                    "description": "保留给旧脚本使用。新项目建议使用 OSS 直传接口，避免大文件经过 easy-deploy 后台进程。",
+                    "description": "保留给旧脚本使用。新项目建议使用新的 app/unit release 接口，或使用 OSS 直传兼容接口避免大文件经过 easy-deploy 后台进程。兼容 services 包接口会登记旧 release；如果应用开启自动入队，响应会包含 queued=true/queue_id 并进入串行发布队列。",
                     "parameters": [{ "$ref": "#/components/parameters/ServiceKey" }],
                     "requestBody": {
                         "required": true,
@@ -10291,6 +10336,7 @@ fn openapi_docs_public_html() -> String {
       <p class="eyebrow">Easy Deploy OpenAPI</p>
       <h1>版本包与应用版本接口</h1>
       <p class="summary">这份文档无需登录即可访问，面向业务项目 CI 和 AI。OpenAPI 原子登记部署单元版本与发布包，并显式创建不可变应用版本；部署仍只能由运维人员在后台手动启动。</p>
+      <p class="summary">完整部署配置、脚本契约、normal/force 规则和多模块示例见 <a href="/docs/deployment">部署接入规范</a>。</p>
     </header>
     <div class="layout">
       <nav>
@@ -10305,11 +10351,12 @@ fn openapi_docs_public_html() -> String {
         <a href="#script">脚本示例</a>
         <a href="#legacy">兼容接口</a>
         <a href="#errors">错误处理</a>
+        <a href="/docs/deployment">部署接入规范</a>
       </nav>
       <article>
         <section id="scope">
           <h2>职责边界</h2>
-          <div class="callout">外部项目不能通过 OpenAPI 创建应用、修改配置或触发部署。CI 只能上传部署单元版本包并创建不可变应用版本，运维人员在后台预览后手动部署。</div>
+          <div class="callout">外部项目不能通过 OpenAPI 创建应用或修改配置。新的 app/unit release 接口只上传部署单元版本包并创建不可变应用版本，不触发部署；旧 services 包接口保留兼容语义，可能按应用发布设置自动入队。多单元应用由运维人员在后台预览后手动部署。</div>
           <ul>
             <li>后台配置：应用标识、环境、目标节点、Compose 内容、环境变量、部署脚本、健康检查和发布策略。</li>
             <li>业务项目：构建版本包、计算 SHA-256、调用 OpenAPI 上传并完成登记。</li>
@@ -10418,7 +10465,7 @@ curl -fsS -X POST "$EASY_DEPLOY_URL/api/v1/services/$SERVICE_KEY/packages/upload
         </section>
         <section id="legacy">
           <h2>兼容接口</h2>
-          <p>旧脚本仍可使用 <code>POST /api/v1/services/{service_key}/packages</code> 以 <code>multipart/form-data</code> 直接上传到平台。新项目建议使用 OSS 直传，避免大文件经过 easy-deploy 进程。</p>
+          <p>旧脚本仍可使用 <code>POST /api/v1/services/{service_key}/packages</code> 以 <code>multipart/form-data</code> 直接上传到平台，也可使用 <code>/api/v1/services/{service_key}/packages/uploads</code> + <code>complete</code> 的 OSS 直传兼容流程。兼容 services 包接口会登记旧 release；如果应用开启自动入队，响应会包含 <code>queued=true</code> / <code>queue_id</code> 并进入串行发布队列。新的 app/unit release 接口固定返回 <code>deployment_started=false</code>，不触发部署。</p>
           <p>升级前登记且未保存对象版本号的 OSS 制品会被标记为历史未绑定制品，平台会阻止其部署以避免下载被改写的对象；请使用当前直传流程重新上传相同版本或新的版本。</p>
         </section>
         <section id="errors">
@@ -10437,6 +10484,240 @@ curl -fsS -X POST "$EASY_DEPLOY_URL/api/v1/services/$SERVICE_KEY/packages/upload
 </body>
 </html>"###.to_owned()
 }
+
+fn deployment_docs_public_html() -> String {
+    r###"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Easy Deploy 部署接入规范</title>
+  <style>
+    :root { color-scheme: light; --bg:#f6f8fc; --panel:#fff; --text:#172033; --muted:#667085; --line:#d8e0ef; --brand:#2563eb; --soft:#eef4ff; --code:#0b1220; --codeText:#e6edf7; --ok:#15803d; --warn:#b45309; --bad:#b91c1c; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height:1.72; }
+    .page { max-width:1180px; margin:0 auto; padding:28px 20px 56px; }
+    .hero { border:1px solid var(--line); border-radius:12px; background:linear-gradient(135deg,#fff 0%,#eef6ff 100%); padding:28px; }
+    .eyebrow { margin:0 0 8px; color:var(--brand); font-size:13px; font-weight:800; }
+    h1 { margin:0; font-size:36px; line-height:1.15; }
+    .summary { margin:12px 0 0; max-width:920px; color:var(--muted); }
+    .layout { display:grid; grid-template-columns:270px minmax(0,1fr); gap:20px; margin-top:20px; align-items:start; }
+    nav, section { border:1px solid var(--line); border-radius:12px; background:var(--panel); }
+    nav { position:sticky; top:16px; padding:14px; }
+    nav strong { display:block; margin:4px 8px 10px; }
+    nav a { display:block; padding:8px 10px; border-radius:7px; color:#344054; text-decoration:none; }
+    nav a:hover { background:var(--soft); color:var(--brand); }
+    article { display:grid; gap:16px; }
+    section { padding:22px 24px; }
+    h2 { margin:0 0 12px; font-size:22px; }
+    h3 { margin:18px 0 8px; font-size:16px; }
+    p, ol, ul { margin-top:0; }
+    li + li { margin-top:6px; }
+    a { color:var(--brand); }
+    code { padding:2px 5px; border-radius:5px; background:#eef2f7; color:#174a83; font-family:"JetBrains Mono", Consolas, monospace; font-size:.92em; }
+    pre { margin:12px 0 0; overflow:auto; border-radius:9px; background:var(--code); }
+    pre code { display:block; padding:16px; color:var(--codeText); background:transparent; white-space:pre; }
+    .callout { padding:13px 15px; border-radius:8px; background:var(--soft); color:#17406e; }
+    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+    .field { padding:12px; border:1px solid var(--line); border-radius:8px; background:#fbfcff; }
+    .field strong { display:block; margin-bottom:4px; }
+    .status { font-weight:800; }
+    .status.ok { color:var(--ok); }
+    .status.warn { color:var(--warn); }
+    .status.bad { color:var(--bad); }
+    @media (max-width:860px) { .layout, .grid { grid-template-columns:1fr; } nav { position:static; } h1 { font-size:30px; } }
+    @media print { body { background:#fff; } nav { display:none; } .layout { display:block; } section, .hero { break-inside:avoid; } }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <p class="eyebrow">Easy Deploy Deployment Guide</p>
+      <h1>部署接入规范</h1>
+      <p class="summary">这份文档免登录访问，面向业务项目 CI、AI 调用方和运维人员。平台负责应用、环境、部署单元、配置版本、部署编排和状态判断；外部项目只负责构建版本包、上传单元发布包并创建不可变应用版本。</p>
+      <p class="summary">接口字段以 <a href="/docs/openapi">OpenAPI 文档</a> 为准；本页说明部署结构、版本规则、脚本契约和多模块项目接入模式。</p>
+    </header>
+    <div class="layout">
+      <nav>
+        <strong>目录</strong>
+        <a href="#concepts">核心概念</a>
+        <a href="#responsibility">职责边界</a>
+        <a href="#config">配置草稿与配置版本</a>
+        <a href="#package">发布包规范</a>
+        <a href="#versioning">双层版本</a>
+        <a href="#openapi">OpenAPI 流程</a>
+        <a href="#deploy">normal / force 部署</a>
+        <a href="#script">脚本契约</a>
+        <a href="#history">过程、历史与清理</a>
+        <a href="#rollback">回退策略</a>
+        <a href="#single-unit">单单元示例</a>
+        <a href="#voucher-hub">qfy-voucher-hub 示例</a>
+      </nav>
+      <article>
+        <section id="concepts">
+          <h2>核心概念</h2>
+          <div class="grid">
+            <div class="field"><strong>应用 Application</strong>一个业务项目在一个环境中的部署主体，例如 <code>qfy-voucher-hub-prod</code>。</div>
+            <div class="field"><strong>部署单元 Deployment Unit</strong>应用内可独立发布的模块，例如 <code>gateway</code>、<code>api</code>、<code>admin</code>、<code>worker</code>。</div>
+            <div class="field"><strong>单元发布 Unit Release</strong>模块 <code>version</code>、平台生成 <code>versionCode</code>、SHA-256 和唯一发布包的原子绑定。</div>
+            <div class="field"><strong>应用版本 Application Release</strong>多个单元发布与环境配置版本组合出来的不可变 manifest。创建后不会自动部署。</div>
+            <div class="field"><strong>部署执行 Deployment Run</strong>运维手动选择应用版本、环境和部署模式后生成的一次执行记录。</div>
+            <div class="field"><strong>运行状态 Runtime State</strong>平台记录每个单元在环境中的已部署版本、fingerprint、健康状态和最近执行结果。</div>
+          </div>
+        </section>
+
+        <section id="responsibility">
+          <h2>职责边界</h2>
+          <div class="callout">OpenAPI 不提供创建应用或修改配置的能力。新的 app/unit release 接口不触发部署；旧 services 包接口保留兼容语义，可能按应用发布设置自动入队。多单元应用部署必须由后台有权限的运维人员手动启动。</div>
+          <ul>
+            <li>平台：维护应用、环境、部署单元、Compose、独立 <code>.env</code>、目标节点、脚本、健康检查、配置版本、部署锁、执行状态和清理策略。</li>
+            <li>业务项目 CI：构建版本包，计算 SHA-256，调用 OpenAPI 上传发生变化的单元包，再创建应用版本 manifest。</li>
+            <li>运维人员：在应用列表或详情中选择应用版本，确认 normal 或 force 部署，并查看本次部署过程与结果。</li>
+          </ul>
+        </section>
+
+        <section id="config">
+          <h2>配置草稿与配置版本</h2>
+          <ol>
+            <li>创建应用时配置应用标识、环境、部署单元、目标节点、Compose 和独立 <code>.env</code>。</li>
+            <li>配置修改先进入草稿；发布配置后生成配置版本，应用版本 manifest 引用固定的配置版本 ID。</li>
+            <li>敏感配置只放在后台配置或目标节点密钥管理中。文档和 OpenAPI 示例只使用占位值，例如 <code>&lt;DB_PASSWORD_PLACEHOLDER&gt;</code>。</li>
+            <li>同一项目不同环境应使用不同应用，或使用同一应用下不同环境配置；容器环境变量由对应环境的 <code>.env</code> 映射。</li>
+          </ol>
+        </section>
+
+        <section id="package">
+          <h2>发布包规范</h2>
+          <ul>
+            <li>每个部署单元版本必须绑定唯一发布包，上传接口使用 <code>multipart/form-data</code>。</li>
+            <li>推荐包名包含模块名与版本，例如 <code>api-1.4.0.tar.gz</code>、<code>admin-1.4.0.tar.gz</code>。</li>
+            <li>平台保存 SHA-256、字节数、包名、包路径、来源和发布时间；同一单元同一版本不能绑定不同校验和。</li>
+            <li>旧单应用包接口仍支持 <code>{service_key}_version_{x_y_z}.tar.gz</code> 命名和 OSS 直传，作为兼容流程保留；如果应用开启自动入队，兼容接口可能返回 <code>queued=true</code> / <code>queue_id</code> 并进入串行发布队列。</li>
+          </ul>
+        </section>
+
+        <section id="versioning">
+          <h2>双层版本</h2>
+          <div class="grid">
+            <div class="field"><strong><code>version</code></strong>业务可读版本，建议使用 <code>x.y.z</code>。大版本 x 表示重大变化，小版本 y 表示功能或配置变化，修复版本 z 表示问题修复。</div>
+            <div class="field"><strong><code>versionCode</code></strong>平台排序版本号。单元发布与应用版本分别从 <code>100</code> 开始按作用域递增，核心比较使用 <code>versionCode</code>。</div>
+          </div>
+          <p>应用版本的 <code>version</code> 不必等于所有单元版本；一次应用版本可以只包含某个模块变化，其余单元从基础版本继承。</p>
+        </section>
+
+        <section id="openapi">
+          <h2>OpenAPI 流程</h2>
+          <ol>
+            <li>为每个发生变化的单元调用 <code>POST /api/v1/apps/{app_key}/units/{unit_key}/releases</code>。</li>
+            <li>保存响应里的 <code>unit_release_id</code>、<code>version</code>、<code>versionCode</code> 和 <code>checksum_sha256</code>。</li>
+            <li>调用 <code>POST /api/v1/apps/{app_key}/releases</code> 创建应用版本。无 <code>base_app_release_id</code> 的首个版本必须覆盖全部已配置部署单元和全部启用环境配置；增量版本传 <code>base_app_release_id</code> 后可只提交变化单元和变化环境配置。</li>
+            <li>两个新接口都必须携带 <code>Idempotency-Key</code>。同 key 同内容返回原结果，同 key 异内容返回幂等冲突。</li>
+          </ol>
+          <pre><code>curl -X POST "https://easy-deploy.example.com/api/v1/apps/qfy-voucher-hub-prod/units/api/releases" \
+  -H "Authorization: Bearer &lt;EASY_DEPLOY_TOKEN&gt;" \
+  -H "Idempotency-Key: qfy-voucher-hub-api-1.4.0" \
+  -F "artifact_version=1.4.0" \
+  -F "source=ci" \
+  -F "package_file=@api-1.4.0.tar.gz"</code></pre>
+          <pre><code>curl -X POST "https://easy-deploy.example.com/api/v1/apps/qfy-voucher-hub-prod/releases" \
+  -H "Authorization: Bearer &lt;EASY_DEPLOY_TOKEN&gt;" \
+  -H "Idempotency-Key: qfy-voucher-hub-app-1.4.0" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "version": "1.4.0",
+    "base_app_release_id": 120,
+    "unit_changes": [
+      { "unit_id": 201, "unit_release_id": 501, "desired_status": "active" }
+    ],
+    "environment_configs": [
+      { "environment_id": 31, "config_revision_id": 88 }
+    ]
+  }'</code></pre>
+          <p>成功响应包含 <code>app_release_id</code>、应用 <code>versionCode</code>、<code>manifest_hash</code>、完整单元摘要和 <code>deployment_started=false</code>。</p>
+        </section>
+
+        <section id="deploy">
+          <h2>normal / force 部署</h2>
+          <ul>
+            <li><strong>normal：</strong>平台按目标 manifest 与当前运行状态比较。只有 artifact/config/script/target fingerprint 一致、容器版本 label 一致、运行状态健康且探测可信时才跳过。</li>
+            <li><strong>force：</strong>不管目标版本是否曾部署过，都重新执行目标 manifest 中所有启用单元；目标为 disabled 的单元仍按停用处理，不会被启动。</li>
+            <li>同一应用同一时间只允许一个部署执行。已有 running/deploying 时，新部署请求必须被阻止并提示当前应用正在部署流程中。</li>
+            <li>部署结果汇总状态包括 <span class="status ok">成功</span>、<span class="status warn">部分失败</span>、<span class="status bad">全部失败</span>、取消和运行中；列表必须同时显示文字与颜色。</li>
+          </ul>
+        </section>
+
+        <section id="script">
+          <h2>脚本契约</h2>
+          <ol>
+            <li>脚本由平台配置版本管理，不建议把编排、跳过判断和状态汇总全部写进业务脚本。</li>
+            <li>脚本应保持幂等：重复执行同一目标版本不得破坏现有可用实例。</li>
+            <li>脚本输出会进入本次部署过程日志；退出码非 0 表示该单元失败，平台不自动重试。</li>
+            <li>脚本只能读取平台传入的上下文变量和发布包路径，不应从文档、URL 或命令行硬编码真实密钥。</li>
+          </ol>
+          <pre><code>#!/usr/bin/env bash
+set -euo pipefail
+
+docker compose --env-file .env -f compose.yaml pull
+docker compose --env-file .env -f compose.yaml up -d --remove-orphans
+docker compose --env-file .env -f compose.yaml ps</code></pre>
+        </section>
+
+        <section id="history">
+          <h2>过程、历史与清理</h2>
+          <ul>
+            <li>应用详情可查看当前运行状态、部署中状态和本次部署过程打印。</li>
+            <li>历史部署保留部署单元结果、配置快照和脚本输出，便于事后排障；当服务器需要释放空间时由运维手动清理。</li>
+            <li>清理分层执行：可删除单次过程日志、配置快照、部署历史记录、未引用制品，也可归档或删除未使用应用版本。</li>
+            <li>清理操作需要独立权限，并记录操作者、时间和目标对象；正在运行或仍被引用的记录不得删除。</li>
+          </ul>
+        </section>
+
+        <section id="rollback">
+          <h2>回退策略</h2>
+          <p>平台不自动回滚。回退是一次新的手动部署：运维选择较低 <code>versionCode</code> 的历史应用版本并启动部署。数据库迁移由业务项目自己管理，正常情况下不在平台层自动回滚 SQL。</p>
+        </section>
+
+        <section id="single-unit">
+          <h2>单单元示例</h2>
+          <ol>
+            <li>后台创建应用 <code>orders-api-prod</code>，默认部署单元 <code>app</code>。</li>
+            <li>CI 构建 <code>orders-api-1.2.3.tar.gz</code>，上传到 <code>/api/v1/apps/orders-api-prod/units/app/releases</code>。</li>
+            <li>CI 创建应用版本 <code>1.2.3</code>，manifest 只有 <code>app</code> 一个启用单元。</li>
+            <li>运维在后台选择该应用版本，normal 部署即可。</li>
+          </ol>
+        </section>
+
+        <section id="voucher-hub">
+          <h2>qfy-voucher-hub 多单元示例</h2>
+          <p>推荐建模为一个应用 <code>qfy-voucher-hub-prod</code>，应用内维护多个部署单元，而不是把每个模块拆成独立应用。这样运维只需要点击一次部署，平台按单元顺序执行并汇总结果。</p>
+          <div class="grid">
+            <div class="field"><strong>gateway</strong>入口网关，阶段 10，变更时先部署。</div>
+            <div class="field"><strong>api</strong>核心服务，阶段 20，依赖 gateway 配置。</div>
+            <div class="field"><strong>admin</strong>后台管理前端，阶段 30，可独立更新。</div>
+            <div class="field"><strong>worker</strong>异步任务，阶段 40，通常在 api 后更新。</div>
+            <div class="field"><strong>scheduler</strong>定时任务，阶段 50，部署前需确认旧任务停止策略。</div>
+            <div class="field"><strong>migration</strong>可选一次性单元，通常由项目脚本自行保证幂等和不可回滚策略。</div>
+          </div>
+          <pre><code># 只更新 admin 的增量应用版本
+{
+  "version": "1.5.0",
+  "base_app_release_id": 130,
+  "unit_changes": [
+    { "unit_id": 203, "unit_release_id": 610, "desired_status": "active" }
+  ],
+  "environment_configs": [
+    { "environment_id": 31, "config_revision_id": 91 }
+  ]
+}</code></pre>
+          <p>normal 部署时，如果 gateway、api、worker、scheduler 的目标状态与当前运行状态完全一致且健康，平台会跳过这些单元，只执行 admin；force 部署会重新执行所有启用单元。</p>
+        </section>
+      </article>
+    </div>
+  </div>
+</body>
+</html>"###.to_owned()
+}
+
 async fn record_audit_event(
     state: &AppState,
     session: &CurrentSession,
@@ -10548,16 +10829,6 @@ fn nav_sections<'a>(active_path: &str, session: &CurrentSession) -> Vec<NavSecti
         ),
     ];
 
-    let _extra_sections = [(
-        "开放接口",
-        vec![nav_item(
-            "API Token",
-            "/admin/api-tokens",
-            "tokens",
-            active_path,
-        )],
-    )];
-
     let mut sections = sections
         .into_iter()
         .filter_map(|(label, items)| {
@@ -10573,19 +10844,27 @@ fn nav_sections<'a>(active_path: &str, session: &CurrentSession) -> Vec<NavSecti
         })
         .collect::<Vec<_>>();
 
-    if let Some(section) = sections.iter_mut().find(|section| {
-        section
-            .items
-            .iter()
-            .any(|item| item.href == "/admin/sessions")
-    }) {
-        let item = nav_item("API Token", "/admin/api-tokens", "tokens", active_path);
-        if nav_permission(item.href)
+    let open_api_items = [
+        nav_item("API Token", "/admin/api-tokens", "tokens", active_path),
+        nav_item(
+            "部署接入",
+            "/deployment-access",
+            "deploy-access",
+            active_path,
+        ),
+    ]
+    .into_iter()
+    .filter(|item| {
+        nav_permission(item.href)
             .map(|permission| session.can(permission))
             .unwrap_or(true)
-        {
-            section.items.push(item);
-        }
+    })
+    .collect::<Vec<_>>();
+    if !open_api_items.is_empty() {
+        sections.push(NavSection {
+            label: "开放接口",
+            items: open_api_items,
+        });
     }
 
     sections
@@ -12991,6 +13270,57 @@ mod tests {
             spec["paths"]["/api/v1/apps/{app_key}/releases"]["post"]["operationId"],
             "createApplicationRelease"
         );
+        let create_app_release_schema = &spec["paths"]["/api/v1/apps/{app_key}/releases"]["post"]["requestBody"]
+            ["content"]["application/json"]["schema"];
+        assert_eq!(
+            create_app_release_schema["required"],
+            serde_json::json!(["version", "unit_changes", "environment_configs"])
+        );
+        assert_eq!(
+            create_app_release_schema["properties"]["unit_changes"]["items"]["required"],
+            serde_json::json!(["unit_id", "desired_status"])
+        );
+        assert_eq!(
+            create_app_release_schema["properties"]["unit_changes"]["items"]["properties"]["unit_id"]
+                ["type"],
+            "integer"
+        );
+        assert_eq!(
+            create_app_release_schema["properties"]["unit_changes"]["items"]["properties"]["unit_release_id"]
+                ["type"],
+            serde_json::json!(["integer", "null"])
+        );
+        assert_eq!(
+            create_app_release_schema["properties"]["unit_changes"]["items"]["properties"]["desired_status"]
+                ["enum"],
+            serde_json::json!(["active", "disabled"])
+        );
+        assert_eq!(
+            create_app_release_schema["properties"]["environment_configs"]["items"]["required"],
+            serde_json::json!(["environment_id", "config_revision_id"])
+        );
+        assert_eq!(
+            create_app_release_schema["properties"]["environment_configs"]["items"]["properties"]["environment_id"]
+                ["type"],
+            "integer"
+        );
+        assert_eq!(
+            create_app_release_schema["properties"]["environment_configs"]["items"]["properties"]["config_revision_id"]
+                ["type"],
+            "integer"
+        );
+        assert!(
+            create_app_release_schema["properties"]["unit_changes"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("无 base_app_release_id")
+        );
+        assert!(
+            spec["paths"]["/api/v1/services/{service_key}/packages"]["post"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("queued=true")
+        );
         assert_eq!(
             spec["paths"]["/api/v1/services/{service_key}/packages/uploads/{upload_id}/complete"]["post"]
                 ["operationId"],
@@ -13038,6 +13368,7 @@ mod tests {
         let html = String::from_utf8_lossy(&body);
         assert!(html.contains("Easy Deploy OpenAPI"));
         assert!(html.contains("版本包与应用版本接口"));
+        assert!(html.contains("/docs/deployment"));
         assert!(html.contains("/api/v1/apps/{app_key}/units/{unit_key}/releases"));
         assert!(html.contains("/api/v1/apps/{app_key}/releases"));
         assert!(html.contains("申请上传地址"));
@@ -13047,12 +13378,300 @@ mod tests {
         assert!(html.contains("/api/v1/services/{service_key}/packages/uploads"));
         assert!(html.contains("/api/v1/services/{service_key}/packages"));
         assert!(html.contains("{service_key}_version_{x_y_z}.tar.gz"));
+        assert!(html.contains("queued=true"));
+        assert!(html.contains("deployment_started=false"));
         assert!(html.contains("file_name"));
         assert!(html.contains("checksum_sha256"));
         assert!(html.contains("source"));
         assert!(!html.contains("/api/v1/tasks"));
         assert!(!html.contains("/api/v1/services/{service_key}/deploy"));
         assert!(!html.contains("Git 源码发布"));
+    }
+
+    #[tokio::test]
+    async fn deployment_docs_are_public_linked_and_not_backed_by_admin_state() {
+        let app = test_web_app().await;
+        let admin = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let created_token = app
+            .auth
+            .create_api_token(&admin.session, "edp_live_should_not_leak")
+            .await
+            .expect("create bait token");
+        app.apps
+            .create_app(CreateAppInput {
+                app_key: "bait-leak-app".to_owned(),
+                name: "prod-db-password-do-not-leak".to_owned(),
+                description: "10.66.77.88 should not be public".to_owned(),
+                environment: "test".to_owned(),
+                app_type: "compose".to_owned(),
+                deploy_strategy: "rolling_stop_on_failure".to_owned(),
+                release_source: "package_upload".to_owned(),
+                auto_queue_release: false,
+                work_dir: "/srv/private/qfy-voucher-hub".to_owned(),
+                target_node_ids: vec![1],
+                compose_content: "services:\n  bait:\n    image: nginx:alpine\n".to_owned(),
+                env_content: "DB_PASSWORD=prod-db-password-do-not-leak\n".to_owned(),
+                deploy_scripts: DeployScriptSet::default(),
+                health_check: Default::default(),
+                binary_artifact_version: String::new(),
+                binary_artifact_path: String::new(),
+                binary_exec_args: String::new(),
+                binary_service_user: String::new(),
+                binary_unit_name: String::new(),
+                binary_release_strategy: "restart".to_owned(),
+                binary_active_slot: "blue".to_owned(),
+                binary_base_port: 8080,
+                binary_standby_port: 18080,
+                binary_proxy_enabled: false,
+                binary_proxy_kind: "none".to_owned(),
+                binary_proxy_domain: String::new(),
+                binary_proxy_config_path: String::new(),
+            })
+            .await
+            .expect("create bait app");
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/docs/deployment")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("部署接入规范"));
+        assert!(html.contains("/docs/openapi"));
+        assert!(html.contains("POST /api/v1/apps/{app_key}/units/{unit_key}/releases"));
+        assert!(html.contains("POST /api/v1/apps/{app_key}/releases"));
+        assert!(html.contains("qfy-voucher-hub"));
+        assert!(html.contains("normal"));
+        assert!(html.contains("force"));
+        assert!(html.contains("queued=true"));
+        assert!(html.contains("&lt;EASY_DEPLOY_TOKEN&gt;"));
+        for bait in [
+            created_token.token.as_str(),
+            "edp_live_should_not_leak",
+            "prod-db-password-do-not-leak",
+            "/srv/private/qfy-voucher-hub",
+            "10.66.77.88",
+        ] {
+            assert!(
+                !html.contains(bait),
+                "deployment docs leaked bait value: {bait}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_access_navigation_respects_api_token_permission() {
+        let app = test_web_app().await;
+        let admin = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let admin_cookie = format!("ed_access={}", admin.tokens.access_token);
+
+        let admin_page = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/deployment-access")
+                    .header(header::COOKIE, &admin_cookie)
+                    .body(Body::empty())
+                    .expect("build admin request"),
+            )
+            .await
+            .expect("send admin request");
+        assert_eq!(admin_page.status(), StatusCode::OK);
+        let body = to_bytes(admin_page.into_body(), usize::MAX)
+            .await
+            .expect("read admin body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("href=\"/docs/deployment\" target=\"_blank\""));
+        assert!(html.contains("href=\"/docs/openapi\" target=\"_blank\""));
+        let token_nav_index = html
+            .find("href=\"/admin/api-tokens\"")
+            .expect("api token nav item");
+        let deployment_nav_index = html
+            .find("href=\"/deployment-access\"")
+            .expect("deployment access nav item");
+        assert!(
+            token_nav_index < deployment_nav_index,
+            "deployment access menu should appear below API Token"
+        );
+
+        let token_viewer_role_id = sqlx::query(
+            "INSERT INTO admin_roles(role_code, role_name, description, status) VALUES ('api_token_viewer', 'API Token Viewer', '', 'active')",
+        )
+        .execute(&app.db)
+        .await
+        .expect("insert api token viewer role")
+        .last_insert_rowid();
+        sqlx::query(
+            r#"
+            INSERT INTO admin_role_permissions(role_id, permission_id)
+            SELECT ?1, id FROM admin_permissions
+            WHERE permission_key = 'api_tokens.view'
+            "#,
+        )
+        .bind(token_viewer_role_id)
+        .execute(&app.db)
+        .await
+        .expect("grant api token view permission");
+        app.auth
+            .create_account(
+                &admin.session,
+                "api_token_viewer",
+                "API Token Viewer",
+                "password123",
+                &[token_viewer_role_id],
+            )
+            .await
+            .expect("create api token viewer");
+        let token_viewer = app
+            .auth
+            .login(LoginInput {
+                username: "api_token_viewer".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("login api token viewer");
+        let token_viewer_cookie = format!("ed_access={}", token_viewer.tokens.access_token);
+        let token_viewer_page = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/deployment-access")
+                    .header(header::COOKIE, &token_viewer_cookie)
+                    .body(Body::empty())
+                    .expect("build token viewer request"),
+            )
+            .await
+            .expect("send token viewer request");
+        assert_eq!(token_viewer_page.status(), StatusCode::OK);
+        let body = to_bytes(token_viewer_page.into_body(), usize::MAX)
+            .await
+            .expect("read token viewer body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("href=\"/admin/api-tokens\""));
+        assert!(html.contains("href=\"/deployment-access\""));
+        assert!(!html.contains("href=\"/admin/sessions\""));
+
+        let role_id = sqlx::query(
+            "INSERT INTO admin_roles(role_code, role_name, description, status) VALUES ('profile_only', 'Profile Only', '', 'active')",
+        )
+        .execute(&app.db)
+        .await
+        .expect("insert profile only role")
+        .last_insert_rowid();
+        sqlx::query(
+            r#"
+            INSERT INTO admin_role_permissions(role_id, permission_id)
+            SELECT ?1, id FROM admin_permissions
+            WHERE permission_key = 'profile.view'
+            "#,
+        )
+        .bind(role_id)
+        .execute(&app.db)
+        .await
+        .expect("grant profile permission");
+        app.auth
+            .create_account(
+                &admin.session,
+                "profile_only_user",
+                "Profile Only",
+                "password123",
+                &[role_id],
+            )
+            .await
+            .expect("create profile only user");
+        let profile_only = app
+            .auth
+            .login(LoginInput {
+                username: "profile_only_user".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("login profile only user");
+        let profile_cookie = format!("ed_access={}", profile_only.tokens.access_token);
+
+        let forbidden_page = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/deployment-access")
+                    .header(header::COOKIE, &profile_cookie)
+                    .body(Body::empty())
+                    .expect("build forbidden request"),
+            )
+            .await
+            .expect("send forbidden request");
+        assert_eq!(forbidden_page.status(), StatusCode::FORBIDDEN);
+
+        let profile_page = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/profile")
+                    .header(header::COOKIE, &profile_cookie)
+                    .body(Body::empty())
+                    .expect("build profile request"),
+            )
+            .await
+            .expect("send profile request");
+        assert_eq!(profile_page.status(), StatusCode::OK);
+        let body = to_bytes(profile_page.into_body(), usize::MAX)
+            .await
+            .expect("read profile body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(!html.contains("href=\"/deployment-access\""));
+        assert!(!html.contains("href=\"/admin/api-tokens\""));
+
+        let public_doc = app
+            .router
+            .oneshot(
+                Request::builder()
+                    .uri("/docs/deployment")
+                    .body(Body::empty())
+                    .expect("build public doc request"),
+            )
+            .await
+            .expect("send public doc request");
+        assert_eq!(public_doc.status(), StatusCode::OK);
     }
 
     #[tokio::test]
