@@ -48,14 +48,14 @@ impl From<SecretConfigError> for ApplicationConfigError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApplicationConfigDocument {
     pub environments: Vec<ConfigEnvironment>,
     pub units: Vec<ConfigUnit>,
     pub stages: Vec<ConfigStage>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigEnvironment {
     pub key: String,
     pub name: String,
@@ -65,7 +65,7 @@ pub struct ConfigEnvironment {
     pub target_node_ids: Vec<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigUnit {
     pub key: String,
     pub name: String,
@@ -82,7 +82,7 @@ pub struct ConfigUnit {
     pub health_check: JsonValue,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigStage {
     pub number: u16,
     pub key: String,
@@ -116,6 +116,24 @@ pub struct ConfigRevisionResult {
     pub config_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublishedApplicationConfig {
+    pub revision_id: i64,
+    pub revision_no: i64,
+    pub config_hash: String,
+    pub document: ApplicationConfigDocument,
+    pub secret_values: BTreeMap<String, String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ConfigRevisionRow {
+    id: i64,
+    revision_no: i64,
+    config_json: String,
+    secret_ciphertext: String,
+    config_hash: String,
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct ConfigDraftRow {
     id: i64,
@@ -129,6 +147,38 @@ struct ConfigDraftRow {
 impl ApplicationConfigService {
     pub fn new(db: SqlitePool, cipher: SecretConfigCipher) -> Self {
         Self { db, cipher }
+    }
+
+    pub async fn load_revision(
+        &self,
+        app_id: i64,
+        revision_id: i64,
+    ) -> Result<PublishedApplicationConfig, ApplicationConfigError> {
+        let revision = sqlx::query_as::<_, ConfigRevisionRow>(
+            r#"
+            SELECT id, revision_no, config_json, secret_ciphertext, config_hash
+            FROM app_config_revisions
+            WHERE id = ?1 AND app_id = ?2
+            "#,
+        )
+        .bind(revision_id)
+        .bind(app_id)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or_else(|| ApplicationConfigError::NotFound("config revision not found".to_owned()))?;
+        let document = serde_json::from_str::<ApplicationConfigDocument>(&revision.config_json)
+            .map_err(|error| ApplicationConfigError::Validation(error.to_string()))?;
+        validate_document(&document)?;
+        let secret_json = self.cipher.decrypt(&revision.secret_ciphertext)?;
+        let secret_values = serde_json::from_slice::<BTreeMap<String, String>>(&secret_json)
+            .map_err(|error| ApplicationConfigError::Secret(error.to_string()))?;
+        Ok(PublishedApplicationConfig {
+            revision_id: revision.id,
+            revision_no: revision.revision_no,
+            config_hash: revision.config_hash,
+            document,
+            secret_values,
+        })
     }
 
     pub async fn save_draft(
@@ -594,6 +644,33 @@ mod tests {
         assert!(!persisted.0.contains("top-secret"));
         assert!(!persisted.1.contains("top-secret"));
         assert_eq!(persisted.2, "operator");
+
+        let loaded = service
+            .load_revision(app_id, revision.revision_id)
+            .await
+            .expect("load published revision");
+        assert_eq!(loaded.revision_no, 100);
+        assert_eq!(loaded.document, valid_document());
+        assert_eq!(
+            loaded.secret_values.get("testing.api.APP_SECRET"),
+            Some(&"top-secret".to_owned())
+        );
+
+        let other_app_id: i64 = sqlx::query_scalar(
+            "INSERT INTO apps(app_key, name, app_type, deploy_mode, work_dir, status) VALUES ('other-config-app', 'Other', 'compose', 'compose', '/srv/other', 'ready') RETURNING id",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("insert other app");
+        assert!(
+            matches!(
+                service
+                    .load_revision(other_app_id, revision.revision_id)
+                    .await,
+                Err(ApplicationConfigError::NotFound(_))
+            ),
+            "config revisions must not be readable through another application"
+        );
     }
 
     #[tokio::test]
