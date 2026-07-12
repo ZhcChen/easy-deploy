@@ -10,6 +10,7 @@ pub mod deploy;
 pub mod deployment_console;
 pub mod deployment_orchestrator;
 pub mod deployment_retention;
+pub mod deployment_runtime;
 pub mod events;
 pub mod health;
 pub mod host_metrics;
