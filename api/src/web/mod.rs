@@ -15,6 +15,7 @@ use axum::{
 };
 use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
@@ -23,6 +24,11 @@ use tracing::warn;
 use crate::{
     Settings,
     application_config::ApplicationConfigService,
+    application_releases::{
+        ApplicationReleaseError, ApplicationReleaseService, CreateApplicationReleaseInput,
+        EnvironmentConfigSelection, RegisterUnitReleaseInput, UnitReleaseChange,
+        UnitReleaseStorage, validate_version,
+    },
     apps::{
         APP_DEPLOYMENT_IN_PROGRESS_MESSAGE, AppDeployDiffStatus, AppError, AppService,
         BinaryPackageNameError, CompleteReleasePackageUploadInput, ComposeTaskAction,
@@ -53,6 +59,7 @@ use crate::{
     nodes::{CreateNodeInput, NodeError, NodeInstallComponent, NodeService, UpdateNodeInput},
     platform::{PlatformConfigError, PlatformConfigService, UpdatePlatformConfigInput},
     runtimefs::DeployScriptSet,
+    runtimefs::RuntimeFs,
     tasks::{TaskError, TaskListFilter, TaskService},
 };
 use templates::{
@@ -93,6 +100,7 @@ pub struct AppStateServices {
     pub platform: PlatformConfigService,
     pub events: EventLogService,
     pub application_config: Option<ApplicationConfigService>,
+    pub application_releases: ApplicationReleaseService,
     pub deployment_orchestrator: DeploymentOrchestratorService,
     pub deployment_logs: DeploymentLogService,
     pub deployment_retention: DeploymentRetentionService,
@@ -109,6 +117,7 @@ struct AppStateInner {
     platform: PlatformConfigService,
     events: EventLogService,
     application_config: Option<ApplicationConfigService>,
+    application_releases: ApplicationReleaseService,
     deployment_orchestrator: DeploymentOrchestratorService,
     deployment_logs: DeploymentLogService,
     deployment_retention: DeploymentRetentionService,
@@ -131,6 +140,7 @@ impl AppState {
                 platform: services.platform,
                 events: services.events,
                 application_config: services.application_config,
+                application_releases: services.application_releases,
                 deployment_orchestrator: services.deployment_orchestrator,
                 deployment_logs: services.deployment_logs,
                 deployment_retention: services.deployment_retention,
@@ -177,6 +187,10 @@ impl AppState {
 
     pub fn application_config(&self) -> Option<&ApplicationConfigService> {
         self.inner.application_config.as_ref()
+    }
+
+    pub fn application_releases(&self) -> &ApplicationReleaseService {
+        &self.inner.application_releases
     }
 
     pub fn deployment_orchestrator(&self) -> &DeploymentOrchestratorService {
@@ -305,6 +319,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/services/{service_key}/packages/uploads/{upload_id}/complete",
             post(api_v1_complete_service_package_upload),
+        )
+        .route(
+            "/api/v1/apps/{app_key}/units/{unit_key}/releases",
+            post(api_v1_upload_unit_release),
+        )
+        .route(
+            "/api/v1/apps/{app_key}/releases",
+            post(api_v1_create_application_release),
         )
         .route("/healthz", get(healthz))
         .route("/assets/logo.svg", get(logo_svg))
@@ -881,6 +903,12 @@ struct ApiErrorBody<'a> {
 }
 
 #[derive(Serialize)]
+struct ApiStableErrorBody<'a> {
+    code: &'a str,
+    error: &'a str,
+}
+
+#[derive(Serialize)]
 struct ApiPackageErrorBody<'a> {
     code: &'a str,
     error: String,
@@ -896,6 +924,39 @@ struct ApiPackageUploadInput {
     bytes: Vec<u8>,
     entry_file: String,
     source: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ApiCreateApplicationReleaseRequest {
+    version: String,
+    #[serde(default, alias = "baseAppReleaseId")]
+    base_app_release_id: Option<i64>,
+    #[serde(default, alias = "unitChanges")]
+    unit_changes: Vec<ApiUnitReleaseChange>,
+    #[serde(default, alias = "environmentConfigs")]
+    environment_configs: Vec<ApiEnvironmentConfigSelection>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ApiUnitReleaseChange {
+    #[serde(alias = "unitId")]
+    unit_id: i64,
+    #[serde(default, alias = "unitReleaseId")]
+    unit_release_id: Option<i64>,
+    #[serde(default = "default_api_desired_status", alias = "desiredStatus")]
+    desired_status: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ApiEnvironmentConfigSelection {
+    #[serde(alias = "environmentId")]
+    environment_id: i64,
+    #[serde(alias = "configRevisionId")]
+    config_revision_id: i64,
+}
+
+fn default_api_desired_status() -> String {
+    "active".to_owned()
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -4814,6 +4875,318 @@ async fn api_v1_complete_service_package_upload(
     .into_response()
 }
 
+async fn api_v1_upload_unit_release(
+    State(state): State<AppState>,
+    api: ApiSession,
+    Path((app_key, unit_key)): Path<(String, String)>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Response {
+    if !api.can(ARTIFACTS_UPLOAD) {
+        return api_error_code(
+            StatusCode::FORBIDDEN,
+            "PERMISSION_DENIED",
+            "permission denied",
+        );
+    }
+    let idempotency_key = match required_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    let (app_id, unit_id) = match sqlx::query_as::<_, (i64, i64)>(
+        r#"
+        SELECT apps.id, units.id FROM apps
+        JOIN deployment_units units ON units.app_id = apps.id
+        WHERE apps.app_key = ?1 AND units.unit_key = ?2
+        "#,
+    )
+    .bind(&app_key)
+    .bind(&unit_key)
+    .fetch_optional(state.db())
+    .await
+    {
+        Ok(Some(ids)) => ids,
+        Ok(None) => {
+            return api_error_code(
+                StatusCode::NOT_FOUND,
+                "UNIT_NOT_FOUND",
+                "application or deployment unit not found",
+            );
+        }
+        Err(error) => {
+            return api_error_code(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DATABASE_ERROR",
+                &error.to_string(),
+            );
+        }
+    };
+    if !api.allows_app(app_id) || !api.allows_unit(unit_id) {
+        return api_error_code(
+            StatusCode::FORBIDDEN,
+            "RESOURCE_SCOPE_DENIED",
+            "API Token is not scoped to this application and deployment unit",
+        );
+    }
+    let upload = match parse_api_package_upload_multipart(multipart).await {
+        Ok(upload) => upload,
+        Err(response) => return response,
+    };
+    if let Err(error) = validate_version(&upload.artifact_version) {
+        return application_release_api_error(error);
+    }
+    if upload.bytes.is_empty() {
+        return api_error_code(
+            StatusCode::BAD_REQUEST,
+            "EMPTY_PACKAGE",
+            "unit release package cannot be empty",
+        );
+    }
+    let checksum = format!("{:x}", Sha256::digest(&upload.bytes));
+    let request_hash = stable_request_hash(&[
+        app_key.as_bytes(),
+        unit_key.as_bytes(),
+        upload.artifact_version.as_bytes(),
+        upload.file_name.as_bytes(),
+        checksum.as_bytes(),
+    ]);
+    match idempotency_replay(
+        state.db(),
+        api.token_id(),
+        "unit_release.upload",
+        &idempotency_key,
+        &request_hash,
+    )
+    .await
+    {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(response) => return response,
+    }
+    let runtime_fs = RuntimeFs::new(state.settings().data_dir.clone());
+    let staged = match runtime_fs
+        .stage_unit_release_package_file(
+            &app_key,
+            &unit_key,
+            &upload.artifact_version,
+            &upload.file_name,
+            &upload.bytes,
+        )
+        .await
+    {
+        Ok(staged) => staged,
+        Err(error) => {
+            return api_error_code(
+                StatusCode::CONFLICT,
+                "PACKAGE_STAGE_FAILED",
+                &error.to_string(),
+            );
+        }
+    };
+    if let Err(error) = runtime_fs.promote_staged_release_package(&staged).await {
+        let _ = runtime_fs.discard_staged_release_package(&staged).await;
+        return api_error_code(
+            StatusCode::CONFLICT,
+            "UNIT_VERSION_EXISTS",
+            &error.to_string(),
+        );
+    }
+    let result = state
+        .application_releases()
+        .register_unit_release(RegisterUnitReleaseInput {
+            unit_id,
+            version: upload.artifact_version,
+            package_name: upload.file_name,
+            package_path: staged.package_path.to_string_lossy().into_owned(),
+            extract_dir: staged.release_dir.to_string_lossy().into_owned(),
+            checksum_sha256: checksum,
+            size_bytes: upload.bytes.len() as i64,
+            published_at: upload.published_at,
+            source: "openapi".to_owned(),
+            metadata: serde_json::json!({
+                "source": upload.source,
+                "entry_file": upload.entry_file,
+                "idempotency_request_hash": request_hash,
+            }),
+            storage: UnitReleaseStorage::local(),
+        })
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = runtime_fs.remove_promoted_release_package(&staged).await;
+            return application_release_api_error(error);
+        }
+    };
+    let body = serde_json::json!({
+        "data": {
+            "app_id": app_id,
+            "app_key": app_key,
+            "unit_id": unit_id,
+            "unit_key": unit_key,
+            "unit_release_id": result.release_id,
+            "version": result.version,
+            "version_code": result.version_code,
+            "versionCode": result.version_code,
+            "checksum_sha256": result.checksum_sha256,
+            "deprecated": false
+        }
+    });
+    if let Err(response) = store_idempotency_response(
+        state.db(),
+        api.token_id(),
+        "unit_release.upload",
+        &idempotency_key,
+        &request_hash,
+        "deployment_unit_release",
+        &result.release_id.to_string(),
+        StatusCode::CREATED,
+        &body,
+    )
+    .await
+    {
+        return response;
+    }
+    (StatusCode::CREATED, Json(body)).into_response()
+}
+
+async fn api_v1_create_application_release(
+    State(state): State<AppState>,
+    api: ApiSession,
+    Path(app_key): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<ApiCreateApplicationReleaseRequest>,
+) -> Response {
+    if !api.can(ARTIFACTS_UPLOAD) {
+        return api_error_code(
+            StatusCode::FORBIDDEN,
+            "PERMISSION_DENIED",
+            "permission denied",
+        );
+    }
+    let idempotency_key = match required_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    let app_id = match sqlx::query_scalar::<_, i64>("SELECT id FROM apps WHERE app_key = ?1")
+        .bind(&app_key)
+        .fetch_optional(state.db())
+        .await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return api_error_code(
+                StatusCode::NOT_FOUND,
+                "APP_NOT_FOUND",
+                "application not found",
+            );
+        }
+        Err(error) => {
+            return api_error_code(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DATABASE_ERROR",
+                &error.to_string(),
+            );
+        }
+    };
+    if !api.allows_app(app_id)
+        || payload
+            .unit_changes
+            .iter()
+            .any(|change| !api.allows_unit(change.unit_id))
+    {
+        return api_error_code(
+            StatusCode::FORBIDDEN,
+            "RESOURCE_SCOPE_DENIED",
+            "API Token is not scoped to this application and all changed deployment units",
+        );
+    }
+    let payload_json = match serde_json::to_vec(&payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return api_error_code(
+                StatusCode::BAD_REQUEST,
+                "INVALID_REQUEST",
+                &error.to_string(),
+            );
+        }
+    };
+    let request_hash = stable_request_hash(&[app_key.as_bytes(), &payload_json]);
+    match idempotency_replay(
+        state.db(),
+        api.token_id(),
+        "application_release.create",
+        &idempotency_key,
+        &request_hash,
+    )
+    .await
+    {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(response) => return response,
+    }
+    let result = state
+        .application_releases()
+        .create_application_release(CreateApplicationReleaseInput {
+            app_id,
+            version: payload.version,
+            base_app_release_id: payload.base_app_release_id,
+            unit_changes: payload
+                .unit_changes
+                .into_iter()
+                .map(|change| UnitReleaseChange {
+                    unit_id: change.unit_id,
+                    unit_release_id: change.unit_release_id,
+                    desired_status: change.desired_status,
+                })
+                .collect(),
+            environment_configs: payload
+                .environment_configs
+                .into_iter()
+                .map(|selection| EnvironmentConfigSelection {
+                    environment_id: selection.environment_id,
+                    config_revision_id: selection.config_revision_id,
+                })
+                .collect(),
+            created_by: format!("api-token:{}", api.token_id()),
+        })
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => return application_release_api_error(error),
+    };
+    let body = serde_json::json!({
+        "data": {
+            "app_id": app_id,
+            "app_key": app_key,
+            "app_release_id": result.app_release_id,
+            "version": result.version,
+            "version_code": result.version_code,
+            "versionCode": result.version_code,
+            "manifest_hash": result.manifest_hash,
+            "units": result.units,
+            "environment_configs": result.environment_configs,
+            "deployment_started": false
+        }
+    });
+    if let Err(response) = store_idempotency_response(
+        state.db(),
+        api.token_id(),
+        "application_release.create",
+        &idempotency_key,
+        &request_hash,
+        "application_release",
+        &result.app_release_id.to_string(),
+        StatusCode::CREATED,
+        &body,
+    )
+    .await
+    {
+        return response;
+    }
+    (StatusCode::CREATED, Json(body)).into_response()
+}
+
 async fn openapi_json() -> impl IntoResponse {
     Json(openapi_spec())
 }
@@ -8133,6 +8506,77 @@ fn openapi_spec() -> serde_json::Value {
         ],
         "security": [{ "BearerAuth": [] }],
         "paths": {
+            "/api/v1/apps/{app_key}/units/{unit_key}/releases": {
+                "post": {
+                    "operationId": "uploadDeploymentUnitRelease",
+                    "summary": "原子上传部署单元版本与发布包",
+                    "description": "上传成功后部署单元 version、平台生成的 versionCode 与唯一发布包不可分离。只登记制品，不触发部署。version 必须是无 v 前缀的 x.y.z。",
+                    "parameters": [
+                        { "name": "app_key", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "unit_key", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "Idempotency-Key", "in": "header", "required": true, "schema": { "type": "string", "maxLength": 128 } }
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "multipart/form-data": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["artifact_version", "package_file"],
+                                    "properties": {
+                                        "artifact_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$", "examples": ["1.2.3"] },
+                                        "package_file": { "type": "string", "contentMediaType": "application/octet-stream" },
+                                        "published_at": { "type": "string", "format": "date-time" },
+                                        "source": { "type": "string", "examples": ["ci"] }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": { "description": "部署单元版本和制品已原子登记" },
+                        "400": { "description": "版本、包或 Idempotency-Key 无效" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "description": "权限或 app/unit scope 不允许" },
+                        "409": { "description": "版本已存在或幂等内容冲突" }
+                    }
+                }
+            },
+            "/api/v1/apps/{app_key}/releases": {
+                "post": {
+                    "operationId": "createApplicationRelease",
+                    "summary": "创建不可变应用发布版本",
+                    "description": "可基于任意历史应用版本，只提交变化单元；平台展开为完整单元与环境配置快照。只创建 ready 版本，不触发部署。",
+                    "parameters": [
+                        { "name": "app_key", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "Idempotency-Key", "in": "header", "required": true, "schema": { "type": "string", "maxLength": 128 } }
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["version"],
+                                    "properties": {
+                                        "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+                                        "base_app_release_id": { "type": ["integer", "null"] },
+                                        "unit_changes": { "type": "array", "items": { "type": "object" } },
+                                        "environment_configs": { "type": "array", "items": { "type": "object" } }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": { "description": "完整不可变应用版本已创建，deployment_started 固定为 false" },
+                        "400": { "description": "缺少部署单元、环境配置或版本格式错误" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "description": "权限或资源 scope 不允许" },
+                        "409": { "description": "版本或 Idempotency-Key 冲突" }
+                    }
+                }
+            },
             "/api/v1/services/{service_key}/packages/uploads": {
                 "post": {
                     "operationId": "createServicePackageUpload",
@@ -8433,14 +8877,15 @@ fn openapi_docs_public_html() -> String {
   <div class="page">
     <header class="hero">
       <p class="eyebrow">Easy Deploy OpenAPI</p>
-      <h1>版本包投递接口</h1>
-      <p class="summary">这份文档无需登录即可访问，面向业务项目脚本和 AI。OpenAPI 只负责把规范命名的版本包投递到平台；应用配置、目标节点、环境变量、Compose 文件、部署脚本和发布时间由 easy-deploy 后台维护。</p>
+      <h1>版本包与应用版本接口</h1>
+      <p class="summary">这份文档无需登录即可访问，面向业务项目 CI 和 AI。OpenAPI 原子登记部署单元版本与发布包，并显式创建不可变应用版本；部署仍只能由运维人员在后台手动启动。</p>
     </header>
     <div class="layout">
       <nav>
         <strong>目录</strong>
         <a href="#scope">职责边界</a>
         <a href="#prepare">接入准备</a>
+        <a href="#multi-unit">多单元发布</a>
         <a href="#naming">包名规范</a>
         <a href="#flow">推荐流程</a>
         <a href="#api-create">申请上传地址</a>
@@ -8452,12 +8897,27 @@ fn openapi_docs_public_html() -> String {
       <article>
         <section id="scope">
           <h2>职责边界</h2>
-          <div class="callout">外部项目不要通过 OpenAPI 创建应用、修改配置或直接触发部署。先在后台把应用参数配置好，外部项目只上传版本包，平台根据配置自动或手动发布。</div>
+          <div class="callout">外部项目不能通过 OpenAPI 创建应用、修改配置或触发部署。CI 只能上传部署单元版本包并创建不可变应用版本，运维人员在后台预览后手动部署。</div>
           <ul>
             <li>后台配置：应用标识、环境、目标节点、Compose 内容、环境变量、部署脚本、健康检查和发布策略。</li>
             <li>业务项目：构建版本包、计算 SHA-256、调用 OpenAPI 上传并完成登记。</li>
             <li>发布执行：平台按应用维度串行处理版本，部署时目标节点直接从 OSS 下载版本包。</li>
           </ul>
+        </section>
+        <section id="multi-unit">
+          <h2>多单元发布</h2>
+          <ol>
+            <li>为每个发生变化的模块调用 <code>POST /api/v1/apps/{app_key}/units/{unit_key}/releases</code>，同时上传 <code>x.y.z</code> 版本和唯一发布包。</li>
+            <li>收集响应中的 <code>unit_release_id</code>，调用 <code>POST /api/v1/apps/{app_key}/releases</code> 创建应用版本。</li>
+            <li>增量应用版本填写 <code>base_app_release_id</code> 并只提交变化单元；平台返回展开后的完整 manifest。</li>
+            <li>两个接口都必须发送 <code>Idempotency-Key</code>。同 key 同内容返回原结果，同 key 异内容返回 <code>IDEMPOTENCY_CONFLICT</code>。</li>
+          </ol>
+          <pre><code>curl -X POST "$EASY_DEPLOY_URL/api/v1/apps/voucher-hub/units/api/releases" \
+  -H "Authorization: Bearer $EASY_DEPLOY_TOKEN" \
+  -H "Idempotency-Key: api-1.4.0" \
+  -F "artifact_version=1.4.0" \
+  -F "package_file=@api-1.4.0.tar.gz"</code></pre>
+          <p>创建应用版本的成功响应包含 <code>manifest_hash</code>、应用 <code>versionCode</code> 和完整单元摘要，并固定返回 <code>deployment_started=false</code>。</p>
         </section>
         <section id="prepare">
           <h2>接入准备</h2>
@@ -9162,6 +9622,173 @@ fn api_error(status: StatusCode, message: &str) -> Response {
     (status, Json(ApiErrorBody { error: message })).into_response()
 }
 
+fn api_error_code(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(ApiStableErrorBody {
+            code,
+            error: message,
+        }),
+    )
+        .into_response()
+}
+
+fn application_release_api_error(error: ApplicationReleaseError) -> Response {
+    let (status, code) = match &error {
+        ApplicationReleaseError::Validation(_) => (StatusCode::BAD_REQUEST, "VALIDATION_ERROR"),
+        ApplicationReleaseError::Conflict(_) => (StatusCode::CONFLICT, "VERSION_CONFLICT"),
+        ApplicationReleaseError::NotFound(_) => (StatusCode::NOT_FOUND, "RESOURCE_NOT_FOUND"),
+        ApplicationReleaseError::Database(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR")
+        }
+    };
+    api_error_code(status, code, &error.to_string())
+}
+
+#[allow(clippy::result_large_err)]
+fn required_idempotency_key(headers: &HeaderMap) -> Result<String, Response> {
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .unwrap_or_default();
+    if key.is_empty() || key.len() > 128 || key.chars().any(char::is_control) {
+        return Err(api_error_code(
+            StatusCode::BAD_REQUEST,
+            "INVALID_IDEMPOTENCY_KEY",
+            "Idempotency-Key is required and must be at most 128 visible characters",
+        ));
+    }
+    Ok(key.to_owned())
+}
+
+fn stable_request_hash(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+async fn idempotency_replay(
+    db: &SqlitePool,
+    token_id: i64,
+    action: &str,
+    key: &str,
+    request_hash: &str,
+) -> Result<Option<Response>, Response> {
+    if let Err(error) = sqlx::query(
+        "DELETE FROM api_idempotency_records WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+    )
+    .execute(db)
+    .await
+    {
+        return Err(api_error_code(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DATABASE_ERROR",
+            &error.to_string(),
+        ));
+    }
+    let record = sqlx::query_as::<_, (String, i64, String)>(
+        r#"
+        SELECT request_hash, response_status, response_body
+        FROM api_idempotency_records
+        WHERE token_id = ?1 AND action = ?2 AND idempotency_key = ?3
+        "#,
+    )
+    .bind(token_id)
+    .bind(action)
+    .bind(key)
+    .fetch_optional(db)
+    .await
+    .map_err(|error| {
+        api_error_code(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DATABASE_ERROR",
+            &error.to_string(),
+        )
+    })?;
+    let Some((stored_hash, response_status, response_body)) = record else {
+        return Ok(None);
+    };
+    if stored_hash != request_hash {
+        return Err(api_error_code(
+            StatusCode::CONFLICT,
+            "IDEMPOTENCY_CONFLICT",
+            "Idempotency-Key was already used with different request content",
+        ));
+    }
+    let status = StatusCode::from_u16(response_status as u16).unwrap_or(StatusCode::OK);
+    let body = serde_json::from_str::<serde_json::Value>(&response_body).map_err(|error| {
+        api_error_code(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "IDEMPOTENCY_RECORD_CORRUPTED",
+            &error.to_string(),
+        )
+    })?;
+    Ok(Some((status, Json(body)).into_response()))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn store_idempotency_response(
+    db: &SqlitePool,
+    token_id: i64,
+    action: &str,
+    key: &str,
+    request_hash: &str,
+    resource_type: &str,
+    resource_id: &str,
+    status: StatusCode,
+    body: &serde_json::Value,
+) -> Result<(), Response> {
+    let body = serde_json::to_string(body).map_err(|error| {
+        api_error_code(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SERIALIZATION_ERROR",
+            &error.to_string(),
+        )
+    })?;
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO api_idempotency_records(
+            token_id, action, idempotency_key, request_hash, resource_type,
+            resource_id, response_status, response_body, expires_at
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+24 hours')
+        )
+        ON CONFLICT(token_id, action, idempotency_key) DO NOTHING
+        "#,
+    )
+    .bind(token_id)
+    .bind(action)
+    .bind(key)
+    .bind(request_hash)
+    .bind(resource_type)
+    .bind(resource_id)
+    .bind(i64::from(status.as_u16()))
+    .bind(body)
+    .execute(db)
+    .await
+    .map_err(|error| {
+        api_error_code(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DATABASE_ERROR",
+            &error.to_string(),
+        )
+    })?;
+    if inserted.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(api_error_code(
+            StatusCode::CONFLICT,
+            "IDEMPOTENCY_CONFLICT",
+            "Idempotency-Key was completed concurrently; retry the request to read its result",
+        ))
+    }
+}
+
 fn api_package_error(status: StatusCode, err: BinaryPackageNameError) -> Response {
     (
         status,
@@ -9217,6 +9844,18 @@ struct ApiSession {
 impl ApiSession {
     fn can(&self, permission_key: &str) -> bool {
         self.inner.session.can(permission_key)
+    }
+
+    fn token_id(&self) -> i64 {
+        self.inner.token_id
+    }
+
+    fn allows_app(&self, app_id: i64) -> bool {
+        self.inner.allows_app(app_id)
+    }
+
+    fn allows_unit(&self, unit_id: i64) -> bool {
+        self.inner.allows_unit(unit_id)
     }
 }
 
@@ -9291,6 +9930,7 @@ mod tests {
 
     struct TestWebApp {
         router: Router,
+        db: SqlitePool,
         auth: AuthService,
         apps: AppService,
         tasks: TaskService,
@@ -9402,12 +10042,14 @@ mod tests {
                     platform,
                     events,
                     application_config: None,
+                    application_releases: ApplicationReleaseService::new(db.clone()),
                     deployment_orchestrator: DeploymentOrchestratorService::new(db.clone()),
                     deployment_logs: DeploymentLogService::new(db.clone()),
                     deployment_retention: DeploymentRetentionService::new(db.clone()),
                 },
             )),
             auth: auth_for_test,
+            db,
             apps: apps_for_test,
             tasks: tasks_for_test,
             platform: platform_for_test,
@@ -9914,7 +10556,9 @@ mod tests {
             "bearer"
         );
         let paths = spec["paths"].as_object().expect("paths object");
-        assert_eq!(paths.len(), 3);
+        assert_eq!(paths.len(), 5);
+        assert!(paths.contains_key("/api/v1/apps/{app_key}/units/{unit_key}/releases"));
+        assert!(paths.contains_key("/api/v1/apps/{app_key}/releases"));
         assert!(paths.contains_key("/api/v1/services/{service_key}/packages/uploads"));
         assert!(
             paths.contains_key(
@@ -9925,6 +10569,14 @@ mod tests {
         assert_eq!(
             spec["paths"]["/api/v1/services/{service_key}/packages/uploads"]["post"]["operationId"],
             "createServicePackageUpload"
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/apps/{app_key}/units/{unit_key}/releases"]["post"]["operationId"],
+            "uploadDeploymentUnitRelease"
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/apps/{app_key}/releases"]["post"]["operationId"],
+            "createApplicationRelease"
         );
         assert_eq!(
             spec["paths"]["/api/v1/services/{service_key}/packages/uploads/{upload_id}/complete"]["post"]
@@ -9972,7 +10624,9 @@ mod tests {
             .expect("read body");
         let html = String::from_utf8_lossy(&body);
         assert!(html.contains("Easy Deploy OpenAPI"));
-        assert!(html.contains("版本包投递接口"));
+        assert!(html.contains("版本包与应用版本接口"));
+        assert!(html.contains("/api/v1/apps/{app_key}/units/{unit_key}/releases"));
+        assert!(html.contains("/api/v1/apps/{app_key}/releases"));
         assert!(html.contains("申请上传地址"));
         assert!(html.contains("完成登记"));
         assert!(html.contains("sha256sum"));
@@ -9983,7 +10637,6 @@ mod tests {
         assert!(html.contains("file_name"));
         assert!(html.contains("checksum_sha256"));
         assert!(html.contains("source"));
-        assert!(!html.contains("/api/v1/apps"));
         assert!(!html.contains("/api/v1/tasks"));
         assert!(!html.contains("/api/v1/services/{service_key}/deploy"));
         assert!(!html.contains("Git 源码发布"));
@@ -10046,6 +10699,262 @@ mod tests {
         let listed = app.auth.list_api_tokens().await.expect("list api tokens");
         assert_eq!(listed[0].source, "test-suite");
         assert!(listed[0].last_used_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn scoped_token_uploads_unit_and_creates_idempotent_application_release() {
+        let app = test_web_app().await;
+        let app_id = create_compose_test_app_with_mode(&app.apps, "multi-api", false).await;
+        let unit_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM deployment_units WHERE app_id = ?1 AND unit_key = 'default'",
+        )
+        .bind(app_id)
+        .fetch_one(&app.db)
+        .await
+        .expect("load default unit");
+        let environment_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM app_environments WHERE app_id = ?1 ORDER BY id LIMIT 1",
+        )
+        .bind(app_id)
+        .fetch_one(&app.db)
+        .await
+        .expect("load environment");
+        let config_revision_id = sqlx::query(
+            "INSERT INTO app_config_revisions(app_id, revision_no, config_json, public_config_json, config_hash) VALUES (?1, 100, '{}', '{}', 'multi-api-config')",
+        )
+        .bind(app_id)
+        .execute(&app.db)
+        .await
+        .expect("insert config revision")
+        .last_insert_rowid();
+        let token = super_admin_api_token(&app.auth, "multi-unit-test").await;
+        let token_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM api_tokens WHERE source = 'multi-unit-test' ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&app.db)
+        .await
+        .expect("load token");
+        sqlx::query(
+            "UPDATE api_tokens SET app_scope_json = ?2, unit_scope_json = ?3, max_concurrent_requests = 10 WHERE id = ?1",
+        )
+        .bind(token_id)
+        .bind(serde_json::json!([app_id]).to_string())
+        .bind(serde_json::json!([unit_id]).to_string())
+        .execute(&app.db)
+        .await
+        .expect("scope token");
+        let boundary = "unit-release-boundary";
+        let upload_body = multipart_body(
+            boundary,
+            "package_file",
+            "multi-api-default-1.0.0.tar.gz",
+            "unit package",
+            &[("artifact_version", "1.0.0"), ("source", "ci")],
+        );
+        let upload_request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/apps/multi-api/units/default/releases")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header("idempotency-key", "unit-default-1.0.0")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(upload_body.clone()))
+                .expect("build upload request")
+        };
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(upload_request())
+            .await
+            .expect("upload unit");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let upload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read upload response"),
+        )
+        .expect("parse upload response");
+        let unit_release_id = upload["data"]["unit_release_id"]
+            .as_i64()
+            .expect("unit release id");
+        let replay = app
+            .router
+            .clone()
+            .oneshot(upload_request())
+            .await
+            .expect("replay upload");
+        assert_eq!(replay.status(), StatusCode::CREATED);
+
+        let release_payload = serde_json::json!({
+            "version": "1.0.0",
+            "unit_changes": [{
+                "unit_id": unit_id,
+                "unit_release_id": unit_release_id,
+                "desired_status": "active"
+            }],
+            "environment_configs": [{
+                "environment_id": environment_id,
+                "config_revision_id": config_revision_id
+            }]
+        });
+        let release_request = |payload: &serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/apps/multi-api/releases")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header("idempotency-key", "app-release-1.0.0")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .expect("build app release request")
+        };
+        let response = app
+            .router
+            .clone()
+            .oneshot(release_request(&release_payload))
+            .await
+            .expect("create application release");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let release: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read release response"),
+        )
+        .expect("parse release response");
+        assert_eq!(release["data"]["versionCode"], 100);
+        assert_eq!(release["data"]["deployment_started"], false);
+        let replay = app
+            .router
+            .clone()
+            .oneshot(release_request(&release_payload))
+            .await
+            .expect("replay application release");
+        assert_eq!(replay.status(), StatusCode::CREATED);
+
+        let mut changed_payload = release_payload;
+        changed_payload["version"] = serde_json::Value::String("1.0.1".to_owned());
+        let conflict = app
+            .router
+            .clone()
+            .oneshot(release_request(&changed_payload))
+            .await
+            .expect("send idempotency conflict");
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM environment_deployment_runs")
+            .fetch_one(&app.db)
+            .await
+            .expect("count deployment runs");
+        assert_eq!(run_count, 0);
+    }
+
+    #[tokio::test]
+    async fn new_openapi_enforces_token_scope_expiry_and_rate_limit() {
+        let app = test_web_app().await;
+        let app_id = create_compose_test_app_with_mode(&app.apps, "scope-api", false).await;
+        let token = super_admin_api_token(&app.auth, "scope-policy-test").await;
+        let token_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM api_tokens WHERE source = 'scope-policy-test' ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&app.db)
+        .await
+        .expect("load token");
+        let boundary = "scope-policy-boundary";
+        let body = multipart_body(
+            boundary,
+            "package_file",
+            "scope-api.tar.gz",
+            "package",
+            &[("artifact_version", "1.0.0")],
+        );
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/apps/scope-api/units/default/releases")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header("idempotency-key", "scope-policy")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body.clone()))
+                .expect("build request")
+        };
+
+        let denied = app
+            .router
+            .clone()
+            .oneshot(request())
+            .await
+            .expect("send scope denied request");
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let denied_body = to_bytes(denied.into_body(), usize::MAX)
+            .await
+            .expect("read denied body");
+        assert!(String::from_utf8_lossy(&denied_body).contains("RESOURCE_SCOPE_DENIED"));
+
+        sqlx::query("UPDATE api_tokens SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?1")
+            .bind(token_id)
+            .execute(&app.db)
+            .await
+            .expect("expire token");
+        let expired = app
+            .router
+            .clone()
+            .oneshot(request())
+            .await
+            .expect("send expired request");
+        assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+
+        sqlx::query(
+            "UPDATE api_tokens SET expires_at = NULL, app_scope_json = ?2, unit_scope_json = '[]', rate_limit_per_minute = 1, rate_window_started_at = '', rate_window_count = 0, active_request_count = 0 WHERE id = ?1",
+        )
+        .bind(token_id)
+        .bind(serde_json::json!([app_id]).to_string())
+        .execute(&app.db)
+        .await
+        .expect("configure rate policy");
+        let first = app
+            .router
+            .clone()
+            .oneshot(request())
+            .await
+            .expect("send first rate request");
+        assert_eq!(first.status(), StatusCode::FORBIDDEN);
+        let limited = app
+            .router
+            .clone()
+            .oneshot(request())
+            .await
+            .expect("send rate limited request");
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        sqlx::query(
+            "UPDATE api_tokens SET rate_limit_per_minute = 100, rate_window_started_at = '', rate_window_count = 0, max_concurrent_requests = 1, active_request_count = 0 WHERE id = ?1",
+        )
+        .bind(token_id)
+        .execute(&app.db)
+        .await
+        .expect("configure concurrency policy");
+        let permit = app
+            .auth
+            .authenticate_api_token(&token, "127.0.0.1")
+            .await
+            .expect("acquire first token request");
+        let concurrent = app
+            .auth
+            .authenticate_api_token(&token, "127.0.0.1")
+            .await
+            .expect_err("second concurrent request must fail");
+        assert!(matches!(concurrent, crate::auth::AuthError::RateLimited(_)));
+        drop(permit);
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        app.auth
+            .authenticate_api_token(&token, "127.0.0.1")
+            .await
+            .expect("permit is released after request drop");
     }
 
     #[tokio::test]

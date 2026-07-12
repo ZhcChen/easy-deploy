@@ -819,6 +819,7 @@ mod tests {
         assert!(versions.contains(&50));
         assert!(versions.contains(&51));
         assert!(versions.contains(&52));
+        assert!(versions.contains(&53));
     }
 
     #[test]

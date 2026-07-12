@@ -8754,6 +8754,64 @@ impl AppService {
             .await?;
         }
 
+        let environment_id = sqlx::query(
+            r#"
+            INSERT INTO app_environments(
+                app_id, environment_key, name, status, max_parallel_units
+            ) VALUES (?1, ?2, ?3, 'ready', 3)
+            "#,
+        )
+        .bind(app_id)
+        .bind(&environment)
+        .bind(match environment.as_str() {
+            "production" => "正式环境",
+            "test" | "testing" => "测试环境",
+            _ => "默认环境",
+        })
+        .execute(&mut *tx)
+        .await?
+        .last_insert_rowid();
+        for node_id in dedupe_ids(&input.target_node_ids) {
+            sqlx::query(
+                "INSERT INTO app_environment_targets(environment_id, node_id, target_role) VALUES (?1, ?2, 'primary')",
+            )
+            .bind(environment_id)
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let unit_id = sqlx::query(
+            r#"
+            INSERT INTO deployment_units(
+                app_id, unit_key, name, description, required, lifecycle_status, work_dir
+            ) VALUES (?1, 'default', ?2, '默认 Compose 部署单元', 1, 'active', ?3)
+            "#,
+        )
+        .bind(app_id)
+        .bind(&name)
+        .bind(&work_dir)
+        .execute(&mut *tx)
+        .await?
+        .last_insert_rowid();
+        let stage_id = sqlx::query(
+            r#"
+            INSERT INTO deployment_pipeline_stages(
+                app_id, stage_no, stage_key, name, stage_kind
+            ) VALUES (?1, 1, 'default', '默认阶段', 'units')
+            "#,
+        )
+        .bind(app_id)
+        .execute(&mut *tx)
+        .await?
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO deployment_pipeline_stage_units(stage_id, unit_id, unit_order, removal_order) VALUES (?1, ?2, 1, 1)",
+        )
+        .bind(stage_id)
+        .bind(unit_id)
+        .execute(&mut *tx)
+        .await?;
+
         sqlx::query(
             r#"
             INSERT INTO app_health_checks(app_id, check_kind)

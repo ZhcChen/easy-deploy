@@ -724,7 +724,7 @@ fn validate_unit_release_input(
     }
 }
 
-fn validate_version(version: &str) -> Result<(), ApplicationReleaseError> {
+pub fn validate_version(version: &str) -> Result<(), ApplicationReleaseError> {
     let value = version.trim();
     let parts = value.split('.').collect::<Vec<_>>();
     let valid = parts.len() == 3

@@ -224,6 +224,12 @@ impl RuntimeFs {
         Ok(self.data_dir.join("apps").join(app_key))
     }
 
+    pub fn unit_root(&self, app_key: &str, unit_key: &str) -> Result<PathBuf, RuntimeFsError> {
+        validate_key(app_key)?;
+        validate_key(unit_key)?;
+        Ok(self.app_root(app_key)?.join("units").join(unit_key))
+    }
+
     pub async fn save_app_config(
         &self,
         config: AppRuntimeConfig,
@@ -451,6 +457,74 @@ impl RuntimeFs {
         })
         .await
         .map_err(|err| RuntimeFsError::Io(format!("写入发布版本临时包任务失败: {err}")))??;
+
+        Ok(StagedReleasePackage {
+            staging_dir,
+            staged_package_path,
+            release_dir,
+            package_path,
+        })
+    }
+
+    pub async fn stage_unit_release_package_file(
+        &self,
+        app_key: &str,
+        unit_key: &str,
+        release_version: &str,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<StagedReleasePackage, RuntimeFsError> {
+        validate_key(app_key)?;
+        validate_key(unit_key)?;
+        validate_release_id(release_version)?;
+        let file_name = sanitize_file_name(file_name)?;
+        let releases_dir = self.unit_root(app_key, unit_key)?.join(RELEASES_DIR_NAME);
+        let release_dir = releases_dir.join(release_version);
+        let staging_name = format!(
+            ".staging-{release_version}-{}-{}",
+            std::process::id(),
+            RELEASE_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        );
+        let staging_dir = releases_dir.join(staging_name);
+        let staged_package_path = staging_dir.join(&file_name);
+        let package_path = release_dir.join(&file_name);
+        let releases_dir_for_write = releases_dir.clone();
+        let staging_dir_for_write = staging_dir.clone();
+        let staged_package_path_for_write = staged_package_path.clone();
+        let content = bytes.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&releases_dir_for_write)
+                .map_err(|err| io_error("创建单元发布版本目录", &releases_dir_for_write, err))?;
+            std::fs::create_dir(&staging_dir_for_write)
+                .map_err(|err| io_error("创建单元发布版本临时目录", &staging_dir_for_write, err))?;
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staged_package_path_for_write)
+            {
+                Ok(file) => file,
+                Err(err) => {
+                    let _ = std::fs::remove_dir_all(&staging_dir_for_write);
+                    return Err(io_error(
+                        "创建单元发布版本临时包",
+                        &staged_package_path_for_write,
+                        err,
+                    ));
+                }
+            };
+            if let Err(err) = std::io::Write::write_all(&mut file, &content) {
+                let _ = std::fs::remove_dir_all(&staging_dir_for_write);
+                return Err(io_error(
+                    "写入单元发布版本临时包",
+                    &staged_package_path_for_write,
+                    err,
+                ));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|err| RuntimeFsError::Io(format!("写入单元发布版本临时包任务失败: {err}")))??;
 
         Ok(StagedReleasePackage {
             staging_dir,

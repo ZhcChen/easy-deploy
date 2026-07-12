@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt, time::Duration};
+use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 
 use axum::{
     http::StatusCode,
@@ -131,6 +131,7 @@ pub enum AuthError {
     Unauthorized(String),
     Forbidden(String),
     Conflict(String),
+    RateLimited(String),
     Internal(String),
 }
 
@@ -141,6 +142,7 @@ impl AuthError {
             | Self::Unauthorized(message)
             | Self::Forbidden(message)
             | Self::Conflict(message)
+            | Self::RateLimited(message)
             | Self::Internal(message) => message,
         }
     }
@@ -151,6 +153,7 @@ impl AuthError {
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -310,6 +313,11 @@ pub struct ApiTokenListItem {
     pub token_prefix: String,
     pub source: String,
     pub status: String,
+    pub app_scope_json: String,
+    pub unit_scope_json: String,
+    pub expires_at: Option<String>,
+    pub rate_limit_per_minute: i64,
+    pub max_concurrent_requests: i64,
     pub last_used_at: Option<String>,
     pub last_used_ip: String,
     pub revoked_at: Option<String>,
@@ -330,6 +338,47 @@ pub struct ApiTokenAuthSession {
     pub session: CurrentSession,
     pub token_id: i64,
     pub source: String,
+    pub app_scope_ids: Vec<i64>,
+    pub unit_scope_ids: Vec<i64>,
+    _permit: Arc<ApiTokenRequestPermit>,
+}
+
+impl ApiTokenAuthSession {
+    pub fn allows_app(&self, app_id: i64) -> bool {
+        self.app_scope_ids.contains(&app_id)
+    }
+
+    pub fn allows_unit(&self, unit_id: i64) -> bool {
+        self.unit_scope_ids.contains(&unit_id)
+    }
+}
+
+#[derive(Debug)]
+struct ApiTokenRequestPermit {
+    db: SqlitePool,
+    token_id: i64,
+}
+
+impl Drop for ApiTokenRequestPermit {
+    fn drop(&mut self) {
+        let db = self.db.clone();
+        let token_id = self.token_id;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = sqlx::query(
+                    r#"
+                    UPDATE api_tokens
+                    SET active_request_count = MAX(active_request_count - 1, 0),
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE id = ?1
+                    "#,
+                )
+                .bind(token_id)
+                .execute(&db)
+                .await;
+            });
+        }
+    }
 }
 
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -1388,6 +1437,11 @@ impl AuthService {
                 t.token_prefix,
                 t.source,
                 t.status,
+                t.app_scope_json,
+                t.unit_scope_json,
+                t.expires_at,
+                t.rate_limit_per_minute,
+                t.max_concurrent_requests,
                 t.last_used_at,
                 t.last_used_ip,
                 t.revoked_at,
@@ -1528,11 +1582,14 @@ impl AuthService {
         client_ip: &str,
     ) -> Result<ApiTokenAuthSession, AuthError> {
         let token_hash = hash_token(token);
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             r#"
             SELECT
                 t.id AS token_id,
                 t.source AS token_source,
+                t.app_scope_json,
+                t.unit_scope_json,
                 a.id,
                 a.username,
                 a.display_name,
@@ -1542,11 +1599,12 @@ impl AuthService {
             JOIN admin_accounts a ON a.id = t.account_id
             WHERE t.token_hash = ?1
               AND t.status = 'active'
+              AND (t.expires_at IS NULL OR t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
               AND a.status = 'active'
             "#,
         )
         .bind(&token_hash)
-        .fetch_optional(&self.db)
+        .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
             return Err(AuthError::Unauthorized("API Token 无效或已吊销".to_owned()));
@@ -1554,19 +1612,46 @@ impl AuthService {
         let account = row_to_account(&row);
         let token_id: i64 = row.get("token_id");
         let token_source: String = row.get("token_source");
-        sqlx::query(
+        let app_scope_json: String = row.get("app_scope_json");
+        let unit_scope_json: String = row.get("unit_scope_json");
+        let app_scope_ids = serde_json::from_str::<Vec<i64>>(&app_scope_json)
+            .map_err(|_| AuthError::Internal("API Token 应用范围配置损坏".to_owned()))?;
+        let unit_scope_ids = serde_json::from_str::<Vec<i64>>(&unit_scope_json)
+            .map_err(|_| AuthError::Internal("API Token 部署单元范围配置损坏".to_owned()))?;
+        let quota = sqlx::query(
             r#"
             UPDATE api_tokens
-            SET last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            SET rate_window_count = CASE
+                    WHEN rate_window_started_at = ''
+                      OR rate_window_started_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-60 seconds')
+                    THEN 1 ELSE rate_window_count + 1 END,
+                rate_window_started_at = CASE
+                    WHEN rate_window_started_at = ''
+                      OR rate_window_started_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-60 seconds')
+                    THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE rate_window_started_at END,
+                active_request_count = active_request_count + 1,
+                last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                 last_used_ip = ?2,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE id = ?1
+              AND active_request_count < max_concurrent_requests
+              AND (
+                    rate_window_started_at = ''
+                 OR rate_window_started_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-60 seconds')
+                 OR rate_window_count < rate_limit_per_minute
+              )
             "#,
         )
         .bind(token_id)
         .bind(client_ip)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
+        if quota.rows_affected() != 1 {
+            return Err(AuthError::RateLimited(
+                "API Token 请求过于频繁或并发数已达到上限".to_owned(),
+            ));
+        }
+        tx.commit().await?;
         let source = token_source.clone();
         Ok(ApiTokenAuthSession {
             session: CurrentSession {
@@ -1580,6 +1665,12 @@ impl AuthService {
             },
             token_id,
             source,
+            app_scope_ids,
+            unit_scope_ids,
+            _permit: Arc::new(ApiTokenRequestPermit {
+                db: self.db.clone(),
+                token_id,
+            }),
         })
     }
 

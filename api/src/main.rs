@@ -4,6 +4,7 @@ use std::sync::Arc;
 use api::{
     AppState, AppStateServices, Settings,
     application_config::ApplicationConfigService,
+    application_releases::ApplicationReleaseService,
     apps::AppService,
     auth::{AuthService, MemorySessionStore},
     build_router,
@@ -178,6 +179,7 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
         .context("load config encryption key ring")?;
         Some(ApplicationConfigService::new(db.clone(), cipher))
     };
+    let application_releases = ApplicationReleaseService::new(db.clone());
     let apps = AppService::new(
         db.clone(),
         RuntimeFs::new(settings.data_dir.clone()),
@@ -204,6 +206,7 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
             platform,
             events,
             application_config,
+            application_releases,
             deployment_orchestrator,
             deployment_logs,
             deployment_retention,

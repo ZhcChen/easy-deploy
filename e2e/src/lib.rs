@@ -4,6 +4,7 @@ use std::{collections::HashMap, net::SocketAddr};
 
 use api::{
     AppState, AppStateServices, Settings,
+    application_releases::ApplicationReleaseService,
     apps::AppService,
     auth::{AuthService, MemorySessionStore},
     build_router,
@@ -196,6 +197,7 @@ pub async fn smoke_test() -> anyhow::Result<()> {
             platform,
             events,
             application_config: None,
+            application_releases: ApplicationReleaseService::new(db.clone()),
             deployment_orchestrator: DeploymentOrchestratorService::new(db.clone()),
             deployment_logs: DeploymentLogService::new(db.clone()),
             deployment_retention: DeploymentRetentionService::new(db.clone()),
