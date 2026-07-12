@@ -170,6 +170,7 @@ pub struct CreatedDeploymentRun {
 pub struct UnitExecutionContext {
     pub deployment_run_id: i64,
     pub task_id: i64,
+    pub step_id: i64,
     pub environment_id: i64,
     pub target_node_ids: Vec<i64>,
     pub item: DeploymentPlanItem,
@@ -617,6 +618,7 @@ async fn execute_wave(
             let context = UnitExecutionContext {
                 deployment_run_id,
                 task_id,
+                step_id,
                 environment_id,
                 target_node_ids: target_node_ids.to_vec(),
                 item: item.clone(),

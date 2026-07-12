@@ -94,7 +94,11 @@
               <td>
                 <span class="badge tone-{{ app.deployment_status_tone }}">{{ app.deployment_status }}</span>
                 {% match app.active_run_id %}
-                  {% when Some with (run_id) %}<a class="text-link" href="/apps/{{ app.id }}#environment-deployment-history-title">查看过程 #{{ run_id }}</a>
+                  {% when Some with (run_id) %}
+                    {% match app.active_task_id %}
+                      {% when Some with (task_id) %}<a class="text-link" href="/tasks/{{ task_id }}">查看过程 #{{ run_id }}</a>
+                      {% when None %}<a class="text-link" href="/apps/{{ app.id }}#environment-deployment-history-title">查看过程 #{{ run_id }}</a>
+                    {% endmatch %}
                   {% when None %}
                 {% endmatch %}
               </td>

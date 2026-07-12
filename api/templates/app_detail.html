@@ -24,7 +24,7 @@
         <strong>{{ item.name }}</strong>
         <span>{{ item.key }} · {{ item.latest_version }}</span>
         <span><span class="badge tone-{{ item.status_tone }}">{{ item.status }}</span> <span class="badge tone-{{ item.runtime_tone }}">{{ item.runtime_status }}</span></span>
-        <span>{{ item.target_count }} 个节点{% match item.active_run_id %}{% when Some with (run_id) %} · <span class="badge tone-active">{{ item.active_run_status }}</span> · <span>#{{ run_id }}</span>{% when None %}{% endmatch %}</span>
+        <span>{{ item.target_count }} 个节点{% match item.active_run_id %}{% when Some with (run_id) %} · <span class="badge tone-active">{{ item.active_run_status }}</span> · {% match item.active_task_id %}{% when Some with (task_id) %}<span><a class="text-link" href="/tasks/{{ task_id }}">查看过程 #{{ run_id }}</a></span>{% when None %}<span>#{{ run_id }}</span>{% endmatch %}{% when None %}{% endmatch %}</span>
       </a>
     {% endfor %}
   </nav>

@@ -190,6 +190,7 @@ async fn serve(db: sqlx::SqlitePool, settings: Settings) -> anyhow::Result<()> {
             api::deploy::SshExecutor::new(command_runner.clone())
                 .with_known_hosts_file(ssh_known_hosts_file(&settings.data_dir)),
             settings.data_dir.join("deployment-staging"),
+            deployment_logs.clone(),
         )) as Arc<dyn api::deployment_orchestrator::DeploymentUnitExecutor>
     });
     let apps = AppService::new(

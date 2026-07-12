@@ -799,6 +799,7 @@ pub struct AppPageRow<'a> {
     pub deployment_status: &'static str,
     pub deployment_status_tone: &'static str,
     pub active_run_id: Option<i64>,
+    pub active_task_id: Option<i64>,
     pub environment_id: Option<i64>,
     pub unit_count: i64,
     pub can_deploy: bool,
@@ -817,6 +818,7 @@ pub struct DeploymentEnvironmentRow {
     pub latest_version: String,
     pub target_count: i64,
     pub active_run_id: Option<i64>,
+    pub active_task_id: Option<i64>,
     pub active_run_status: String,
     pub selected: bool,
 }

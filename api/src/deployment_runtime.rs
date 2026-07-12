@@ -17,6 +17,7 @@ use crate::{
     deployment_orchestrator::{
         DeploymentAction, DeploymentUnitExecutor, UnitExecutionContext, UnitExecutionOutcome,
     },
+    deployment_retention::DeploymentLogService,
     health::{HealthCheckKind, normalize_health_config},
 };
 
@@ -32,6 +33,7 @@ pub struct ComposeDeploymentUnitExecutor {
     compose: ComposeExecutor,
     ssh: SshExecutor,
     staging_root: PathBuf,
+    logs: DeploymentLogService,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,12 +346,14 @@ impl ComposeDeploymentUnitExecutor {
         compose: ComposeExecutor,
         ssh: SshExecutor,
         staging_root: PathBuf,
+        logs: DeploymentLogService,
     ) -> Self {
         Self {
             runtime,
             compose,
             ssh,
             staging_root,
+            logs,
         }
     }
 
@@ -359,19 +363,44 @@ impl ComposeDeploymentUnitExecutor {
     ) -> Result<String, DeploymentRuntimeError> {
         let spec = self.runtime.load_unit_spec(context).await?;
         let prepared = prepare_unit_runtime(&spec, &self.staging_root).await?;
+        let secrets = spec
+            .environment_variables
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut summaries = Vec::new();
         for node in &spec.target_nodes {
             let result =
                 execute_prepared_unit_on_node(&spec, &prepared, node, &self.compose, &self.ssh)
                     .await?;
             summaries.push(result.summary.clone());
+            for output in &result.outputs {
+                let rendered = format!("$ {}\n{}\n", output.command, output.output);
+                self.logs
+                    .append(
+                        context.task_id,
+                        context.step_id,
+                        &secrets,
+                        rendered.as_bytes(),
+                    )
+                    .await
+                    .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
+            }
             if !result.success {
+                self.logs
+                    .finish(context.task_id, context.step_id)
+                    .await
+                    .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
                 return Err(DeploymentRuntimeError::Validation(format!(
                     "节点 {} 执行失败：{}",
                     node.node_key, result.summary
                 )));
             }
         }
+        self.logs
+            .finish(context.task_id, context.step_id)
+            .await
+            .map_err(|error| DeploymentRuntimeError::Database(error.to_string()))?;
         Ok(summaries.join("；"))
     }
 }
@@ -381,17 +410,29 @@ impl DeploymentUnitExecutor for ComposeDeploymentUnitExecutor {
     async fn execute(&self, context: UnitExecutionContext) -> UnitExecutionOutcome {
         match self.execute_inner(&context).await {
             Ok(summary) => UnitExecutionOutcome::Success { summary },
-            Err(error) => UnitExecutionOutcome::Failed {
-                failure_kind: match error {
-                    DeploymentRuntimeError::Validation(_) => "validation",
-                    DeploymentRuntimeError::NotFound(_) => "resource_not_found",
-                    DeploymentRuntimeError::Config(_) => "config_error",
-                    DeploymentRuntimeError::Database(_) => "database_error",
+            Err(error) => {
+                let _ = self
+                    .logs
+                    .append(
+                        context.task_id,
+                        context.step_id,
+                        &[],
+                        format!("部署执行失败：{error}\n").as_bytes(),
+                    )
+                    .await;
+                let _ = self.logs.finish(context.task_id, context.step_id).await;
+                UnitExecutionOutcome::Failed {
+                    failure_kind: match error {
+                        DeploymentRuntimeError::Validation(_) => "validation",
+                        DeploymentRuntimeError::NotFound(_) => "resource_not_found",
+                        DeploymentRuntimeError::Config(_) => "config_error",
+                        DeploymentRuntimeError::Database(_) => "database_error",
+                    }
+                    .to_owned(),
+                    summary: error.to_string(),
+                    exit_code: None,
                 }
-                .to_owned(),
-                summary: error.to_string(),
-                exit_code: None,
-            },
+            }
         }
     }
 }

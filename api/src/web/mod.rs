@@ -1207,6 +1207,9 @@ async fn apps_page(
                 })
                 .unwrap_or("neutral"),
             active_run_id: active,
+            active_task_id: deployment_environment
+                .as_ref()
+                .and_then(|environment| environment.active_task_id),
             environment_id: deployment_environment
                 .as_ref()
                 .map(|environment| environment.environment_id),
@@ -1673,6 +1676,7 @@ async fn render_app_detail(
                 .unwrap_or_else(|| "尚无应用版本".to_owned()),
             target_count: environment.target_count,
             active_run_id: environment.active_run_id,
+            active_task_id: environment.active_task_id,
             active_run_status: environment.active_run_status.clone().unwrap_or_default(),
             selected: environment.environment_id == selected_environment_id,
         })

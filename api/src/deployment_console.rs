@@ -18,6 +18,7 @@ pub struct ApplicationEnvironmentSummary {
     pub latest_version: Option<String>,
     pub latest_version_code: Option<i64>,
     pub active_run_id: Option<i64>,
+    pub active_task_id: Option<i64>,
     pub active_run_status: Option<String>,
     pub unit_count: i64,
     pub target_count: i64,
@@ -107,6 +108,7 @@ impl DeploymentConsoleService {
                    latest_release.version AS latest_version,
                    latest_release.version_code AS latest_version_code,
                    active_run.id AS active_run_id,
+                   active_run.task_id AS active_task_id,
                    active_run.status AS active_run_status,
                    (SELECT COUNT(*) FROM deployment_units units
                     WHERE units.app_id = apps.id) AS unit_count,
