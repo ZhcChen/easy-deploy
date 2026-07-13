@@ -51,7 +51,7 @@
 </section>
 
 {% for template in templates %}
-  <dialog class="modal-dialog wide-modal" id="template-preview-{{ template.key }}" aria-labelledby="template-preview-title-{{ template.key }}">
+  <dialog class="modal-dialog xwide-modal template-preview-modal" id="template-preview-{{ template.key }}" aria-labelledby="template-preview-title-{{ template.key }}">
     <section class="modal-card">
       <div class="modal-header">
         <div>
@@ -64,12 +64,15 @@
         </div>
       </div>
       <div class="modal-detail-body template-preview-body">
-        <section class="modal-detail-section" aria-labelledby="template-preview-config-title-{{ template.key }}">
-          <h3 id="template-preview-config-title-{{ template.key }}">Compose 配置预览</h3>
-          <label class="copy-field template-preview-copy">
-            <span>包含 compose.yaml 和 .env 示例。创建应用时仍可按环境修改端口、密码、镜像和资源目录。</span>
-            <textarea id="template-preview-config-{{ template.key }}" readonly spellcheck="false">{{ template.preview_config }}</textarea>
-          </label>
+        <section class="template-code-panel" aria-labelledby="template-preview-config-title-{{ template.key }}">
+          <div class="template-code-panel-header">
+            <div>
+              <h3 id="template-preview-config-title-{{ template.key }}">Compose 配置预览</h3>
+              <p>包含 compose.yaml 和 .env 示例。创建应用时仍可按环境修改端口、密码、镜像和资源目录。</p>
+            </div>
+            <span class="code-language-pill">compose.yaml + .env</span>
+          </div>
+          <pre class="template-code-preview" tabindex="0"><code id="template-preview-config-{{ template.key }}">{{ template.preview_config }}</code></pre>
         </section>
       </div>
     </section>
