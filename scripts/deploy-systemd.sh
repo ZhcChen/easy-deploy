@@ -12,6 +12,8 @@ BIND_ADDR="127.0.0.1:9066"
 COOKIE_SECURE="false"
 COMMAND_TIMEOUT_SECS="120"
 RELEASES_TO_KEEP="4"
+BACKUPS_TO_KEEP="5"
+BACKUPS_TO_KEEP_MAX="1000"
 BINARY_PATH=""
 SKIP_START="false"
 SKIP_BUILD="false"
@@ -39,6 +41,7 @@ Options:
   --cookie-secure <true|false> Secure cookie flag. Default: false.
   --command-timeout-secs <n>   Command timeout. Default: 120.
   --releases-to-keep <n>       Uploaded binary releases to keep. Default: 4.
+  --backups-to-keep <n>        Self-deployment backups to keep. Default: 5, max: 1000.
   --no-start                   Install/update files but do not start or restart service.
   --force-env                  Rewrite existing environment file.
   --dry-run                    Print actions without changing the system.
@@ -71,6 +74,18 @@ need_value() {
     die "$name requires a value"
   fi
   printf '%s' "$value"
+}
+
+require_positive_integer_at_most() {
+  local name="$1"
+  local value="$2"
+  local max="$3"
+  if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+    die "$name must be a positive integer"
+  fi
+  if (( ${#value} > ${#max} )) || (( 10#$value > 10#$max )); then
+    die "$name must be less than or equal to $max"
+  fi
 }
 
 run() {
@@ -239,6 +254,52 @@ backup_existing_files() {
     cp -a "$db_path" "$backup_dir/easy-deploy.db"
   fi
   chown -R "$RUN_USER:$RUN_GROUP" "$DATA_DIR/backups"
+}
+
+prune_old_backups() {
+  local backups_dir="$DATA_DIR/backups"
+  if [[ "$SKIP_START" == "true" ]]; then
+    log "skip backup pruning because --no-start was used"
+    return
+  fi
+  if [[ ! -d "$backups_dir" ]]; then
+    log "no deployment backup directory to prune: $backups_dir"
+    return
+  fi
+
+  local backup_names=()
+  local name
+  local backup_path
+  for backup_path in "$backups_dir"/*; do
+    [[ -d "$backup_path" ]] || continue
+    name="${backup_path##*/}"
+    if [[ "$name" =~ ^[0-9]{14}$ ]]; then
+      backup_names+=("$name")
+    fi
+  done
+
+  if ((${#backup_names[@]} > 0)); then
+    local sorted_output
+    sorted_output="$(printf '%s\n' "${backup_names[@]}" | sort)" || die "failed to sort deployment backup list"
+    local sorted_names=()
+    while IFS= read -r name; do
+      sorted_names+=("$name")
+    done <<< "$sorted_output"
+    backup_names=("${sorted_names[@]}")
+  fi
+
+  local count="${#backup_names[@]}"
+  local prune_count=$((count - BACKUPS_TO_KEEP))
+  if (( prune_count <= 0 )); then
+    log "keeping $count deployment backups; prune threshold is $BACKUPS_TO_KEEP"
+    return
+  fi
+
+  local index
+  for ((index = 0; index < prune_count && index < count; index++)); do
+    run rm -rf -- "$backups_dir/${backup_names[$index]}"
+  done
+  log "pruned $prune_count old deployment backups; kept newest $BACKUPS_TO_KEEP"
 }
 
 install_layout() {
@@ -430,6 +491,14 @@ while [[ $# -gt 0 ]]; do
       RELEASES_TO_KEEP="${1#*=}"
       shift
       ;;
+    --backups-to-keep)
+      BACKUPS_TO_KEEP="$(need_value --backups-to-keep "${2:-}")"
+      shift 2
+      ;;
+    --backups-to-keep=*)
+      BACKUPS_TO_KEEP="${1#*=}"
+      shift
+      ;;
     --no-start)
       SKIP_START="true"
       shift
@@ -462,6 +531,7 @@ esac
 [[ "$CONFIG_DIR" = /* ]] || die "--config-dir must be absolute"
 [[ "$DATA_DIR" = /* ]] || die "--data-dir must be absolute"
 [[ "$LOCAL_APP_DIR" = /* ]] || die "--local-app-dir must be absolute"
+require_positive_integer_at_most "--backups-to-keep" "$BACKUPS_TO_KEEP" "$BACKUPS_TO_KEEP_MAX"
 
 require_linux_systemd
 require_root
@@ -475,5 +545,6 @@ backup_existing_files
 install_binary
 install_config
 restart_service
+prune_old_backups
 
 log "done"

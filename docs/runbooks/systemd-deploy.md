@@ -140,6 +140,22 @@ easy-deploy-api
 easy-deploy.db
 ```
 
+脚本默认只保留最近 5 份自部署备份。清理动作发生在新 service 启动并通过 `systemctl status` 检查之后；如果使用 `--no-start`，脚本不会自动清理旧备份，避免在未验证新版本可启动时丢失回滚点。这里的启动成功仅代表 systemd 启动检查通过，正式发布完成后仍需按验收要求访问 `/healthz`。
+
+如需调整保留数量：
+
+```bash
+sudo bash scripts/deploy-systemd.sh --binary ./target/release/api --skip-build --backups-to-keep 10
+```
+
+`--backups-to-keep` 必须是 1 到 1000 之间的整数。备份目录中非 14 位数字时间戳格式的目录不会被脚本自动删除；如需长期保留某次备份，可以先移动到其他归档目录。
+
+部署后可以查看实际保留的备份：
+
+```bash
+ls -1 /var/lib/easy-deploy/backups/ | sort
+```
+
 ## 配置
 
 脚本生成的配置文件：
@@ -221,6 +237,7 @@ sudo bash scripts/deploy-systemd.sh --binary ./target/release/api --skip-build -
 --skip-build                跳过 cargo build，通常和 --binary 一起使用。
 --bind <addr:port>          修改监听地址，默认 127.0.0.1:9066。
 --user <name> --group <g>   修改 systemd 运行用户和组，默认 root:root。
+--backups-to-keep <n>       自部署备份保留数量，默认 5，范围 1..1000。
 --no-start                  只安装/更新文件，不启动服务；如果原服务正在运行，更新前会先停止。
 --force-env                 覆盖已有 /etc/easy-deploy/easy-deploy.env。
 --dry-run                   只打印将执行的动作。
