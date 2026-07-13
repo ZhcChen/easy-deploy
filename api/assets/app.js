@@ -277,6 +277,66 @@
     }
   };
 
+  const activateTemplateCodeTab = (button) => {
+    const panel = button.closest(".template-code-panel");
+    if (!panel) return;
+
+    const targetId = button.getAttribute("data-template-code-target");
+    if (!targetId) return;
+
+    panel.querySelectorAll("[data-template-code-tab]").forEach((tab) => {
+      const active = tab === button;
+      tab.classList.toggle("is-active", active);
+      tab.setAttribute("aria-selected", active ? "true" : "false");
+      tab.setAttribute("tabindex", active ? "0" : "-1");
+    });
+
+    panel.querySelectorAll("[data-template-code-panel]").forEach((tabPanel) => {
+      tabPanel.hidden = tabPanel.id !== targetId;
+    });
+
+    const copyTargetId = button.getAttribute("data-copy-target-id");
+    const modal = button.closest(".template-preview-modal");
+    const copyButton = modal?.querySelector("[data-template-code-copy]");
+    if (copyTargetId && copyButton) {
+      copyButton.setAttribute("data-copy-target", copyTargetId);
+    }
+  };
+
+  const handleTemplateCodeTabKeydown = (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const current = target?.closest("[data-template-code-tab]");
+    if (!current) return false;
+
+    const panel = current.closest(".template-code-panel");
+    if (!panel) return false;
+
+    const tabs = Array.from(panel.querySelectorAll("[data-template-code-tab]"));
+    const currentIndex = tabs.indexOf(current);
+    if (currentIndex < 0) return false;
+
+    let nextIndex = currentIndex;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+      nextIndex = (currentIndex + 1) % tabs.length;
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+      nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = tabs.length - 1;
+    } else {
+      return false;
+    }
+
+    event.preventDefault();
+    const nextTab = tabs[nextIndex];
+    activateTemplateCodeTab(nextTab);
+    if (nextTab instanceof HTMLElement) {
+      nextTab.focus();
+    }
+    return true;
+  };
+
   const namedControls = (root, name) =>
     Array.from(root.querySelectorAll("input, textarea, select")).filter(
       (control) => control.name === name,
@@ -1080,6 +1140,13 @@
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
 
+    const templateCodeTab = target.closest("[data-template-code-tab]");
+    if (templateCodeTab) {
+      event.preventDefault();
+      activateTemplateCodeTab(templateCodeTab);
+      return;
+    }
+
     const copyButton = target.closest("[data-copy-target]");
     if (copyButton) {
       event.preventDefault();
@@ -1165,6 +1232,8 @@
   });
 
   document.addEventListener("keydown", (event) => {
+    if (handleTemplateCodeTabKeydown(event)) return;
+
     if (event.key === "Enter" || event.key === " ") {
       const target = event.target instanceof Element ? event.target : null;
       const openButton = target?.closest('[data-modal-target][role="button"]');

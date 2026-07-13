@@ -4536,14 +4536,19 @@ async fn templates_page(session: CurrentSession) -> Response {
     }
     let template_rows = compose_templates()
         .iter()
-        .map(|template| TemplateCardRow {
-            key: template.key,
-            name: template.name,
-            description: template.description,
-            image: template.image,
-            default_port: template.default_port,
-            env_hint: template.env_hint,
-            preview_config: compose_template_preview_config(template.key, template.default_port),
+        .map(|template| {
+            let (compose_preview, env_preview) =
+                compose_template_preview_parts(template.key, template.default_port);
+            TemplateCardRow {
+                key: template.key,
+                name: template.name,
+                description: template.description,
+                image: template.image,
+                default_port: template.default_port,
+                env_hint: template.env_hint,
+                compose_preview,
+                env_preview,
+            }
         })
         .collect::<Vec<_>>();
     let nav_sections = nav_sections("/templates", &session);
@@ -4559,18 +4564,20 @@ async fn templates_page(session: CurrentSession) -> Response {
     })
 }
 
-fn compose_template_preview_config(template_key: &str, default_port: u16) -> String {
+fn compose_template_preview_parts(template_key: &str, default_port: u16) -> (String, String) {
     match render_compose_template(RenderTemplateInput {
         template_key,
         app_key: template_key,
         port: default_port,
     }) {
-        Ok(rendered) => {
-            let compose = rendered.compose_content.trim_end();
-            let env = rendered.env_content.trim_end();
-            format!("# compose.yaml\n{compose}\n\n# .env\n{env}\n")
-        }
-        Err(err) => format!("# 模板渲染失败\n{}\n", err.message()),
+        Ok(rendered) => (
+            rendered.compose_content.trim_end().to_owned(),
+            rendered.env_content.trim_end().to_owned(),
+        ),
+        Err(err) => (
+            format!("# 模板渲染失败\n{}\n", err.message()),
+            "# 模板渲染失败，无法生成 .env 示例\n".to_owned(),
+        ),
     }
 }
 

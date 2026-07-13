@@ -59,7 +59,7 @@
           <p>{{ template.key }} · {{ template.image }} · 默认端口 {{ template.default_port }}</p>
         </div>
         <div class="modal-header-actions">
-          <button class="ghost-button compact-button" type="button" data-copy-target="template-preview-config-{{ template.key }}" data-copy-done="已复制">复制配置</button>
+          <button class="ghost-button compact-button" type="button" data-template-code-copy data-copy-target="template-preview-compose-{{ template.key }}" data-copy-done="已复制">复制配置</button>
           <button class="modal-close" type="button" data-modal-close aria-label="关闭">×</button>
         </div>
       </div>
@@ -70,9 +70,51 @@
               <h3 id="template-preview-config-title-{{ template.key }}">Compose 配置预览</h3>
               <p>包含 compose.yaml 和 .env 示例。创建应用时仍可按环境修改端口、密码、镜像和资源目录。</p>
             </div>
-            <span class="code-language-pill">compose.yaml + .env</span>
+            <div class="template-code-tabs" role="tablist" aria-label="配置文件">
+              <button
+                class="template-code-tab is-active"
+                type="button"
+                role="tab"
+                id="template-compose-tab-{{ template.key }}"
+                aria-selected="true"
+                aria-controls="template-compose-panel-{{ template.key }}"
+                data-template-code-tab
+                data-template-code-target="template-compose-panel-{{ template.key }}"
+                data-copy-target-id="template-preview-compose-{{ template.key }}"
+              >compose.yaml</button>
+              <button
+                class="template-code-tab"
+                type="button"
+                role="tab"
+                id="template-env-tab-{{ template.key }}"
+                aria-selected="false"
+                aria-controls="template-env-panel-{{ template.key }}"
+                tabindex="-1"
+                data-template-code-tab
+                data-template-code-target="template-env-panel-{{ template.key }}"
+                data-copy-target-id="template-preview-env-{{ template.key }}"
+              >.env</button>
+            </div>
           </div>
-          <pre class="template-code-preview" tabindex="0"><code id="template-preview-config-{{ template.key }}">{{ template.preview_config }}</code></pre>
+          <div
+            class="template-code-tab-panel"
+            id="template-compose-panel-{{ template.key }}"
+            role="tabpanel"
+            aria-labelledby="template-compose-tab-{{ template.key }}"
+            data-template-code-panel
+          >
+            <pre class="template-code-preview" tabindex="0"><code id="template-preview-compose-{{ template.key }}">{{ template.compose_preview }}</code></pre>
+          </div>
+          <div
+            class="template-code-tab-panel"
+            id="template-env-panel-{{ template.key }}"
+            role="tabpanel"
+            aria-labelledby="template-env-tab-{{ template.key }}"
+            data-template-code-panel
+            hidden
+          >
+            <pre class="template-code-preview" tabindex="0"><code id="template-preview-env-{{ template.key }}">{{ template.env_preview }}</code></pre>
+          </div>
         </section>
       </div>
     </section>

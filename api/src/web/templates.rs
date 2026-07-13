@@ -1339,7 +1339,8 @@ pub struct TemplateCardRow<'a> {
     pub image: &'a str,
     pub default_port: u16,
     pub env_hint: &'a str,
-    pub preview_config: String,
+    pub compose_preview: String,
+    pub env_preview: String,
 }
 
 pub struct SettingsRow {
