@@ -47,7 +47,7 @@ use crate::{
         SERVICES_LOGS, SERVICES_VIEW, SETTINGS_UPDATE, SETTINGS_VIEW, SessionTokens, TASKS_RETRY,
         TASKS_VIEW, TEMPLATES_VIEW, nav_permission, permission_dependencies,
     },
-    catalog::compose_templates,
+    catalog::{RenderTemplateInput, compose_templates, render_compose_template},
     deployment_console::DeploymentConsoleService,
     deployment_orchestrator::{
         CreateDeploymentRunInput, DeploymentCancellationRegistry, DeploymentUnitExecutor,
@@ -4543,6 +4543,7 @@ async fn templates_page(session: CurrentSession) -> Response {
             image: template.image,
             default_port: template.default_port,
             env_hint: template.env_hint,
+            preview_config: compose_template_preview_config(template.key, template.default_port),
         })
         .collect::<Vec<_>>();
     let nav_sections = nav_sections("/templates", &session);
@@ -4556,6 +4557,21 @@ async fn templates_page(session: CurrentSession) -> Response {
         nav_sections: &nav_sections,
         templates: &template_rows,
     })
+}
+
+fn compose_template_preview_config(template_key: &str, default_port: u16) -> String {
+    match render_compose_template(RenderTemplateInput {
+        template_key,
+        app_key: template_key,
+        port: default_port,
+    }) {
+        Ok(rendered) => {
+            let compose = rendered.compose_content.trim_end();
+            let env = rendered.env_content.trim_end();
+            format!("# compose.yaml\n{compose}\n\n# .env\n{env}\n")
+        }
+        Err(err) => format!("# 模板渲染失败\n{}\n", err.message()),
+    }
 }
 
 async fn artifacts_page(

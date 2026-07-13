@@ -1759,7 +1759,7 @@ table {
 }
 
 .template-table {
-  min-width: 940px;
+  min-width: 1040px;
 }
 
 .template-table th:first-child,
@@ -1778,6 +1778,19 @@ table {
 .template-table td:nth-child(3) {
   width: 110px;
   min-width: 110px;
+}
+
+.template-table .template-actions-col {
+  width: 96px;
+  min-width: 96px;
+  text-align: right;
+}
+
+.template-preview-copy textarea {
+  min-height: min(52vh, 520px);
+  overflow: auto;
+  resize: vertical;
+  white-space: pre;
 }
 
 .apps-table {

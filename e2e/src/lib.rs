@@ -1454,6 +1454,11 @@ async fn run_checks(
             && templates.contains("PUBLIC_PORT=8080")
             && templates.contains("REDIS_PASSWORD=change-me")
             && templates.contains("POSTGRES_PASSWORD=change-me")
+            && templates.contains("data-modal-target=\"template-preview-redis-single\"")
+            && templates.contains("id=\"template-preview-config-redis-single\"")
+            && templates.contains("复制配置")
+            && templates.contains("# compose.yaml")
+            && templates.contains("# .env")
             && !templates.contains("name=\"template_key\"")
             && !templates.contains("id=\"template-port\"")
             && !templates.contains("data-default-port"),
@@ -2403,6 +2408,8 @@ async fn run_checks(
     anyhow::ensure!(
         viewer_templates.contains("redis:7-alpine")
             && viewer_templates.contains("nginx:1.27-alpine")
+            && viewer_templates.contains("data-modal-target=\"template-preview-redis-single\"")
+            && viewer_templates.contains("复制配置")
             && !viewer_templates.contains("name=\"template_key\"")
             && !viewer_templates.contains("name=\"app_key\""),
         "viewer should see templates without creation form"
