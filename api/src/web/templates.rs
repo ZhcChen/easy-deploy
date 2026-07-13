@@ -90,8 +90,6 @@ pub struct AppDetailTemplate<'a> {
     pub status_tone: &'a str,
     pub targets: &'a str,
     pub target_count: i64,
-    pub created_at: &'a str,
-    pub updated_at: &'a str,
     pub compose_content: &'a str,
     pub env_content: &'a str,
     pub deploy_script_pre_deploy: &'a str,

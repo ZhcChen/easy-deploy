@@ -2510,8 +2510,6 @@ async fn render_app_detail(
         status_tone: app_enabled_status_tone(&detail.app.status),
         targets: detail.app.target_names.as_deref().unwrap_or("未绑定节点"),
         target_count: detail.app.target_count,
-        created_at: &detail.app.created_at,
-        updated_at: &detail.app.updated_at,
         compose_content: &detail.compose_content,
         env_content: &detail.env_content,
         deploy_script_pre_deploy: &detail.deploy_scripts.pre_deploy,
@@ -14726,9 +14724,9 @@ mod tests {
             .await
             .expect("read body");
         let html = String::from_utf8_lossy(&body);
-        assert!(html.contains("运行配置"));
-        assert!(html.contains("部署控制台"));
-        assert!(html.contains("应用部署历史"));
+        assert!(html.contains("运行配置与脚本"));
+        assert!(html.contains("部署单元与版本"));
+        assert!(html.contains("部署历史"));
         assert!(!html.contains("versionCode 1002003"));
         assert!(!html.contains(&format!("/apps/{app_id}/binary/upload")));
         assert!(!html.contains("二进制配置"));

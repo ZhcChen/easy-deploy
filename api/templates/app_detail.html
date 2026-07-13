@@ -8,109 +8,80 @@
 {% endblock %}
 
 {% block content %}
-<section class="panel deployment-console" aria-labelledby="deployment-console-title">
-  <div class="panel-header">
+<section
+  class="panel app-hero"
+  aria-labelledby="app-hero-title"
+>
+  <div class="app-hero-main">
     <div>
-      <h2 id="deployment-console-title">部署控制台</h2>
-      <p>选择环境后查看目标版本、部署单元和最近执行结果。</p>
+      <p class="app-hero-eyebrow">应用 #{{ id }} · {{ app_key }}</p>
+      <h2 id="app-hero-title">{{ name }}</h2>
+      <p class="app-hero-description">{% if description == "" %}暂无描述{% else %}{{ description }}{% endif %}</p>
+      <div class="app-hero-badges" aria-label="应用状态">
+        <span class="badge tone-{{ environment_tone }}">{{ environment_label }}</span>
+        <span class="badge tone-{{ status_tone }}">{{ status }}</span>
+        {% for runtime in runtime_states %}
+          <span class="badge tone-{{ runtime.status_tone }}">{{ runtime.status }}</span>
+        {% endfor %}
+      </div>
     </div>
-    {% if can_deploy && application_releases.len() > 0 && selected_environment_id > 0 %}
-      <a class="primary-button compact-button" href="/apps/{{ id }}/deploy?environment_id={{ selected_environment_id }}">部署应用</a>
-    {% endif %}
+
+    <div class="app-hero-actions" aria-label="主要操作">
+      {% if can_deploy && application_releases.len() > 0 && selected_environment_id > 0 %}
+        <a class="primary-button compact-button" href="/apps/{{ id }}/deploy?environment_id={{ selected_environment_id }}">部署应用版本</a>
+      {% endif %}
+      {% if can_deploy && release_source == "manual" %}
+        <a class="primary-button compact-button" href="/apps/{{ id }}/compose/up/confirm">部署配置</a>
+        <a class="ghost-button compact-button" href="/apps/{{ id }}/compose/restart/confirm">重启</a>
+      {% endif %}
+      {% if can_logs %}
+        <form method="post" action="/apps/{{ id }}/compose/logs">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="ghost-button compact-button" type="submit">最近日志</button>
+        </form>
+      {% endif %}
+      {% if can_deploy %}
+        <details class="app-more-actions">
+          <summary>更多</summary>
+          <div>
+            <form method="post" action="/apps/{{ id }}/compose/config">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="text-button" type="submit">校验 Compose 配置</button>
+            </form>
+            {% if release_source == "manual" %}
+              <a class="text-link danger-link" href="/apps/{{ id }}/compose/down/confirm">停止 Compose</a>
+            {% endif %}
+            {% if can_manage %}
+              <button class="text-button" type="button" data-modal-target="app-metadata-modal">编辑基础信息</button>
+            {% endif %}
+          </div>
+        </details>
+      {% endif %}
+    </div>
   </div>
-  <nav class="environment-tabs" aria-label="应用环境">
-    {% for item in deployment_environments %}
-      <a class="environment-tab{% if item.selected %} is-active{% endif %}" href="/apps/{{ id }}?environment_id={{ item.id }}">
-        <strong>{{ item.name }}</strong>
-        <span>{{ item.key }} · {{ item.latest_version }}</span>
-        <span><span class="badge tone-{{ item.status_tone }}">{{ item.status }}</span> <span class="badge tone-{{ item.runtime_tone }}">{{ item.runtime_status }}</span></span>
-        <span>{{ item.target_count }} 个节点{% match item.active_run_id %}{% when Some with (run_id) %} · <span class="badge tone-active">{{ item.active_run_status }}</span> · {% match item.active_task_id %}{% when Some with (task_id) %}<span><a class="text-link" href="/tasks/{{ task_id }}">查看过程 #{{ run_id }}</a></span>{% when None %}<span>#{{ run_id }}</span>{% endmatch %}{% when None %}{% endmatch %}</span>
-      </a>
-    {% endfor %}
-  </nav>
-  {% if deployment_environments.len() == 0 %}
-    <div class="empty-state"><strong>尚未配置环境</strong><span>完成环境和配置版本后才能部署。</span></div>
-  {% else %}
-    <div class="deployment-console-grid">
-      <section aria-labelledby="deployment-units-title">
-        <div class="section-heading"><h3 id="deployment-units-title">部署单元</h3><span>{{ deployment_units.len() }} 个</span></div>
-        <div class="unit-list">
-          {% for unit in deployment_units %}
-            <article class="unit-row">
-              <div><strong>{{ unit.name }}</strong><span>{{ unit.key }} · {{ unit.stage }}</span></div>
-              <div><strong>{{ unit.latest_version }}</strong><span>{{ unit.work_dir }}</span></div>
-              <div><span class="badge tone-{{ unit.runtime_tone }}">{{ unit.runtime_status }}</span><span class="badge tone-{{ unit.lifecycle_tone }}">{{ unit.lifecycle_status }}</span></div>
-            </article>
-          {% endfor %}
-        </div>
-      </section>
-      <aside aria-labelledby="application-releases-title">
-        <div class="section-heading"><h3 id="application-releases-title">可部署版本</h3><span>最近 {{ application_releases.len() }} 个</span></div>
-        <div class="release-compact-list">
-          {% for release in application_releases %}
-            <div>
-              <strong>{{ release.version }} <span class="badge tone-{{ release.status_tone }}">{{ release.status }}</span></strong>
-              <span>#{{ release.id }} · versionCode {{ release.version_code }} · {{ release.unit_count }} 单元 · {{ release.estimated_size }}</span>
-              <span>{{ release.blockers }}</span><span>{{ release.created_at }}</span>
-              {% if release.can_archive %}
-                <details class="cleanup-confirmation"><summary>归档版本</summary><form method="post" action="/apps/{{ id }}/releases/{{ release.id }}/archive"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>输入版本编号 {{ release.id }} 以确认<input name="confirmation" inputmode="numeric" required></label><button class="primary-button danger-action compact-button" type="submit">确认归档</button></form></details>
-              {% endif %}
-              {% if release.can_delete %}
-                <details class="cleanup-confirmation"><summary>彻底删除版本记录</summary><form method="post" action="/apps/{{ id }}/releases/{{ release.id }}/cleanup"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>输入版本编号 {{ release.id }} 以确认<input name="confirmation" inputmode="numeric" required></label><button class="primary-button danger-action compact-button" type="submit">确认彻底删除</button></form></details>
-              {% endif %}
-            </div>
-          {% endfor %}
-        </div>
-      </aside>
-    </div>
-  {% endif %}
-</section>
 
-<section class="panel deployment-history-panel" aria-labelledby="environment-deployment-history-title">
-  <div class="panel-header"><div><h2 id="environment-deployment-history-title">应用部署历史</h2><p>保留每次部署的环境、版本和单元汇总结果。</p></div></div>
-  {% if environment_runs.len() == 0 %}
-    <div class="empty-state"><strong>暂无应用部署记录</strong><span>新编排流程执行后会在这里显示。</span></div>
-  {% else %}
-    <div class="detail-list">
-      {% for run in environment_runs %}
-        <div><span>#{{ run.id }} · {{ run.environment_name }}</span><strong>
-          <strong>{{ run.version }} · {{ run.mode }}</strong>
-          <a class="text-link" href="/apps/{{ id }}/deployments/{{ run.id }}">查看详情</a>
-          {% match run.task_id %}{% when Some with (task_id) %}<a class="text-link" href="/tasks/{{ task_id }}">任务 #{{ task_id }}</a>{% when None %}{% endmatch %}
-          <span class="badge tone-{{ run.status_tone }}">{{ run.status }}</span>
-          <span>{{ run.result_summary }}</span><span>{{ run.summary }} · {{ run.created_at }}</span>
-        </strong></div>
-      {% endfor %}
+  <div class="app-status-strip" aria-label="关键状态">
+    <div>
+      <span>部署方式</span>
+      <strong>{{ app_type }}</strong>
+      <small>{{ deploy_strategy_label }}</small>
     </div>
-  {% endif %}
-</section>
-
-<section class="summary-grid" aria-label="应用概览">
-  <article class="summary-card tone-neutral">
-    <span>部署方式</span>
-    <strong>{{ app_type }}</strong>
-    <p>{{ deploy_strategy_label }}</p>
-  </article>
-  <article class="summary-card tone-neutral">
-    <span>发布模式</span>
-    <strong>{{ release_source_label }}</strong>
-    <p>{{ release_publish_mode }}</p>
-  </article>
-  <article class="summary-card tone-neutral">
-    <span>目标节点</span>
-    <strong>{{ target_count }}</strong>
-    <p>{{ targets }}</p>
-  </article>
-  <article class="summary-card tone-neutral">
-    <span>应用标识</span>
-    <strong>{{ app_key }}</strong>
-    <p>#{{ id }} · {{ environment_label }}</p>
-  </article>
-  <article class="summary-card tone-{{ status_tone }}">
-    <span>启用状态</span>
-    <strong>{{ status }}</strong>
-    <p>{{ updated_at }} 更新，创建于 {{ created_at }}</p>
-  </article>
+    <div>
+      <span>发布模式</span>
+      <strong>{{ release_source_label }}</strong>
+      <small>{{ release_publish_mode }}</small>
+    </div>
+    <div>
+      <span>目标节点</span>
+      <strong>{{ target_count }}</strong>
+      <small>{{ targets }}</small>
+    </div>
+    <div>
+      <span>部署目录</span>
+      <strong>{{ work_dir }}</strong>
+      <small>配置目录：{{ runtime_root }}</small>
+    </div>
+  </div>
 </section>
 
 {% if let Some(message) = notice %}
@@ -128,7 +99,7 @@
 {% endif %}
 
 <section
-  class="main-grid app-detail-layout"
+  class="main-grid app-detail-layout app-detail-layout-clean"
   data-app-config-transfer
   data-app-id="{{ id }}"
   data-app-name="{{ name }}"
@@ -141,73 +112,11 @@
   data-app-auto-queue-release="{{ auto_queue_release }}"
 >
   <div class="app-detail-main side-stack">
-    <section class="panel panel-large" aria-labelledby="config-title">
-      <div class="panel-header">
-        <div>
-          <h2 id="config-title">运行配置</h2>
-          <p>{{ name }} · {% if description == "" %}暂无描述{% else %}{{ description }}{% endif %}</p>
-        </div>
-        <div class="panel-actions app-config-transfer-actions">
-          <button class="ghost-button compact-button" type="button" data-app-config-export>复制配置</button>
-          {% if can_manage %}
-            <button class="ghost-button compact-button" type="button" data-app-config-import>导入配置</button>
-          {% endif %}
-          <span class="config-transfer-status" data-config-transfer-status aria-live="polite"></span>
-        </div>
-      </div>
-      <form class="panel-form config-form" method="post" action="/apps/{{ id }}/config">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <input type="hidden" name="health_check_kind" value="{{ health_check_kind }}">
-        <input type="hidden" name="health_endpoint" value="{{ health_endpoint }}">
-        <input type="hidden" name="health_timeout_secs" value="{{ health_timeout_secs }}">
-        <input type="hidden" name="health_expected_status" value="{{ health_expected_status }}">
-        <label>
-          compose.yaml
-          <textarea name="compose_content" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ compose_content }}</textarea>
-        </label>
-        <label>
-          .env
-          <textarea name="env_content" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ env_content }}</textarea>
-        </label>
-        <details class="config-advanced-details deploy-script-details form-span-all">
-          <summary>
-            <span>部署脚本</span>
-            <small>pre_deploy / deploy / post_deploy / switch_traffic / cleanup</small>
-          </summary>
-          <div class="advanced-form-grid deploy-script-grid">
-            <label>
-              发布前脚本
-              <textarea name="deploy_script_pre_deploy" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_pre_deploy }}</textarea>
-            </label>
-            <label>
-              部署脚本
-              <textarea name="deploy_script_deploy" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_deploy }}</textarea>
-            </label>
-            <label>
-              发布后脚本
-              <textarea name="deploy_script_post_deploy" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_post_deploy }}</textarea>
-            </label>
-            <label>
-              切流脚本
-              <textarea name="deploy_script_switch_traffic" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_switch_traffic }}</textarea>
-            </label>
-            <label class="form-span-all">
-              清理脚本
-              <textarea name="deploy_script_cleanup" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_cleanup }}</textarea>
-            </label>
-          </div>
-        </details>
-        {% if can_manage %}
-          <button class="primary-button compact-button" type="submit">保存配置</button>
-        {% endif %}
-      </form>
-    </section>
-
     <section class="panel" aria-labelledby="runtime-states-title">
-      <div class="panel-header">
+      <div class="panel-header compact">
         <div>
           <h2 id="runtime-states-title">运行状态</h2>
-          <p>按目标节点展示应用运行态、版本和日志入口。</p>
+          <p>先看这里：节点、运行项、最近任务和日志入口。</p>
         </div>
       </div>
       {% if runtime_states.len() == 0 %}
@@ -216,37 +125,147 @@
           <span>应用绑定目标节点后会显示运行态。</span>
         </div>
       {% else %}
-        <div class="detail-list app-runtime-list">
+        <div class="runtime-node-list">
           {% for runtime in runtime_states %}
-            <div>
-              <span>
-                <a class="text-link" href="{{ runtime.node_detail_href }}">{{ runtime.node_name }}</a>
-              </span>
-              <strong>
+            <article class="runtime-node-card">
+              <div class="runtime-node-header">
+                <div>
+                  <strong><a class="text-link" href="{{ runtime.node_detail_href }}">{{ runtime.node_name }}</a></strong>
+                  <span>{{ runtime.node_key }} · {{ runtime.service_count }} 个运行项 · {{ runtime.active_version }}</span>
+                </div>
                 <span class="badge tone-{{ runtime.status_tone }}">{{ runtime.status }}</span>
-                <span>{{ runtime.node_key }} · {{ runtime.service_count }} 个运行项 · {{ runtime.active_version }}</span>
-                <span>{{ runtime.message }}</span>
-                <span class="inline-actions runtime-actions">
-                  <a class="text-link" href="{{ runtime.node_detail_href }}">节点详情</a>
-                  {% if runtime.has_task_href %}
-                    <a class="text-link" href="{{ runtime.task_href }}">最近任务</a>
-                  {% endif %}
-                  {% if can_logs && runtime.has_log_links %}
-                    {% for log_link in runtime.log_links %}
-                      <a class="text-link" href="{{ log_link.href }}">{{ log_link.name }} 日志</a>
-                    {% endfor %}
-                  {% endif %}
-                </span>
-                <span>最后部署 {{ runtime.last_deploy_at }} · 更新 {{ runtime.updated_at }}</span>
-              </strong>
+              </div>
+              <p>{{ runtime.message }}</p>
+              <div class="runtime-link-row">
+                <a class="text-link" href="{{ runtime.node_detail_href }}">节点详情</a>
+                {% if runtime.has_task_href %}
+                  <a class="text-link" href="{{ runtime.task_href }}">最近任务</a>
+                {% endif %}
+                {% if can_logs && runtime.has_log_links %}
+                  {% for log_link in runtime.log_links %}
+                    <a class="text-link" href="{{ log_link.href }}">{{ log_link.name }} 日志</a>
+                  {% endfor %}
+                {% endif %}
+              </div>
+              <small>最后部署 {{ runtime.last_deploy_at }} · 更新 {{ runtime.updated_at }}</small>
+            </article>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="panel" aria-labelledby="deployment-console-title">
+      <div class="panel-header compact">
+        <div>
+          <h2 id="deployment-console-title">部署单元与版本</h2>
+          <p>只保留部署决策需要的信息；手动配置应用没有应用版本时不会占用大块空间。</p>
+        </div>
+      </div>
+      {% if deployment_environments.len() == 0 %}
+        <div class="empty-state"><strong>尚未配置环境</strong><span>完成环境和配置版本后才能部署。</span></div>
+      {% else %}
+        <nav class="environment-tabs compact-environment-tabs" aria-label="应用环境">
+          {% for item in deployment_environments %}
+            <a class="environment-tab{% if item.selected %} is-active{% endif %}" href="/apps/{{ id }}?environment_id={{ item.id }}">
+              <strong>{{ item.name }}</strong>
+              <span>{{ item.key }} · {{ item.latest_version }}</span>
+              <span><span class="badge tone-{{ item.status_tone }}">{{ item.status }}</span> <span class="badge tone-{{ item.runtime_tone }}">{{ item.runtime_status }}</span></span>
+              <span>{{ item.target_count }} 个节点{% match item.active_run_id %}{% when Some with (run_id) %} · <span class="badge tone-active">{{ item.active_run_status }}</span> · {% match item.active_task_id %}{% when Some with (task_id) %}<span><a class="text-link" href="/tasks/{{ task_id }}">查看过程 #{{ run_id }}</a></span>{% when None %}<span>#{{ run_id }}</span>{% endmatch %}{% when None %}{% endmatch %}</span>
+            </a>
+          {% endfor %}
+        </nav>
+        <div class="deployment-console-grid compact-deployment-grid">
+          <section aria-labelledby="deployment-units-title">
+            <div class="section-heading"><h3 id="deployment-units-title">部署单元</h3><span>{{ deployment_units.len() }} 个</span></div>
+            <div class="unit-list">
+              {% for unit in deployment_units %}
+                <article class="unit-row">
+                  <div><strong>{{ unit.name }}</strong><span>{{ unit.key }} · {{ unit.stage }}</span></div>
+                  <div><strong>{{ unit.latest_version }}</strong><span>{{ unit.work_dir }}</span></div>
+                  <div><span class="badge tone-{{ unit.runtime_tone }}">{{ unit.runtime_status }}</span><span class="badge tone-{{ unit.lifecycle_tone }}">{{ unit.lifecycle_status }}</span></div>
+                </article>
+              {% endfor %}
             </div>
+          </section>
+          <aside aria-labelledby="application-releases-title">
+            <div class="section-heading"><h3 id="application-releases-title">可部署版本</h3><span>最近 {{ application_releases.len() }} 个</span></div>
+            {% if application_releases.len() == 0 %}
+              <div class="empty-state compact-empty-state">
+                <strong>暂无应用版本</strong>
+                <span>{% if release_source == "manual" %}当前是手动配置发布，使用顶部“部署配置”。{% else %}上传版本包后在这里选择版本部署。{% endif %}</span>
+              </div>
+            {% else %}
+              <div class="release-compact-list">
+                {% for release in application_releases %}
+                  <div>
+                    <strong>{{ release.version }} <span class="badge tone-{{ release.status_tone }}">{{ release.status }}</span></strong>
+                    <span>#{{ release.id }} · versionCode {{ release.version_code }} · {{ release.unit_count }} 单元 · {{ release.estimated_size }}</span>
+                    <span>{{ release.blockers }}</span><span>{{ release.created_at }}</span>
+                    {% if release.can_archive %}
+                      <details class="cleanup-confirmation"><summary>归档版本</summary><form method="post" action="/apps/{{ id }}/releases/{{ release.id }}/archive"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>输入版本编号 {{ release.id }} 以确认<input name="confirmation" inputmode="numeric" required></label><button class="primary-button danger-action compact-button" type="submit">确认归档</button></form></details>
+                    {% endif %}
+                    {% if release.can_delete %}
+                      <details class="cleanup-confirmation"><summary>彻底删除版本记录</summary><form method="post" action="/apps/{{ id }}/releases/{{ release.id }}/cleanup"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>输入版本编号 {{ release.id }} 以确认<input name="confirmation" inputmode="numeric" required></label><button class="primary-button danger-action compact-button" type="submit">确认彻底删除</button></form></details>
+                    {% endif %}
+                  </div>
+                {% endfor %}
+              </div>
+            {% endif %}
+          </aside>
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="panel" aria-labelledby="deploy-history-title">
+      <div class="panel-header compact">
+        <div>
+          <h2 id="deploy-history-title">部署历史</h2>
+          <p>应用级部署和 Compose 操作统一放在这里看结果。</p>
+        </div>
+      </div>
+      {% if environment_runs.len() == 0 && deployment_runs.len() == 0 %}
+        <div class="empty-state">
+          <strong>暂无部署记录</strong>
+          <span>执行部署、停止或重启后会在这里显示结果。</span>
+        </div>
+      {% else %}
+        <div class="deployment-history-list">
+          {% for run in environment_runs %}
+            <article class="history-row">
+              <div>
+                <strong>{{ run.version }} · {{ run.mode }}</strong>
+                <span>#{{ run.id }} · {{ run.environment_name }} · {{ run.created_at }}</span>
+              </div>
+              <div>
+                <span class="badge tone-{{ run.status_tone }}">{{ run.status }}</span>
+                <span>{{ run.result_summary }}</span>
+                <span>{{ run.summary }}</span>
+              </div>
+              <div class="runtime-link-row">
+                <a class="text-link" href="/apps/{{ id }}/deployments/{{ run.id }}">查看详情</a>
+                {% match run.task_id %}{% when Some with (task_id) %}<a class="text-link" href="/tasks/{{ task_id }}">任务 #{{ task_id }}</a>{% when None %}{% endmatch %}
+              </div>
+            </article>
+          {% endfor %}
+          {% for run in deployment_runs %}
+            <article class="history-row">
+              <div>
+                <strong>{% match run.task_id %}{% when Some with (task_id) %}<a class="text-link" href="/tasks/{{ task_id }}">{{ run.title }}</a>{% when None %}{{ run.title }}{% endmatch %}</strong>
+                <span>{{ run.action }} · {{ run.started_at }} - {{ run.finished_at }}</span>
+              </div>
+              <div>
+                <span class="badge tone-{{ run.status_tone }}">{{ run.status }}</span>
+                <span>{{ run.config_revision }} · {{ run.artifact_version }}</span>
+                <span>{{ run.message }}</span>
+              </div>
+            </article>
           {% endfor %}
         </div>
       {% endif %}
     </section>
 
     <section class="panel" aria-labelledby="deploy-diff-title">
-      <div class="panel-header">
+      <div class="panel-header compact">
         <div>
           <h2 id="deploy-diff-title">部署前差异</h2>
           <p>{{ deploy_diff.baseline }}</p>
@@ -300,80 +319,80 @@
       {% endif %}
     </section>
 
-    <section class="panel" aria-labelledby="deploy-history-title">
-      <div class="panel-header">
+    <section class="panel panel-large config-workbench-panel" aria-labelledby="config-title">
+      <details class="runtime-file-details config-workbench-details">
+        <summary>
+          <span>运行配置与脚本</span>
+          <small>compose.yaml、.env、部署脚本；低频修改，默认收起</small>
+        </summary>
         <div>
-          <h2 id="deploy-history-title">部署历史</h2>
-          <p>最近 10 次部署、停止和重启结果。</p>
-        </div>
-      </div>
-      {% if deployment_runs.len() == 0 %}
-        <div class="empty-state">
-          <strong>暂无部署记录</strong>
-          <span>执行部署、停止或重启后会在这里显示结果。</span>
-        </div>
-      {% else %}
-        <div class="detail-list">
-          {% for run in deployment_runs %}
+          <div class="panel-header compact nested-panel-header">
             <div>
-              <span>{{ run.action }}</span>
-              <strong>
-                {% match run.task_id %}
-                  {% when Some with (task_id) %}
-                    <a class="text-link" href="/tasks/{{ task_id }}">{{ run.title }}</a>
-                  {% when None %}
-                    {{ run.title }}
-                {% endmatch %}
-                <span class="badge tone-{{ run.status_tone }}">{{ run.status }}</span>
-                <span>{{ run.config_revision }} · {{ run.artifact_version }}</span>
-                <span>{{ run.message }}</span>
-                <span>{{ run.started_at }} - {{ run.finished_at }}</span>
-              </strong>
+              <h2 id="config-title">运行配置</h2>
+              <p>修改前建议先复制配置；保存后会生成新的配置快照。</p>
             </div>
-          {% endfor %}
-        </div>
-      {% endif %}
-    </section>
-
-    <section class="panel" aria-labelledby="config-snapshots-title">
-      <div class="panel-header">
-        <div>
-          <h2 id="config-snapshots-title">配置快照</h2>
-          <p>运行配置版本会在部署历史中绑定，回退时可恢复对应配置。</p>
-        </div>
-      </div>
-      {% if config_snapshots.len() == 0 %}
-        <div class="empty-state">
-          <strong>暂无配置快照</strong>
-          <span>创建应用或保存配置后会生成快照。</span>
-        </div>
-      {% else %}
-        <div class="detail-list">
-          {% for snapshot in config_snapshots %}
-            <div>
-              <span>{{ snapshot.revision }}</span>
-              <strong>
-                <span>{{ snapshot.kind }} · {{ snapshot.created_at }}</span>
-                <span>{{ snapshot.artifact_version }} · hash {{ snapshot.config_hash }}</span>
-                <span>Compose: {{ snapshot.compose_summary }}</span>
-                <span>Env: {{ snapshot.env_summary }}</span>
-                {% if snapshot.can_restore %}
-                  <form class="inline-actions" method="post" action="/apps/{{ id }}/snapshots/{{ snapshot.id }}/restore">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                    <button class="text-button" type="submit">恢复</button>
-                  </form>
-                {% endif %}
-              </strong>
+            <div class="panel-actions app-config-transfer-actions">
+              <button class="ghost-button compact-button" type="button" data-app-config-export>复制配置</button>
+              {% if can_manage %}
+                <button class="ghost-button compact-button" type="button" data-app-config-import>导入配置</button>
+              {% endif %}
+              <span class="config-transfer-status" data-config-transfer-status aria-live="polite"></span>
             </div>
-          {% endfor %}
+          </div>
+          <form class="panel-form config-form config-editor-form" method="post" action="/apps/{{ id }}/config">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="health_check_kind" value="{{ health_check_kind }}">
+            <input type="hidden" name="health_endpoint" value="{{ health_endpoint }}">
+            <input type="hidden" name="health_timeout_secs" value="{{ health_timeout_secs }}">
+            <input type="hidden" name="health_expected_status" value="{{ health_expected_status }}">
+            <label>
+              compose.yaml
+              <textarea name="compose_content" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ compose_content }}</textarea>
+            </label>
+            <label>
+              .env
+              <textarea name="env_content" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ env_content }}</textarea>
+            </label>
+            <details class="config-advanced-details deploy-script-details form-span-all">
+              <summary>
+                <span>部署脚本</span>
+                <small>pre_deploy / deploy / post_deploy / switch_traffic / cleanup</small>
+              </summary>
+              <div class="advanced-form-grid deploy-script-grid">
+                <label>
+                  发布前脚本
+                  <textarea name="deploy_script_pre_deploy" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_pre_deploy }}</textarea>
+                </label>
+                <label>
+                  部署脚本
+                  <textarea name="deploy_script_deploy" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_deploy }}</textarea>
+                </label>
+                <label>
+                  发布后脚本
+                  <textarea name="deploy_script_post_deploy" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_post_deploy }}</textarea>
+                </label>
+                <label>
+                  切流脚本
+                  <textarea name="deploy_script_switch_traffic" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_switch_traffic }}</textarea>
+                </label>
+                <label class="form-span-all">
+                  清理脚本
+                  <textarea name="deploy_script_cleanup" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_cleanup }}</textarea>
+                </label>
+              </div>
+            </details>
+            {% if can_manage %}
+              <button class="primary-button compact-button" type="submit">保存配置</button>
+            {% endif %}
+          </form>
         </div>
-      {% endif %}
+      </details>
     </section>
 
     {% match compose_result %}
       {% when Some with (result) %}
         <section class="panel" aria-labelledby="compose-result-title">
-          <div class="panel-header">
+          <div class="panel-header compact">
             <div>
               <h2 id="compose-result-title">执行结果</h2>
               <p>{{ result.command }} · 退出码 {{ result.status_code }}</p>
@@ -389,10 +408,10 @@
 
   <aside class="app-detail-side side-stack">
     <section class="panel" aria-labelledby="app-basic-title">
-      <div class="panel-header">
+      <div class="panel-header compact">
         <div>
           <h2 id="app-basic-title">基础信息</h2>
-          <p>应用名称、部署目录和目标节点。</p>
+          <p>低频信息集中在右侧，避免干扰部署操作。</p>
         </div>
         {% if can_manage %}
           <div class="panel-actions">
@@ -418,6 +437,10 @@
           <strong>{{ deploy_strategy_label }}</strong>
         </div>
         <div>
+          <span>部署方式</span>
+          <strong>{{ app_type }}</strong>
+        </div>
+        <div>
           <span>发布模式</span>
           <strong>{{ release_publish_mode }}</strong>
         </div>
@@ -429,41 +452,55 @@
     </section>
 
     <section class="panel" aria-labelledby="health-check-title">
-      <div class="panel-header">
+      <div class="panel-header compact">
         <div>
           <h2 id="health-check-title">健康检查</h2>
-          <p>部署和重启成功后执行，失败会把任务标记为失败。</p>
+          <p>部署和重启后执行。</p>
         </div>
         <span class="badge tone-neutral">{{ health_check_label }}</span>
       </div>
+      <div class="detail-list compact-detail-list">
+        <div>
+          <span>检查方式</span>
+          <strong>{{ health_check_label }}</strong>
+        </div>
+        <div>
+          <span>检查地址</span>
+          <strong>{% if health_endpoint == "" %}未配置{% else %}{{ health_endpoint }}{% endif %}</strong>
+        </div>
+        <div>
+          <span>超时</span>
+          <strong>{{ health_timeout_secs }} 秒</strong>
+        </div>
+      </div>
       {% if can_manage %}
-        <form class="panel-form" method="post" action="/apps/{{ id }}/config">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <textarea name="compose_content" hidden>{{ compose_content }}</textarea>
-          <textarea name="env_content" hidden>{{ env_content }}</textarea>
-          <textarea name="deploy_script_pre_deploy" hidden>{{ deploy_script_pre_deploy }}</textarea>
-          <textarea name="deploy_script_deploy" hidden>{{ deploy_script_deploy }}</textarea>
-          <textarea name="deploy_script_post_deploy" hidden>{{ deploy_script_post_deploy }}</textarea>
-          <textarea name="deploy_script_switch_traffic" hidden>{{ deploy_script_switch_traffic }}</textarea>
-          <textarea name="deploy_script_cleanup" hidden>{{ deploy_script_cleanup }}</textarea>
-          <label>
-            检查方式
-            <select name="health_check_kind">
-              <option value="none"{% if health_check_kind == "none" %} selected{% endif %}>不检查</option>
-              <option value="http"{% if health_check_kind == "http" %} selected{% endif %}>HTTP GET</option>
-              <option value="tcp"{% if health_check_kind == "tcp" %} selected{% endif %}>TCP 连接</option>
-              <option value="compose_running"{% if health_check_kind == "compose_running" %} selected{% endif %}>容器运行状态</option>
-            </select>
-          </label>
-          <label>
-            检查地址
-            <input name="health_endpoint" value="{{ health_endpoint }}" placeholder="http://127.0.0.1:8080/healthz 或 127.0.0.1:8080">
-          </label>
-          <details class="config-advanced-details">
-            <summary>
-              <span>高级配置</span>
-              <small>{{ health_timeout_secs }} 秒 · HTTP {{ health_expected_status }}</small>
-            </summary>
+        <details class="config-advanced-details compact-advanced-details">
+          <summary>
+            <span>编辑健康检查</span>
+            <small>保存时不会改动 compose.yaml 和 .env 内容</small>
+          </summary>
+          <form class="panel-form compact-panel-form" method="post" action="/apps/{{ id }}/config">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <textarea name="compose_content" hidden>{{ compose_content }}</textarea>
+            <textarea name="env_content" hidden>{{ env_content }}</textarea>
+            <textarea name="deploy_script_pre_deploy" hidden>{{ deploy_script_pre_deploy }}</textarea>
+            <textarea name="deploy_script_deploy" hidden>{{ deploy_script_deploy }}</textarea>
+            <textarea name="deploy_script_post_deploy" hidden>{{ deploy_script_post_deploy }}</textarea>
+            <textarea name="deploy_script_switch_traffic" hidden>{{ deploy_script_switch_traffic }}</textarea>
+            <textarea name="deploy_script_cleanup" hidden>{{ deploy_script_cleanup }}</textarea>
+            <label>
+              检查方式
+              <select name="health_check_kind">
+                <option value="none"{% if health_check_kind == "none" %} selected{% endif %}>不检查</option>
+                <option value="http"{% if health_check_kind == "http" %} selected{% endif %}>HTTP GET</option>
+                <option value="tcp"{% if health_check_kind == "tcp" %} selected{% endif %}>TCP 连接</option>
+                <option value="compose_running"{% if health_check_kind == "compose_running" %} selected{% endif %}>容器运行状态</option>
+              </select>
+            </label>
+            <label>
+              检查地址
+              <input name="health_endpoint" value="{{ health_endpoint }}" placeholder="http://127.0.0.1:8080/healthz 或 127.0.0.1:8080">
+            </label>
             <div class="advanced-form-grid">
               <label>
                 超时时间（秒）
@@ -474,82 +511,58 @@
                 <input name="health_expected_status" type="number" min="100" max="599" value="{{ health_expected_status }}">
               </label>
             </div>
-          </details>
-          <button class="primary-button compact-button" type="submit">保存健康检查</button>
-        </form>
-      {% else %}
-        <div class="detail-list">
-          <div>
-            <span>检查方式</span>
-            <strong>{{ health_check_label }}</strong>
-          </div>
-          <div>
-            <span>检查地址</span>
-            <strong>{{ health_endpoint }}</strong>
-          </div>
-        </div>
+            <button class="primary-button compact-button" type="submit">保存健康检查</button>
+          </form>
+        </details>
       {% endif %}
     </section>
 
-    <section class="panel" aria-labelledby="compose-actions-title">
-      <div class="panel-header">
+    <section class="panel" aria-labelledby="config-snapshots-title">
+      <div class="panel-header compact">
         <div>
-          <h2 id="compose-actions-title">Compose 操作</h2>
-          <p>提供配置校验、最近日志和部署任务入口。</p>
+          <h2 id="config-snapshots-title">配置快照</h2>
+          <p>排障或恢复时再展开。</p>
         </div>
       </div>
-      {% if can_deploy || can_logs %}
-        <div class="panel-form">
-          {% if can_deploy %}
-            <a class="primary-button compact-button" href="/apps/{{ id }}/compose/up/confirm">部署</a>
-            <a class="ghost-button compact-button" href="/apps/{{ id }}/compose/restart/confirm">重启</a>
-            <a class="ghost-button compact-button" href="/apps/{{ id }}/compose/down/confirm">停止</a>
-            <form method="post" action="/apps/{{ id }}/compose/config">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-              <button class="primary-button compact-button" type="submit">校验配置</button>
-            </form>
-          {% endif %}
-          {% if can_logs %}
-            <form method="post" action="/apps/{{ id }}/compose/logs">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-              <button class="ghost-button compact-button" type="submit">最近日志</button>
-            </form>
-          {% endif %}
+      {% if config_snapshots.len() == 0 %}
+        <div class="empty-state compact-empty-state">
+          <strong>暂无配置快照</strong>
+          <span>创建应用或保存配置后会生成快照。</span>
         </div>
       {% else %}
-        <div class="panel-form">
-          <span class="label">只读权限</span>
-        </div>
+        <details class="runtime-file-details compact-runtime-details">
+          <summary>查看 {{ config_snapshots.len() }} 个快照</summary>
+          <div class="detail-list compact-detail-list">
+            {% for snapshot in config_snapshots %}
+              <div>
+                <span>{{ snapshot.revision }}</span>
+                <strong>
+                  <span>{{ snapshot.kind }} · {{ snapshot.created_at }}</span>
+                  <span>{{ snapshot.artifact_version }} · hash {{ snapshot.config_hash }}</span>
+                  <span>Compose: {{ snapshot.compose_summary }}</span>
+                  <span>Env: {{ snapshot.env_summary }}</span>
+                  {% if snapshot.can_restore %}
+                    <form class="inline-actions" method="post" action="/apps/{{ id }}/snapshots/{{ snapshot.id }}/restore">
+                      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                      <button class="text-button" type="submit">恢复</button>
+                    </form>
+                  {% endif %}
+                </strong>
+              </div>
+            {% endfor %}
+          </div>
+        </details>
       {% endif %}
-    </section>
-
-    <section class="panel" aria-labelledby="paths-title">
-      <div class="panel-header">
-        <div>
-          <h2 id="paths-title">目录</h2>
-          <p>区分平台配置目录和目标机器部署目录。</p>
-        </div>
-      </div>
-      <div class="detail-list">
-        <div>
-          <span>部署目录</span>
-          <strong>{{ work_dir }}</strong>
-        </div>
-        <div>
-          <span>配置目录</span>
-          <strong>{{ runtime_root }}</strong>
-        </div>
-      </div>
     </section>
 
     <section class="panel" aria-labelledby="metadata-title">
-      <div class="panel-header">
+      <div class="panel-header compact">
         <div>
-          <h2 id="metadata-title">app.yaml</h2>
-          <p>平台生成的应用元数据，排障时展开查看。</p>
+          <h2 id="metadata-title">平台元数据</h2>
+          <p>app.yaml 通常只在排障时查看。</p>
         </div>
       </div>
-      <details class="runtime-file-details">
+      <details class="runtime-file-details compact-runtime-details">
         <summary>查看 app.yaml</summary>
         <pre class="code-block">{{ metadata_content }}</pre>
       </details>
