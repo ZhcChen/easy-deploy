@@ -43,11 +43,11 @@
 - 如果因环境、外部依赖或耗时原因无法完成完整验证，必须在最终回复中说明边界和已完成的验证。
 - 不提交明显编译失败、测试失败或半成品状态，除非用户明确要求保存现场；这种提交必须在 commit message 中标记 `WIP` 或阻塞点。
 
-## 正式环境部署约定
-- 当前 easy-deploy 的正式环境为服务器 SSH 别名 `qfy-sc-test`。
-- 正式访问域名为 `https://easy-deploy.quanxinfu.com`，由服务器现有 Caddy 托管 HTTPS 和反向代理。
-- 后续用户说“部署正式环境”“发正式”“部署生产”等同类指令时，默认目标就是 `qfy-sc-test` 上的 easy-deploy 正式环境，除非用户当次明确指定其他服务器或域名。
-- 正式环境服务使用 systemd 单机部署：
+## easy-deploy 部署服务器约定
+- 当前 easy-deploy 只有一个平台部署服务器，SSH 别名为 `qfy-sc-test`。
+- 平台访问域名为 `https://easy-deploy.quanxinfu.com`，由服务器现有 Caddy 托管 HTTPS 和反向代理。
+- 后续用户说“部署服务器”“部署 easy-deploy”“发平台”“更新平台”等同类指令时，默认目标就是 `qfy-sc-test` 上的 easy-deploy 平台服务器，除非用户当次明确指定其他服务器或域名。
+- 平台服务使用 systemd 单机部署：
   - systemd 服务：`easy-deploy.service`
   - 运行用户：`root:root`
   - 后端监听：`127.0.0.1:9066`
@@ -55,9 +55,9 @@
   - 环境配置：`/etc/easy-deploy/easy-deploy.env`
   - SQLite 数据库：`/var/lib/easy-deploy/easy-deploy.db`
   - Caddy 配置：`/etc/caddy/Caddyfile.d/easy-deploy.quanxinfu.com.caddy`
-- 部署正式环境时，优先在本地或构建容器中产出 Linux x86_64 二进制，再上传到服务器执行 `scripts/deploy-systemd.sh`；不要在 `qfy-sc-test` 上直接 release 编译，服务器内存较小，容易拖垮 SSH 和系统负载。
+- 部署 easy-deploy 平台时，优先在本地或构建容器中产出 Linux x86_64 二进制，再上传到服务器执行 `scripts/deploy-systemd.sh`；不要在 `qfy-sc-test` 上直接 release 编译，服务器内存较小，容易拖垮 SSH 和系统负载。
 - 修改 Caddy 时只新增或调整 `easy-deploy.quanxinfu.com.caddy` 这一份独立配置，必须先执行 `caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile`，通过后再 `systemctl reload caddy`，不得影响 `/etc/caddy/Caddyfile.d/` 下其他项目配置。
-- 正式部署完成后至少验证：
+- 平台部署完成后至少验证：
   - `systemctl is-active easy-deploy`
   - `curl http://127.0.0.1:9066/healthz`
   - `curl https://easy-deploy.quanxinfu.com/healthz`
