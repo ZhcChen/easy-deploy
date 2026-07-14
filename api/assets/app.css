@@ -2363,6 +2363,20 @@ td span {
   border-radius: 0;
 }
 
+.redis-config-notes {
+  display: grid;
+  gap: 6px;
+  padding: 12px 14px 14px;
+  border-top: 1px solid rgba(217, 226, 238, 0.84);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.redis-config-notes span {
+  display: block;
+}
+
 .release-list {
   display: grid;
   gap: 0;

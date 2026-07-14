@@ -112,6 +112,7 @@ pub struct AppDetailTemplate<'a> {
     pub config_snapshots: &'a [AppConfigSnapshotRow],
     pub deploy_diff: &'a AppDeployDiffView,
     pub runtime_states: &'a [AppRuntimeStateRow],
+    pub redis_config: Option<RedisConfigView>,
     pub target_choices: &'a [AppTargetChoiceRow],
     pub can_manage: bool,
     pub can_deploy: bool,
@@ -985,6 +986,17 @@ pub struct AppDeploymentRunRow {
     pub artifact_version: String,
     pub started_at: String,
     pub finished_at: String,
+}
+
+pub struct RedisConfigView {
+    pub rows: Vec<RedisConfigRow>,
+    pub notes: Vec<String>,
+}
+
+pub struct RedisConfigRow {
+    pub label: &'static str,
+    pub value: String,
+    pub tone: &'static str,
 }
 
 pub struct AppConfigSnapshotRow {

@@ -1,7 +1,7 @@
 mod templates;
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -84,12 +84,13 @@ use templates::{
     NodeCheckHistoryRow, NodeCredentialOptionRow, NodeCredentialPageRow, NodeCredentialsTemplate,
     NodeDetailModalRow, NodeDetailTemplate, NodePageRow, NodeRow, NodeTaskRow, NodesTemplate,
     PermissionGroup, PermissionRow, PermissionsTemplate, ProfileTemplate, RbacFilterOptionRow,
-    ReleaseQueueRow, RoleRow, RolesTemplate, ServiceLogTailOptionRow, ServiceLogsTemplate,
-    ServiceNodeLinkRow, ServicePageRow, ServicesTemplate, SessionRow, SessionsTemplate,
-    SettingsRow, SettingsTemplate, SummaryItem, TaskAppFilterRow, TaskDetailTemplate,
-    TaskDetailView, TaskExecutionGuideView, TaskFilterOptionRow, TaskLogRow, TaskNodeResultRow,
-    TaskPageRow, TaskPhaseGroupRow, TaskPhaseStepRow, TaskReturnActionView, TaskRow, TaskStepRow,
-    TasksTemplate, TemplateCardRow, TemplatesTemplate, render_html,
+    RedisConfigRow, RedisConfigView, ReleaseQueueRow, RoleRow, RolesTemplate,
+    ServiceLogTailOptionRow, ServiceLogsTemplate, ServiceNodeLinkRow, ServicePageRow,
+    ServicesTemplate, SessionRow, SessionsTemplate, SettingsRow, SettingsTemplate, SummaryItem,
+    TaskAppFilterRow, TaskDetailTemplate, TaskDetailView, TaskExecutionGuideView,
+    TaskFilterOptionRow, TaskLogRow, TaskNodeResultRow, TaskPageRow, TaskPhaseGroupRow,
+    TaskPhaseStepRow, TaskReturnActionView, TaskRow, TaskStepRow, TasksTemplate, TemplateCardRow,
+    TemplatesTemplate, render_html,
 };
 
 const LOGO_SVG: &str = include_str!("../../assets/logo.svg");
@@ -2367,10 +2368,12 @@ async fn render_app_detail(
         .iter()
         .map(|run| AppDeploymentRunRow {
             task_id: run.task_id,
-            title: run
-                .task_title
-                .clone()
-                .unwrap_or_else(|| format!("部署记录 #{}", run.id)),
+            title: deployment_history_task_title(
+                run.task_title.as_deref(),
+                &run.deploy_action,
+                &detail.app.name,
+                run.id,
+            ),
             action: deploy_action_label(&run.deploy_action),
             status: deployment_status_label(&run.status),
             status_tone: deployment_status_tone(&run.status),
@@ -2392,6 +2395,7 @@ async fn render_app_detail(
                 .unwrap_or_else(|| "未结束".to_owned()),
         })
         .collect::<Vec<_>>();
+    let redis_config = redis_config_view(&detail.compose_content, &detail.env_content);
     let can_manage = session.can("apps.update") && app_enabled && app_idle;
     let config_snapshots = detail
         .config_snapshots
@@ -2532,6 +2536,7 @@ async fn render_app_detail(
         config_snapshots: &config_snapshots,
         deploy_diff: &deploy_diff,
         runtime_states: &runtime_states,
+        redis_config,
         target_choices: &target_choices,
         can_manage,
         can_deploy: session.can(SERVICES_DEPLOY) && app_enabled && app_idle,
@@ -8072,6 +8077,258 @@ fn deploy_action_label(action: &str) -> &'static str {
         "compose_restart" => "重启",
         _ => "操作",
     }
+}
+
+fn deployment_history_task_title(
+    raw_title: Option<&str>,
+    deploy_action: &str,
+    app_name: &str,
+    run_id: i64,
+) -> String {
+    let fallback = if app_name.trim().is_empty() {
+        format!("{}记录 #{}", deploy_action_label(deploy_action), run_id)
+    } else {
+        format!("{} {}", deploy_action_label(deploy_action), app_name)
+    };
+    let Some(title) = raw_title.map(str::trim).filter(|title| !title.is_empty()) else {
+        return fallback;
+    };
+    if looks_like_lost_unicode_title(title) {
+        fallback
+    } else {
+        crate::text::fix_mojibake(title)
+    }
+}
+
+fn looks_like_lost_unicode_title(value: &str) -> bool {
+    let question_count = value.chars().filter(|ch| *ch == '?').count();
+    question_count >= 2 && !value.chars().any(is_cjk_char)
+}
+
+fn is_cjk_char(ch: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&ch)
+}
+
+fn redis_config_view(compose_content: &str, env_content: &str) -> Option<RedisConfigView> {
+    let env = parse_env_content(env_content);
+    if !is_redis_compose_config(compose_content, &env) {
+        return None;
+    }
+
+    let image = env_or_compose_default(&env, compose_content, "REDIS_IMAGE", "redis:7-alpine");
+    let bind_ip = env_or_compose_default(&env, compose_content, "REDIS_BIND_IP", "127.0.0.1");
+    let port = env_or_compose_default(&env, compose_content, "REDIS_PORT", "6379");
+    let maxmemory = env_or_compose_default(&env, compose_content, "REDIS_MAXMEMORY", "1024mb");
+    let maxmemory_policy = env_or_compose_default(
+        &env,
+        compose_content,
+        "REDIS_MAXMEMORY_POLICY",
+        "allkeys-lru",
+    );
+    let log_max_size = env_or_compose_default(&env, compose_content, "DOCKER_LOG_MAX_SIZE", "200m");
+    let log_max_file = env_or_compose_default(&env, compose_content, "DOCKER_LOG_MAX_FILE", "5");
+
+    let password_value = env.get("REDIS_PASSWORD").map(|value| value.trim());
+    let (password_status, password_tone, password_note) = match password_value {
+        Some(value) if value.is_empty() => (
+            "未设置".to_owned(),
+            "danger",
+            Some("REDIS_PASSWORD 为空，部署或健康检查可能失败。".to_owned()),
+        ),
+        Some("change-me") => (
+            "默认占位值".to_owned(),
+            "warning",
+            Some("REDIS_PASSWORD 仍是 change-me，正式环境建议立即修改。".to_owned()),
+        ),
+        Some(_) => ("已设置（隐藏）".to_owned(), "success", None),
+        None if compose_content.contains("REDIS_PASSWORD:?") => (
+            "未设置".to_owned(),
+            "danger",
+            Some("compose.yaml 要求 REDIS_PASSWORD，当前 .env 未提供。".to_owned()),
+        ),
+        None => ("未识别".to_owned(), "warning", None),
+    };
+
+    let maxclients_explicit =
+        compose_content.contains("REDIS_MAXCLIENTS") || compose_content.contains("--maxclients");
+    let (maxclients, maxclients_tone, maxclients_note) = if maxclients_explicit {
+        (
+            env_or_compose_default(&env, compose_content, "REDIS_MAXCLIENTS", "10000"),
+            "neutral",
+            None,
+        )
+    } else if let Some(value) = env.get("REDIS_MAXCLIENTS") {
+        (
+            format!("{value}（未生效）"),
+            "warning",
+            Some("REDIS_MAXCLIENTS 存在于 .env，但 compose.yaml 未传给 redis-server。".to_owned()),
+        )
+    } else {
+        (
+            "未显式设置（Redis 默认 10000）".to_owned(),
+            "neutral",
+            Some(
+                "最大连接数未在 compose.yaml 中显式设置，Redis 默认 maxclients 为 10000。"
+                    .to_owned(),
+            ),
+        )
+    };
+
+    let (persistence, persistence_tone) = if compose_content.contains("--appendonly")
+        && (compose_content.contains("\"yes\"") || compose_content.contains("'yes'"))
+    {
+        ("AOF 开启".to_owned(), "success")
+    } else if compose_content.contains("--appendonly") {
+        ("已配置 appendonly".to_owned(), "neutral")
+    } else {
+        ("未识别".to_owned(), "warning")
+    };
+    let data_dir = redis_data_dir_summary(compose_content);
+    let (healthcheck, healthcheck_tone) = if compose_content.contains("redis-cli")
+        && compose_content.to_ascii_lowercase().contains("ping")
+    {
+        ("PING/PONG".to_owned(), "success")
+    } else {
+        ("未识别".to_owned(), "warning")
+    };
+
+    let mut notes = Vec::new();
+    if let Some(note) = password_note {
+        notes.push(note);
+    }
+    if let Some(note) = maxclients_note {
+        notes.push(note);
+    }
+
+    Some(RedisConfigView {
+        rows: vec![
+            RedisConfigRow {
+                label: "镜像",
+                value: image,
+                tone: "neutral",
+            },
+            RedisConfigRow {
+                label: "监听地址",
+                value: format!("{bind_ip}:{port} -> 6379"),
+                tone: "neutral",
+            },
+            RedisConfigRow {
+                label: "内存上限",
+                value: maxmemory,
+                tone: "neutral",
+            },
+            RedisConfigRow {
+                label: "淘汰策略",
+                value: maxmemory_policy,
+                tone: "neutral",
+            },
+            RedisConfigRow {
+                label: "最大连接数",
+                value: maxclients,
+                tone: maxclients_tone,
+            },
+            RedisConfigRow {
+                label: "密码",
+                value: password_status,
+                tone: password_tone,
+            },
+            RedisConfigRow {
+                label: "持久化",
+                value: persistence,
+                tone: persistence_tone,
+            },
+            RedisConfigRow {
+                label: "数据目录",
+                value: data_dir,
+                tone: "neutral",
+            },
+            RedisConfigRow {
+                label: "健康检查",
+                value: healthcheck,
+                tone: healthcheck_tone,
+            },
+            RedisConfigRow {
+                label: "日志轮转",
+                value: format!("{log_max_size} × {log_max_file}"),
+                tone: "neutral",
+            },
+        ],
+        notes,
+    })
+}
+
+fn is_redis_compose_config(compose_content: &str, env: &BTreeMap<String, String>) -> bool {
+    let compose = compose_content.to_ascii_lowercase();
+    compose.contains("redis-server")
+        || compose.contains("redis:")
+        || compose.contains("redis/redis-stack")
+        || env.keys().any(|key| key.starts_with("REDIS_"))
+}
+
+fn parse_env_content(env_content: &str) -> BTreeMap<String, String> {
+    env_content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let line = line.strip_prefix("export ").unwrap_or(line);
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            Some((key.to_owned(), strip_env_quotes(value.trim()).to_owned()))
+        })
+        .collect()
+}
+
+fn strip_env_quotes(value: &str) -> &str {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')
+        {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+fn env_or_compose_default(
+    env: &BTreeMap<String, String>,
+    compose_content: &str,
+    key: &str,
+    fallback: &str,
+) -> String {
+    env.get(key)
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .or_else(|| compose_env_default(compose_content, key))
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn compose_env_default(compose_content: &str, key: &str) -> Option<String> {
+    let token = format!("${{{key}:-");
+    let start = compose_content.find(&token)? + token.len();
+    let rest = &compose_content[start..];
+    let end = rest.find('}')?;
+    let value = rest[..end].trim();
+    (!value.is_empty()).then(|| strip_env_quotes(value).to_owned())
+}
+
+fn redis_data_dir_summary(compose_content: &str) -> String {
+    compose_content
+        .lines()
+        .map(str::trim)
+        .find_map(|line| {
+            let line = line.trim_start_matches("- ").trim().trim_matches('"');
+            let (host, container) = line.split_once(':')?;
+            (container == "/data" || container.starts_with("/data:"))
+                .then(|| format!("{host} -> /data"))
+        })
+        .unwrap_or_else(|| "未识别".to_owned())
 }
 
 fn parse_compose_confirm_action(action: &str) -> Option<ComposeTaskAction> {
@@ -14733,6 +14990,112 @@ mod tests {
         assert!(!html.contains("systemd 操作"));
         assert!(!html.contains("发布时间 2026-06-09T10:00:00Z"));
         assert!(artifact_id > 0);
+    }
+
+    #[tokio::test]
+    async fn app_detail_renders_redis_config_and_repairs_lost_unicode_history_title() {
+        let app = test_web_app().await;
+        let rendered = render_compose_template(RenderTemplateInput {
+            template_key: "redis-single",
+            app_key: "shared-prod-redis",
+            port: 6379,
+        })
+        .expect("render redis template");
+        let env_content = rendered
+            .env_content
+            .replace("REDIS_PASSWORD=change-me", "REDIS_PASSWORD=redis-secret")
+            .replace("REDIS_MAXMEMORY=1024mb", "REDIS_MAXMEMORY=2048mb")
+            .replace("REDIS_MAXCLIENTS=10000\n", "");
+        let compose_content = rendered.compose_content.replace(
+            "      - \"--maxclients\"\n      - \"${REDIS_MAXCLIENTS:-10000}\"\n",
+            "",
+        );
+        let app_id = app
+            .apps
+            .create_app(CreateAppInput {
+                app_key: "shared-prod-redis".to_owned(),
+                name: "共享正式 Redis".to_owned(),
+                description: "多个正式项目共用的 Redis 基础设施".to_owned(),
+                environment: "production".to_owned(),
+                app_type: "compose".to_owned(),
+                deploy_strategy: "rolling_stop_on_failure".to_owned(),
+                release_source: "manual".to_owned(),
+                auto_queue_release: false,
+                work_dir: "/opt/easy-deploy/apps/shared-prod-redis".to_owned(),
+                target_node_ids: vec![1],
+                compose_content,
+                env_content,
+                deploy_scripts: rendered.deploy_scripts,
+                health_check: Default::default(),
+                binary_artifact_version: String::new(),
+                binary_artifact_path: String::new(),
+                binary_exec_args: String::new(),
+                binary_service_user: String::new(),
+                binary_unit_name: String::new(),
+                binary_release_strategy: "restart".to_owned(),
+                binary_active_slot: "blue".to_owned(),
+                binary_base_port: 8080,
+                binary_standby_port: 18080,
+                binary_proxy_enabled: false,
+                binary_proxy_kind: "none".to_owned(),
+                binary_proxy_domain: String::new(),
+                binary_proxy_config_path: String::new(),
+            })
+            .await
+            .expect("create redis app");
+        let task_id = sqlx::query(
+            "INSERT INTO operation_tasks(task_kind, title, app_id, status, created_by) VALUES ('compose.up', '?? ???? Redis', ?1, 'success', 'admin')",
+        )
+        .bind(app_id)
+        .execute(&app.db)
+        .await
+        .expect("insert broken task")
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO deployment_runs(app_id, task_id, deploy_action, status, message, config_revision_no, artifact_version, finished_at) VALUES (?1, ?2, 'compose_up', 'success', 'Redis 容器已运行，健康检查通过，PING 返回 PONG', 1, '', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(app_id)
+        .bind(task_id)
+        .execute(&app.db)
+        .await
+        .expect("insert deployment run");
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+
+        let detail_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/apps/{app_id}"))
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let body = to_bytes(detail_response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("Redis 配置摘要"));
+        assert!(html.contains("2048mb"));
+        assert!(html.contains("allkeys-lru"));
+        assert!(html.contains("未显式设置（Redis 默认 10000）"));
+        assert!(html.contains("已设置（隐藏）"));
+        assert!(html.contains("部署 共享正式 Redis"));
+        assert!(!html.contains("?? ???? Redis"));
     }
 
     #[tokio::test]

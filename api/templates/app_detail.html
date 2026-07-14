@@ -517,6 +517,35 @@
       {% endif %}
     </section>
 
+    {% match redis_config %}
+      {% when Some with (redis) %}
+        <section class="panel" aria-labelledby="redis-config-title">
+          <div class="panel-header compact">
+            <div>
+              <h2 id="redis-config-title">Redis 配置摘要</h2>
+              <p>从当前 compose.yaml 和 .env 静态解析，便于快速核对运行参数。</p>
+            </div>
+            <span class="badge tone-success">Redis</span>
+          </div>
+          <div class="detail-list compact-detail-list">
+            {% for row in redis.rows %}
+              <div>
+                <span>{{ row.label }}</span>
+                <strong><span class="badge tone-{{ row.tone }}">{{ row.value }}</span></strong>
+              </div>
+            {% endfor %}
+          </div>
+          {% if redis.notes.len() > 0 %}
+            <div class="redis-config-notes">
+              {% for note in redis.notes %}
+                <span>{{ note }}</span>
+              {% endfor %}
+            </div>
+          {% endif %}
+        </section>
+      {% when None %}
+    {% endmatch %}
+
     <section class="panel" aria-labelledby="config-snapshots-title">
       <div class="panel-header compact">
         <div>

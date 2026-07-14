@@ -187,6 +187,8 @@ fn render_redis(service_name: &str, port: u16) -> RenderedTemplate {
       - "${REDIS_MAXMEMORY:-1024mb}"
       - "--maxmemory-policy"
       - "${REDIS_MAXMEMORY_POLICY:-allkeys-lru}"
+      - "--maxclients"
+      - "${REDIS_MAXCLIENTS:-10000}"
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
       TZ: ${TZ:-Asia/Shanghai}
@@ -210,7 +212,7 @@ fn render_redis(service_name: &str, port: u16) -> RenderedTemplate {
     RenderedTemplate {
         compose_content,
         env_content: format!(
-            "REDIS_IMAGE=redis:7-alpine\nREDIS_BIND_IP=127.0.0.1\nREDIS_PORT={port}\nREDIS_PASSWORD=change-me\nREDIS_MAXMEMORY=1024mb\nREDIS_MAXMEMORY_POLICY=allkeys-lru\nDOCKER_LOG_MAX_SIZE=200m\nDOCKER_LOG_MAX_FILE=5\n"
+            "REDIS_IMAGE=redis:7-alpine\nREDIS_BIND_IP=127.0.0.1\nREDIS_PORT={port}\nREDIS_PASSWORD=change-me\nREDIS_MAXMEMORY=1024mb\nREDIS_MAXMEMORY_POLICY=allkeys-lru\nREDIS_MAXCLIENTS=10000\nDOCKER_LOG_MAX_SIZE=200m\nDOCKER_LOG_MAX_FILE=5\n"
         ),
         deploy_scripts: DeployScriptSet {
             pre_deploy: "set -eu\nmkdir -p data\n".to_owned(),
@@ -613,6 +615,8 @@ mod tests {
         })
         .expect("render redis");
         assert!(redis.compose_content.contains("--requirepass"));
+        assert!(redis.compose_content.contains("--maxclients"));
+        assert!(redis.env_content.contains("REDIS_MAXCLIENTS=10000"));
         assert!(
             redis
                 .compose_content
