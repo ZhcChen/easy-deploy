@@ -117,14 +117,6 @@
           <strong>{{ node.disk_info }}</strong>
         </div>
         <div>
-          <span>公网 IP</span>
-          <strong>{{ node.public_ip }}</strong>
-        </div>
-        <div>
-          <span>内网 IP</span>
-          <strong>{{ node.private_ips }}</strong>
-        </div>
-        <div>
           <span>systemd</span>
           <strong>{{ node.systemd_version }}</strong>
         </div>
@@ -139,6 +131,25 @@
         <div>
           <span>摘要</span>
           <strong>{{ node.last_message }}</strong>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="node-network-title">
+      <div class="panel-header">
+        <div>
+          <h2 id="node-network-title">网络信息</h2>
+          <p>公网和内网地址来自最近一次节点探测。</p>
+        </div>
+      </div>
+      <div class="detail-list">
+        <div>
+          <span>公网 IP</span>
+          <strong>{{ node.public_ip }}</strong>
+        </div>
+        <div>
+          <span>内网 IP</span>
+          <strong>{{ node.private_ips }}</strong>
         </div>
       </div>
     </section>

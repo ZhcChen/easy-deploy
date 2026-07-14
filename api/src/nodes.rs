@@ -508,6 +508,56 @@ ED_PROBE_END=docker_info
         assert!(result.compose_version.is_empty());
     }
 
+    #[test]
+    fn ssh_probe_result_filters_network_probe_noise() {
+        let result = ssh_probe_result_from_output_clean(
+            "\
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=work_dir
+/opt/easy-deploy/apps
+ED_PROBE_END=work_dir
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=os_info
+Linux 6.1 x86_64 GNU/Linux
+ED_PROBE_END=os_info
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=disk_info
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda1        40G  12G   28G  31% /
+ED_PROBE_END=disk_info
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=systemd_version
+systemd 252
+ED_PROBE_END=systemd_version
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=public_ip
+curl: (7) Failed to connect to api.ipify.org port 443
+ED_PROBE_END=public_ip
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=private_ips
+curl: noisy line
+172.17.63.73 100.64.1.1
+ED_PROBE_END=private_ips
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=docker_version
+Docker version 26.1.0
+ED_PROBE_END=docker_version
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=docker_info
+Server Version: 26.1.0
+ED_PROBE_END=docker_info
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=compose_version
+Docker Compose version v2.27.0
+ED_PROBE_END=compose_version
+",
+        );
+
+        assert_eq!(result.status, "passed");
+        assert!(result.public_ip.is_empty());
+        assert_eq!(result.private_ips, "172.17.63.73");
+    }
+
     #[tokio::test]
     async fn node_install_command_uses_known_hosts_identity_and_component_script() {
         let work_dir = tempdir().expect("temp dir");
@@ -1511,13 +1561,19 @@ fn is_systemd_available(value: &str) -> bool {
     !value.is_empty() && !value.contains(':')
 }
 
-const PUBLIC_IP_PROBE_SCRIPT: &str = r#"if command -v curl >/dev/null 2>&1; then
-  curl -fsS --max-time 3 https://api.ipify.org || curl -fsS --max-time 3 https://ifconfig.me/ip || curl -fsS --max-time 3 https://icanhazip.com
-elif command -v wget >/dev/null 2>&1; then
-  wget -qO- -T 3 https://api.ipify.org || wget -qO- -T 3 https://ifconfig.me/ip || wget -qO- -T 3 https://icanhazip.com
-else
-  exit 1
-fi"#;
+const PUBLIC_IP_PROBE_SCRIPT: &str = r#"for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+  if command -v curl >/dev/null 2>&1; then
+    value="$(curl -fsS --max-time 3 "$url" 2>/dev/null | head -n 1 | tr -d '\r\n')"
+  elif command -v wget >/dev/null 2>&1; then
+    value="$(wget -qO- -T 3 "$url" 2>/dev/null | head -n 1 | tr -d '\r\n')"
+  else
+    exit 1
+  fi
+  case "$value" in
+    [0-9]*.[0-9]*.[0-9]*.[0-9]*) printf '%s\n' "$value"; exit 0 ;;
+  esac
+done
+exit 1"#;
 
 const PRIVATE_IPS_PROBE_SCRIPT: &str = r#"ips=""
 if command -v ip >/dev/null 2>&1; then
@@ -1582,14 +1638,14 @@ async fn run_node_probe_clean(
             .await
             .map(|output| first_non_empty_line(&output))
             .unwrap_or_else(|err| format!("systemd 探测失败: {err}"));
-    let public_ip = optional_probe_first_line_clean(
+    let public_ip = optional_public_ip_probe_clean(
         runner,
         &target,
         &["sh", "-lc", PUBLIC_IP_PROBE_SCRIPT],
         &mut probe_log,
     )
     .await;
-    let private_ips = optional_probe_lines_clean(
+    let private_ips = optional_private_ips_probe_clean(
         runner,
         &target,
         &["sh", "-lc", PRIVATE_IPS_PROBE_SCRIPT],
@@ -1811,10 +1867,10 @@ fn ssh_probe_result_from_output_clean(output: &str) -> NodeCheckResult {
         .map(|value| first_non_empty_line(&value))
         .unwrap_or_else(|| "systemd 探测失败: 探测未返回结果".to_owned());
     let public_ip = probe_section_output(&sections, "public_ip")
-        .map(|value| first_non_empty_line(&value))
+        .map(|value| normalize_public_ip(&value))
         .unwrap_or_default();
     let private_ips = probe_section_output(&sections, "private_ips")
-        .map(|value| normalize_probe_lines(&value))
+        .map(|value| normalize_private_ips(&value))
         .unwrap_or_default();
     let docker_version = match require_probe_section_clean(&sections, "docker_version") {
         Ok(value) => value,
@@ -2112,7 +2168,7 @@ async fn optional_probe_version_clean(
         .unwrap_or_default()
 }
 
-async fn optional_probe_first_line_clean(
+async fn optional_public_ip_probe_clean(
     runner: &DynCommandRunner,
     target: &NodeProbeTarget,
     command: &[&str],
@@ -2120,11 +2176,11 @@ async fn optional_probe_first_line_clean(
 ) -> String {
     probe_command_clean(runner, target, command, probe_log)
         .await
-        .map(|output| first_non_empty_line(&output))
+        .map(|output| normalize_public_ip(&output))
         .unwrap_or_default()
 }
 
-async fn optional_probe_lines_clean(
+async fn optional_private_ips_probe_clean(
     runner: &DynCommandRunner,
     target: &NodeProbeTarget,
     command: &[&str],
@@ -2132,17 +2188,53 @@ async fn optional_probe_lines_clean(
 ) -> String {
     probe_command_clean(runner, target, command, probe_log)
         .await
-        .map(|output| normalize_probe_lines(&output))
+        .map(|output| normalize_private_ips(&output))
         .unwrap_or_default()
 }
 
-fn normalize_probe_lines(value: &str) -> String {
+fn normalize_public_ip(value: &str) -> String {
     value
         .lines()
+        .flat_map(|line| line.split(|ch: char| ch.is_whitespace() || ch == ','))
         .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .find(|part| is_ipv4_address(part))
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn normalize_private_ips(value: &str) -> String {
+    value
+        .lines()
+        .flat_map(|line| line.split(|ch: char| ch.is_whitespace() || ch == ','))
+        .map(str::trim)
+        .filter(|line| is_private_ipv4_address(line))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn is_ipv4_address(value: &str) -> bool {
+    let octets = value.split('.').collect::<Vec<_>>();
+    octets.len() == 4
+        && octets.iter().all(|part| {
+            !part.is_empty()
+                && part.len() <= 3
+                && part.chars().all(|ch| ch.is_ascii_digit())
+                && part.parse::<u8>().is_ok()
+        })
+}
+
+fn is_private_ipv4_address(value: &str) -> bool {
+    if !is_ipv4_address(value) {
+        return false;
+    }
+    let octets = value
+        .split('.')
+        .filter_map(|part| part.parse::<u8>().ok())
+        .collect::<Vec<_>>();
+    matches!(
+        octets.as_slice(),
+        [10, _, _, _] | [192, 168, _, _] | [172, 16..=31, _, _]
+    )
 }
 
 struct ProbeLog {

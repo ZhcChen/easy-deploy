@@ -177,14 +177,6 @@
               <strong>{{ node.disk_info }}</strong>
             </div>
             <div>
-              <span>公网 IP</span>
-              <strong class="path-cell">{{ node.public_ip }}</strong>
-            </div>
-            <div>
-              <span>内网 IP</span>
-              <strong class="path-cell">{{ node.private_ips }}</strong>
-            </div>
-            <div>
               <span>systemd</span>
               <strong>{{ node.systemd_version }}</strong>
             </div>
@@ -199,6 +191,20 @@
             <div class="detail-span-all">
               <span>探测摘要</span>
               <strong>{{ node.last_message }}</strong>
+            </div>
+          </div>
+        </section>
+
+        <section class="modal-detail-section" aria-labelledby="node-network-title-{{ node.id }}">
+          <h3 id="node-network-title-{{ node.id }}">网络信息</h3>
+          <div class="modal-detail-grid node-detail-grid">
+            <div>
+              <span>公网 IP</span>
+              <strong class="path-cell">{{ node.public_ip }}</strong>
+            </div>
+            <div>
+              <span>内网 IP</span>
+              <strong class="path-cell">{{ node.private_ips }}</strong>
             </div>
           </div>
         </section>

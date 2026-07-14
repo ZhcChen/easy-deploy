@@ -6829,13 +6829,29 @@ fn node_probe_ip_text_clean(value: Option<&str>, fallback: &'static str) -> Stri
     if value.is_empty() {
         return fallback.to_owned();
     }
-    value
+    let normalized = value
         .lines()
-        .flat_map(|line| line.split(','))
+        .flat_map(|line| line.split(|ch: char| ch == ',' || ch.is_whitespace()))
         .map(str::trim)
-        .filter(|part| !part.is_empty())
+        .filter(|part| looks_like_ipv4(part))
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    if normalized.is_empty() {
+        fallback.to_owned()
+    } else {
+        normalized
+    }
+}
+
+fn looks_like_ipv4(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    parts.len() == 4
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.len() <= 3
+                && part.chars().all(|ch| ch.is_ascii_digit())
+                && part.parse::<u8>().is_ok()
+        })
 }
 
 fn node_check_status_label_clean(status: &str) -> &'static str {
@@ -12386,6 +12402,82 @@ mod tests {
         assert!(!html.contains("qfy-sc worker"));
         assert!(!html.contains("二进制直部署"));
         assert!(!html.contains("systemd 管理"));
+    }
+
+    #[tokio::test]
+    async fn node_pages_render_network_placeholders_before_probe() {
+        let app = test_web_app().await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+
+        let nodes_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/nodes")
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build nodes request"),
+            )
+            .await
+            .expect("send nodes request");
+        assert_eq!(nodes_response.status(), StatusCode::OK);
+        let nodes_body = to_bytes(nodes_response.into_body(), usize::MAX)
+            .await
+            .expect("read nodes body");
+        let nodes_html = String::from_utf8_lossy(&nodes_body);
+        assert!(nodes_html.contains("网络信息"));
+        assert!(nodes_html.contains("公网 IP"));
+        assert!(nodes_html.contains("内网 IP"));
+        assert!(nodes_html.contains("未检测到"));
+
+        let detail_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/nodes/1")
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build node detail request"),
+            )
+            .await
+            .expect("send node detail request");
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let detail_body = to_bytes(detail_response.into_body(), usize::MAX)
+            .await
+            .expect("read node detail body");
+        let detail_html = String::from_utf8_lossy(&detail_body);
+        assert!(detail_html.contains("网络信息"));
+        assert!(detail_html.contains("公网 IP"));
+        assert!(detail_html.contains("内网 IP"));
+        assert!(detail_html.contains("未检测到"));
+    }
+
+    #[test]
+    fn node_probe_ip_text_ignores_command_errors() {
+        assert_eq!(
+            node_probe_ip_text_clean(
+                Some("curl: (7) Failed to connect to api.ipify.org\n"),
+                "未检测到"
+            ),
+            "未检测到"
+        );
+        assert_eq!(
+            node_probe_ip_text_clean(Some("curl noisy\n172.17.63.73 10.0.2.11"), "未检测到"),
+            "172.17.63.73, 10.0.2.11"
+        );
     }
 
     #[tokio::test]
