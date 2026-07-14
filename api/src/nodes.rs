@@ -98,6 +98,15 @@ systemd 252
 +PAM +AUDIT
 ED_PROBE_END=systemd_version
 ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=public_ip
+198.51.100.22
+ED_PROBE_END=public_ip
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=private_ips
+10.0.2.11
+172.16.1.5
+ED_PROBE_END=private_ips
+ED_PROBE_STATUS=ok
 ED_PROBE_FIELD=docker_version
 Docker version 26.1.0
 ED_PROBE_END=docker_version
@@ -126,6 +135,12 @@ ED_PROBE_END=nginx_version
                     "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        40G  12G   28G  31% /\n",
                 ),
                 ("systemctl", _) => (Some(0), "systemd 252\n+PAM +AUDIT\n"),
+                ("sh", args) if args == ["-lc", PUBLIC_IP_PROBE_SCRIPT] => {
+                    (Some(0), "198.51.100.21\n")
+                }
+                ("sh", args) if args == ["-lc", PRIVATE_IPS_PROBE_SCRIPT] => {
+                    (Some(0), "10.0.2.10\n172.16.1.4\n")
+                }
                 ("docker", args) if args == ["--version"] => (Some(0), "Docker version 26.1.0\n"),
                 ("docker", args) if args == ["info"] => (Some(0), "Server Version: 26.1.0\n"),
                 ("docker", args) if args == ["compose", "version"] => {
@@ -320,6 +335,11 @@ ED_PROBE_END=nginx_version
             node.last_compose_version.as_deref(),
             Some("Docker Compose version v2.27.0")
         );
+        assert_eq!(node.last_public_ip.as_deref(), Some("198.51.100.21"));
+        assert_eq!(
+            node.last_private_ips.as_deref(),
+            Some("10.0.2.10, 172.16.1.4")
+        );
         assert_eq!(node.last_caddy_version.as_deref(), Some("2.8.4"));
         assert_eq!(
             node.last_nginx_version.as_deref(),
@@ -345,6 +365,12 @@ ED_PROBE_END=nginx_version
         let node_id = create_test_ssh_node(&service, Some(credential_id)).await;
 
         service.check_node(node_id).await.expect("check ssh node");
+        let node = service.fetch_node(node_id).await.expect("fetch node");
+        assert_eq!(node.last_public_ip.as_deref(), Some("198.51.100.22"));
+        assert_eq!(
+            node.last_private_ips.as_deref(),
+            Some("10.0.2.11, 172.16.1.5")
+        );
 
         let specs = { runner.specs.lock().expect("lock specs").clone() };
         let keygen_specs = specs
@@ -409,6 +435,8 @@ ED_PROBE_END=nginx_version
         assert!(event.3.contains("known_host_added=true"));
         assert!(event.3.contains("StrictHostKeyChecking=yes"));
         assert!(event.3.contains("IdentitiesOnly=yes"));
+        assert!(event.3.contains("public_ip: status=ok"));
+        assert!(event.3.contains("private_ips: status=ok"));
         assert!(event.3.contains("compose_version: status=ok"));
     }
 
@@ -590,6 +618,8 @@ pub struct NodeListItem {
     pub last_compose_version: Option<String>,
     pub last_os_info: Option<String>,
     pub last_disk_info: Option<String>,
+    pub last_public_ip: Option<String>,
+    pub last_private_ips: Option<String>,
     pub last_systemd_version: Option<String>,
     pub last_caddy_version: Option<String>,
     pub last_nginx_version: Option<String>,
@@ -684,6 +714,8 @@ pub struct NodeCheckResult {
     pub compose_version: String,
     pub os_info: String,
     pub disk_info: String,
+    pub public_ip: String,
+    pub private_ips: String,
     pub systemd_version: String,
     pub caddy_version: String,
     pub nginx_version: String,
@@ -706,6 +738,8 @@ pub struct NodeCheckHistoryItem {
     pub compose_version: String,
     pub os_info: String,
     pub disk_info: String,
+    pub public_ip: String,
+    pub private_ips: String,
     pub systemd_version: String,
     pub checked_at: String,
 }
@@ -788,6 +822,8 @@ impl NodeService {
                 c.compose_version AS last_compose_version,
                 c.os_info AS last_os_info,
                 c.disk_info AS last_disk_info,
+                c.public_ip AS last_public_ip,
+                c.private_ips AS last_private_ips,
                 c.systemd_version AS last_systemd_version,
                 c.caddy_version AS last_caddy_version,
                 c.nginx_version AS last_nginx_version
@@ -873,6 +909,8 @@ impl NodeService {
                 compose_version,
                 os_info,
                 disk_info,
+                public_ip,
+                private_ips,
                 systemd_version,
                 checked_at
             FROM node_checks
@@ -1191,9 +1229,11 @@ impl NodeService {
                 compose_version,
                 os_info,
                 disk_info,
+                public_ip,
+                private_ips,
                 systemd_version
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
         )
         .bind(node_id)
@@ -1203,6 +1243,8 @@ impl NodeService {
         .bind(&result.compose_version)
         .bind(&result.os_info)
         .bind(&result.disk_info)
+        .bind(&result.public_ip)
+        .bind(&result.private_ips)
         .bind(&result.systemd_version)
         .execute(&mut *tx)
         .await?;
@@ -1266,6 +1308,8 @@ impl NodeService {
                 c.compose_version AS last_compose_version,
                 c.os_info AS last_os_info,
                 c.disk_info AS last_disk_info,
+                c.public_ip AS last_public_ip,
+                c.private_ips AS last_private_ips,
                 c.systemd_version AS last_systemd_version,
                 c.caddy_version AS last_caddy_version,
                 c.nginx_version AS last_nginx_version
@@ -1296,6 +1340,8 @@ async fn check_local_node_clean(runner: &DynCommandRunner, node: &NodeListItem) 
             compose_version: String::new(),
             os_info: String::new(),
             disk_info: String::new(),
+            public_ip: String::new(),
+            private_ips: String::new(),
             systemd_version: String::new(),
             caddy_version: String::new(),
             nginx_version: String::new(),
@@ -1388,6 +1434,8 @@ async fn upsert_node_capabilities(
             compose_version,
             os_info,
             disk_info,
+            public_ip,
+            private_ips,
             systemd_version,
             caddy_version,
             nginx_version,
@@ -1410,6 +1458,8 @@ async fn upsert_node_capabilities(
             ?13,
             ?14,
             ?15,
+            ?16,
+            ?17,
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         )
@@ -1425,6 +1475,8 @@ async fn upsert_node_capabilities(
             compose_version = excluded.compose_version,
             os_info = excluded.os_info,
             disk_info = excluded.disk_info,
+            public_ip = excluded.public_ip,
+            private_ips = excluded.private_ips,
             systemd_version = excluded.systemd_version,
             caddy_version = excluded.caddy_version,
             nginx_version = excluded.nginx_version,
@@ -1444,6 +1496,8 @@ async fn upsert_node_capabilities(
     .bind(&result.compose_version)
     .bind(&result.os_info)
     .bind(&result.disk_info)
+    .bind(&result.public_ip)
+    .bind(&result.private_ips)
     .bind(&result.systemd_version)
     .bind(&result.caddy_version)
     .bind(&result.nginx_version)
@@ -1456,6 +1510,23 @@ fn is_systemd_available(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty() && !value.contains(':')
 }
+
+const PUBLIC_IP_PROBE_SCRIPT: &str = r#"if command -v curl >/dev/null 2>&1; then
+  curl -fsS --max-time 3 https://api.ipify.org || curl -fsS --max-time 3 https://ifconfig.me/ip || curl -fsS --max-time 3 https://icanhazip.com
+elif command -v wget >/dev/null 2>&1; then
+  wget -qO- -T 3 https://api.ipify.org || wget -qO- -T 3 https://ifconfig.me/ip || wget -qO- -T 3 https://icanhazip.com
+else
+  exit 1
+fi"#;
+
+const PRIVATE_IPS_PROBE_SCRIPT: &str = r#"ips=""
+if command -v ip >/dev/null 2>&1; then
+  ips="$(ip -o -4 addr show scope global up 2>/dev/null | awk '$2 !~ /^(lo|docker|br-|veth|virbr|cni|flannel|tailscale|zt)/ {print $4}' | cut -d/ -f1)"
+fi
+if [ -z "$ips" ] && command -v hostname >/dev/null 2>&1; then
+  ips="$(hostname -I 2>/dev/null)"
+fi
+printf '%s\n' "$ips" | tr ' ' '\n' | awk 'NF && ($1 ~ /^10\./ || $1 ~ /^192\.168\./ || $1 ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./) {print $1}' | sort -u"#;
 
 enum NodeProbeTarget {
     Local {
@@ -1511,6 +1582,20 @@ async fn run_node_probe_clean(
             .await
             .map(|output| first_non_empty_line(&output))
             .unwrap_or_else(|err| format!("systemd 探测失败: {err}"));
+    let public_ip = optional_probe_first_line_clean(
+        runner,
+        &target,
+        &["sh", "-lc", PUBLIC_IP_PROBE_SCRIPT],
+        &mut probe_log,
+    )
+    .await;
+    let private_ips = optional_probe_lines_clean(
+        runner,
+        &target,
+        &["sh", "-lc", PRIVATE_IPS_PROBE_SCRIPT],
+        &mut probe_log,
+    )
+    .await;
 
     let docker_version = match probe_command_clean(
         runner,
@@ -1530,6 +1615,8 @@ async fn run_node_probe_clean(
                 compose_version: String::new(),
                 os_info,
                 disk_info,
+                public_ip,
+                private_ips,
                 systemd_version,
                 caddy_version: String::new(),
                 nginx_version: String::new(),
@@ -1548,6 +1635,8 @@ async fn run_node_probe_clean(
             os_info,
             disk_info,
             systemd_version,
+            public_ip,
+            private_ips,
             caddy_version: String::new(),
             nginx_version: String::new(),
         };
@@ -1570,6 +1659,8 @@ async fn run_node_probe_clean(
                 compose_version: String::new(),
                 os_info,
                 disk_info,
+                public_ip,
+                private_ips,
                 systemd_version,
                 caddy_version: String::new(),
                 nginx_version: String::new(),
@@ -1589,6 +1680,8 @@ async fn run_node_probe_clean(
         compose_version,
         os_info,
         disk_info,
+        public_ip,
+        private_ips,
         systemd_version,
         caddy_version,
         nginx_version,
@@ -1717,6 +1810,12 @@ fn ssh_probe_result_from_output_clean(output: &str) -> NodeCheckResult {
     let systemd_version = probe_section_output(&sections, "systemd_version")
         .map(|value| first_non_empty_line(&value))
         .unwrap_or_else(|| "systemd 探测失败: 探测未返回结果".to_owned());
+    let public_ip = probe_section_output(&sections, "public_ip")
+        .map(|value| first_non_empty_line(&value))
+        .unwrap_or_default();
+    let private_ips = probe_section_output(&sections, "private_ips")
+        .map(|value| normalize_probe_lines(&value))
+        .unwrap_or_default();
     let docker_version = match require_probe_section_clean(&sections, "docker_version") {
         Ok(value) => value,
         Err(err) => {
@@ -1728,6 +1827,8 @@ fn ssh_probe_result_from_output_clean(output: &str) -> NodeCheckResult {
                 compose_version: String::new(),
                 os_info,
                 disk_info,
+                public_ip,
+                private_ips,
                 systemd_version,
                 caddy_version: String::new(),
                 nginx_version: String::new(),
@@ -1743,6 +1844,8 @@ fn ssh_probe_result_from_output_clean(output: &str) -> NodeCheckResult {
             compose_version: String::new(),
             os_info,
             disk_info,
+            public_ip,
+            private_ips,
             systemd_version,
             caddy_version: String::new(),
             nginx_version: String::new(),
@@ -1759,6 +1862,8 @@ fn ssh_probe_result_from_output_clean(output: &str) -> NodeCheckResult {
                 compose_version: String::new(),
                 os_info,
                 disk_info,
+                public_ip,
+                private_ips,
                 systemd_version,
                 caddy_version: String::new(),
                 nginx_version: String::new(),
@@ -1780,6 +1885,8 @@ fn ssh_probe_result_from_output_clean(output: &str) -> NodeCheckResult {
         compose_version,
         os_info,
         disk_info,
+        public_ip,
+        private_ips,
         systemd_version,
         caddy_version,
         nginx_version,
@@ -2005,6 +2112,39 @@ async fn optional_probe_version_clean(
         .unwrap_or_default()
 }
 
+async fn optional_probe_first_line_clean(
+    runner: &DynCommandRunner,
+    target: &NodeProbeTarget,
+    command: &[&str],
+    probe_log: &mut ProbeLog,
+) -> String {
+    probe_command_clean(runner, target, command, probe_log)
+        .await
+        .map(|output| first_non_empty_line(&output))
+        .unwrap_or_default()
+}
+
+async fn optional_probe_lines_clean(
+    runner: &DynCommandRunner,
+    target: &NodeProbeTarget,
+    command: &[&str],
+    probe_log: &mut ProbeLog,
+) -> String {
+    probe_command_clean(runner, target, command, probe_log)
+        .await
+        .map(|output| normalize_probe_lines(&output))
+        .unwrap_or_default()
+}
+
+fn normalize_probe_lines(value: &str) -> String {
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 struct ProbeLog {
     lines: Vec<String>,
 }
@@ -2203,12 +2343,22 @@ run_probe work_dir mkdir -p {remote_work_dir}
 run_probe os_info uname -srmo
 run_probe disk_info df -h {remote_work_dir}
 run_probe systemd_version systemctl --version
+probe_public_ip() {{
+{public_ip_probe}
+}}
+probe_private_ips() {{
+{private_ips_probe}
+}}
+run_probe public_ip probe_public_ip
+run_probe private_ips probe_private_ips
 run_probe docker_version docker --version
 run_probe docker_info docker info
 run_probe compose_version docker compose version
 run_probe caddy_version caddy version
 run_probe nginx_version nginx -v
-"#
+"#,
+        public_ip_probe = PUBLIC_IP_PROBE_SCRIPT,
+        private_ips_probe = PRIVATE_IPS_PROBE_SCRIPT,
     )
 }
 

@@ -1200,6 +1200,8 @@ pub struct NodePageRow<'a> {
     pub capability: String,
     pub os_info: String,
     pub disk_info: String,
+    pub public_ip: String,
+    pub private_ips: String,
     pub systemd_version: String,
     pub proxy_version: String,
     pub last_check_at: &'a str,
@@ -1268,6 +1270,8 @@ pub struct NodeCheckHistoryRow {
     pub compose_version: String,
     pub os_info: String,
     pub disk_info: String,
+    pub public_ip: String,
+    pub private_ips: String,
     pub systemd_version: String,
     pub checked_at: String,
 }

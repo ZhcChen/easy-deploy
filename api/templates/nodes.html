@@ -177,6 +177,14 @@
               <strong>{{ node.disk_info }}</strong>
             </div>
             <div>
+              <span>公网 IP</span>
+              <strong class="path-cell">{{ node.public_ip }}</strong>
+            </div>
+            <div>
+              <span>内网 IP</span>
+              <strong class="path-cell">{{ node.private_ips }}</strong>
+            </div>
+            <div>
               <span>systemd</span>
               <strong>{{ node.systemd_version }}</strong>
             </div>
@@ -230,6 +238,8 @@
                       <td>
                         <strong>{{ check.os_info }}</strong>
                         <span>{{ check.disk_info }}</span>
+                        <span>公网 {{ check.public_ip }}</span>
+                        <span>内网 {{ check.private_ips }}</span>
                         <span>{{ check.systemd_version }}</span>
                       </td>
                     </tr>

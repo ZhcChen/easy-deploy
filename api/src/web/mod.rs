@@ -6643,6 +6643,8 @@ fn node_page_row_clean<'a>(
         capability: node_capability_text_clean(node),
         os_info: node_probe_detail_text_clean(node.last_os_info.as_deref(), "OS 未探测"),
         disk_info: node_disk_detail_text_clean(node.last_disk_info.as_deref(), "磁盘未探测"),
+        public_ip: node_probe_ip_text_clean(node.last_public_ip.as_deref(), "未检测到"),
+        private_ips: node_probe_ip_text_clean(node.last_private_ips.as_deref(), "未检测到"),
         systemd_version: node_probe_detail_text_clean(
             node.last_systemd_version.as_deref(),
             "systemd 未探测",
@@ -6668,6 +6670,8 @@ fn node_check_history_row_clean(check: &crate::nodes::NodeCheckHistoryItem) -> N
         compose_version: display_text_clean(check.compose_version.clone(), "未记录"),
         os_info: node_probe_detail_text_clean(Some(&check.os_info), "OS 未探测"),
         disk_info: node_disk_detail_text_clean(Some(&check.disk_info), "磁盘未探测"),
+        public_ip: node_probe_ip_text_clean(Some(&check.public_ip), "未检测到"),
+        private_ips: node_probe_ip_text_clean(Some(&check.private_ips), "未检测到"),
         systemd_version: node_probe_detail_text_clean(
             Some(&check.systemd_version),
             "systemd 未探测",
@@ -6818,6 +6822,20 @@ fn node_disk_detail_text_clean(value: Option<&str>, fallback: &'static str) -> S
             .find(|line| !line.is_empty() && !line.starts_with("Filesystem"))
             .unwrap_or(value),
     )
+}
+
+fn node_probe_ip_text_clean(value: Option<&str>, fallback: &'static str) -> String {
+    let value = value.unwrap_or("").trim();
+    if value.is_empty() {
+        return fallback.to_owned();
+    }
+    value
+        .lines()
+        .flat_map(|line| line.split(','))
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn node_check_status_label_clean(status: &str) -> &'static str {
@@ -15961,6 +15979,8 @@ mod tests {
             last_compose_version: None,
             last_os_info: None,
             last_disk_info: None,
+            last_public_ip: None,
+            last_private_ips: None,
             last_systemd_version: Some("systemd 探测失败: permission denied".to_owned()),
             last_caddy_version: None,
             last_nginx_version: None,
