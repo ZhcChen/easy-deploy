@@ -337,6 +337,106 @@
     return true;
   };
 
+  const activateAppDetailTab = (root, tabName, focusTab = false) => {
+    if (!root || !tabName) return false;
+
+    const buttons = Array.from(root.querySelectorAll("[data-app-detail-tab]"));
+    if (!buttons.some((button) => button.getAttribute("data-app-detail-tab") === tabName)) {
+      return false;
+    }
+
+    buttons.forEach((button) => {
+      const active = button.getAttribute("data-app-detail-tab") === tabName;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-selected", active ? "true" : "false");
+      button.setAttribute("tabindex", active ? "0" : "-1");
+      if (active && focusTab && button instanceof HTMLElement) {
+        button.focus();
+      }
+    });
+
+    root.querySelectorAll("[data-app-detail-group]").forEach((group) => {
+      group.hidden = group.getAttribute("data-app-detail-group") !== tabName;
+    });
+
+    const content = root.querySelector("[data-app-detail-tab-content]");
+    if (content) {
+      content.setAttribute("data-active-app-detail-tab", tabName);
+    }
+
+    const side = root.querySelector("[data-app-detail-side]");
+    if (side) {
+      const hasVisibleChildren = Array.from(
+        side.querySelectorAll("[data-app-detail-group]"),
+      ).some((group) => !group.hidden);
+      side.hidden = !hasVisibleChildren;
+    }
+
+    return true;
+  };
+
+  const activateAppDetailTabButton = (button, focusTab = false) => {
+    const root = button.closest("[data-app-detail-tabs]");
+    const tabName = button.getAttribute("data-app-detail-tab");
+    return activateAppDetailTab(root, tabName, focusTab);
+  };
+
+  const appDetailTabFromHash = (root) => {
+    const hash = window.location.hash.slice(1);
+    if (!hash) return "";
+
+    const target = document.getElementById(hash);
+    const group = target?.closest("[data-app-detail-group]");
+    if (group && root.contains(group)) {
+      return group.getAttribute("data-app-detail-group") || "";
+    }
+
+    const directTab = root.querySelector(`[data-app-detail-tab="${CSS.escape(hash)}"]`);
+    return directTab ? hash : "";
+  };
+
+  const initAppDetailTabs = () => {
+    document.querySelectorAll("[data-app-detail-tabs]").forEach((root) => {
+      const hashTab = appDetailTabFromHash(root);
+      const initialTab =
+        hashTab ||
+        root.querySelector("[data-app-detail-tab].is-active")?.getAttribute("data-app-detail-tab") ||
+        root.querySelector("[data-app-detail-tab]")?.getAttribute("data-app-detail-tab") ||
+        "";
+      activateAppDetailTab(root, initialTab);
+    });
+  };
+
+  const handleAppDetailTabKeydown = (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const current = target?.closest("[data-app-detail-tab]");
+    if (!current) return false;
+
+    const root = current.closest("[data-app-detail-tabs]");
+    if (!root) return false;
+
+    const tabs = Array.from(root.querySelectorAll("[data-app-detail-tab]"));
+    const currentIndex = tabs.indexOf(current);
+    if (currentIndex < 0) return false;
+
+    let nextIndex = currentIndex;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+      nextIndex = (currentIndex + 1) % tabs.length;
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+      nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = tabs.length - 1;
+    } else {
+      return false;
+    }
+
+    event.preventDefault();
+    activateAppDetailTabButton(tabs[nextIndex], true);
+    return true;
+  };
+
   const namedControls = (root, name) =>
     Array.from(root.querySelectorAll("input, textarea, select")).filter(
       (control) => control.name === name,
@@ -1147,6 +1247,13 @@
       return;
     }
 
+    const appDetailTab = target.closest("[data-app-detail-tab]");
+    if (appDetailTab) {
+      event.preventDefault();
+      activateAppDetailTabButton(appDetailTab);
+      return;
+    }
+
     const copyButton = target.closest("[data-copy-target]");
     if (copyButton) {
       event.preventDefault();
@@ -1233,6 +1340,7 @@
 
   document.addEventListener("keydown", (event) => {
     if (handleTemplateCodeTabKeydown(event)) return;
+    if (handleAppDetailTabKeydown(event)) return;
 
     if (event.key === "Enter" || event.key === " ") {
       const target = event.target instanceof Element ? event.target : null;
@@ -1343,9 +1451,13 @@
     });
   });
 
-  window.addEventListener("hashchange", openHashModal);
+  window.addEventListener("hashchange", () => {
+    initAppDetailTabs();
+    openHashModal();
+  });
   observeEast8Timestamps();
   initSearchableSelects();
+  initAppDetailTabs();
   initHostMetrics();
   initTaskAutoRefresh();
   openHashModal();

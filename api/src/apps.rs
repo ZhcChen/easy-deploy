@@ -7059,6 +7059,11 @@ pub struct AppTargetChoiceItem {
     pub id: i64,
     pub name: String,
     pub node_key: String,
+    pub node_type: String,
+    pub status: String,
+    pub docker_status: String,
+    pub compose_available: i64,
+    pub capability_message: String,
     pub checked: bool,
 }
 
@@ -8001,6 +8006,11 @@ impl AppService {
                 n.id,
                 n.name,
                 n.node_key,
+                n.node_type,
+                n.status,
+                n.docker_status,
+                COALESCE(c.compose_available, 0) AS compose_available,
+                COALESCE(c.message, '') AS capability_message,
                 CASE
                     WHEN EXISTS(
                         SELECT 1
@@ -8026,6 +8036,7 @@ impl AppService {
                 END AS checked
             FROM nodes n
             JOIN apps a ON a.id = ?1
+            LEFT JOIN node_capabilities c ON c.node_id = n.id
             WHERE n.status != 'disabled'
                OR EXISTS(
                     SELECT 1

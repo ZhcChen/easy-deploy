@@ -2490,6 +2490,26 @@ async fn render_app_detail(
             id: node.id,
             label: node.name.clone(),
             detail: node.node_key.clone(),
+            node_type: node_type_label(&node.node_type),
+            status: node_status_label(&node.status),
+            status_tone: node_status_tone(&node.status),
+            docker_status: deploy_confirm_docker_status(&node.docker_status),
+            docker_tone: deployment_docker_tone(&node.docker_status, 0),
+            compose_status: if node.compose_available == 1 {
+                "Compose 可用"
+            } else {
+                "Compose 未确认"
+            },
+            compose_tone: if node.compose_available == 1 {
+                "success"
+            } else {
+                "neutral"
+            },
+            capability_message: if node.capability_message.trim().is_empty() {
+                "等待节点探测或能力检查".to_owned()
+            } else {
+                node.capability_message.clone()
+            },
             checked: node.checked,
         })
         .collect::<Vec<_>>();

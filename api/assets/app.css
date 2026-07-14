@@ -2228,8 +2228,88 @@ td span {
   line-height: 1.45;
 }
 
+.app-detail-tab-shell {
+  display: grid;
+  gap: 12px;
+}
+
+.app-detail-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid rgba(217, 226, 238, 0.88);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.app-detail-tab {
+  display: grid;
+  min-width: 150px;
+  min-height: 54px;
+  flex: 1 1 170px;
+  gap: 3px;
+  padding: 9px 12px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: #283548;
+  cursor: pointer;
+  text-align: left;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
+}
+
+.app-detail-tab strong,
+.app-detail-tab span {
+  display: block;
+  min-width: 0;
+}
+
+.app-detail-tab strong {
+  color: #18212f;
+  font-size: 14px;
+}
+
+.app-detail-tab span {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-detail-tab:hover,
+.app-detail-tab:focus-visible {
+  border-color: rgba(37, 99, 235, 0.24);
+  background: #ffffff;
+  outline: none;
+}
+
+.app-detail-tab.is-active {
+  border-color: rgba(37, 99, 235, 0.28);
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.11), rgba(6, 182, 212, 0.06)), #fff;
+  color: var(--accent-strong);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
+}
+
 .app-detail-layout-clean {
   grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
+}
+
+.app-detail-layout-clean[data-active-app-detail-tab="config"],
+.app-detail-layout-clean[data-active-app-detail-tab="targets"],
+.app-detail-layout-clean[data-active-app-detail-tab="history"] {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.app-detail-side[hidden],
+[data-app-detail-group][hidden] {
+  display: none !important;
 }
 
 .runtime-node-list,
@@ -2299,6 +2379,52 @@ td span {
   color: var(--text-muted);
   font-size: 12px;
   line-height: 1.45;
+}
+
+.target-node-form {
+  display: grid;
+  gap: 12px;
+}
+
+.target-node-table-wrap {
+  border-top: 1px solid rgba(217, 226, 238, 0.84);
+}
+
+.target-node-table {
+  min-width: 900px;
+}
+
+.target-node-table th:first-child,
+.target-node-table td:first-child {
+  width: 64px;
+  text-align: center;
+}
+
+.target-node-table tbody tr.is-selected td {
+  background: #f8fbff;
+}
+
+.target-node-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+}
+
+.target-node-check input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.target-node-form-footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 0 16px 16px;
 }
 
 .runtime-node-card small,

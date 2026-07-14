@@ -990,6 +990,14 @@ pub struct AppTargetChoiceRow {
     pub id: i64,
     pub label: String,
     pub detail: String,
+    pub node_type: &'static str,
+    pub status: &'static str,
+    pub status_tone: &'static str,
+    pub docker_status: String,
+    pub docker_tone: &'static str,
+    pub compose_status: &'static str,
+    pub compose_tone: &'static str,
+    pub capability_message: String,
     pub checked: bool,
 }
 
