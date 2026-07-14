@@ -17,6 +17,43 @@
     <button class="ghost-button compact-button" type="submit">重新生成计划</button>
   </form>
   {% if has_active_run %}<div class="deploy-risk-summary tone-warning"><span>当前环境不可部署</span><strong>已有部署流程正在进行</strong><p>完成或人工核对后才能创建下一次部署。</p></div>{% endif %}
+  <section class="deploy-target-overview" aria-labelledby="deploy-target-title">
+    <div class="deploy-target-header">
+      <div>
+        <h3 id="deploy-target-title">本次部署节点</h3>
+        <p>{{ target_summary }}</p>
+      </div>
+      {% if can_manage_targets %}
+        <a class="ghost-button compact-button" href="/apps/{{ app_id }}?environment_id={{ environment_id }}#deployment-targets-title">调整节点</a>
+      {% endif %}
+    </div>
+    {% if target_nodes.len() == 0 %}
+      <div class="empty-state compact-empty-state">
+        <strong>未绑定部署节点</strong>
+        <span>请先回到应用详情绑定一个或多个目标节点。</span>
+      </div>
+    {% else %}
+      <div class="target-node-grid">
+        {% for node in target_nodes %}
+          <article class="target-node-card">
+            <div class="target-node-card-header">
+              <div>
+                <strong><a class="text-link" href="{{ node.node_href }}">{{ node.name }}</a></strong>
+                <span>{{ node.node_key }} · {{ node.node_type }}</span>
+              </div>
+              <span class="badge tone-{{ node.status_tone }}">{{ node.status }}</span>
+            </div>
+            <div class="target-node-badges">
+              <span class="badge tone-{{ node.docker_tone }}">{{ node.docker_status }}</span>
+              <span class="badge tone-{{ node.compose_tone }}">{{ node.compose_status }}</span>
+            </div>
+            <p>{{ node.capability_message }}</p>
+          </article>
+        {% endfor %}
+      </div>
+    {% endif %}
+    <p class="field-hint">部署节点来自当前环境配置；调整后需要重新生成计划，计划 hash 会随节点变化。</p>
+  </section>
   <section class="deploy-plan-summary" aria-label="计划汇总"><div><strong>{{ deploy_count }}</strong><span>执行</span></div><div><strong>{{ skip_count }}</strong><span>跳过</span></div><div><strong>{{ stop_count }}</strong><span>停止</span></div></section>
   <div class="table-wrap"><table><thead><tr><th>阶段</th><th>部署单元</th><th>目标版本</th><th>动作</th><th>原因</th></tr></thead><tbody>
     {% for row in plan_rows %}<tr><td>{{ row.stage_no }}</td><td><strong>{{ row.unit_key }}</strong></td><td>{{ row.version }}</td><td><span class="badge tone-{{ row.action_tone }}">{{ row.action }}</span></td><td>{{ row.reason }}</td></tr>{% endfor %}

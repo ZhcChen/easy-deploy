@@ -73,8 +73,8 @@
     </div>
     <div>
       <span>目标节点</span>
-      <strong>{{ target_count }}</strong>
-      <small>{{ targets }}</small>
+      <strong>{{ deployment_targets.len() }}</strong>
+      <small>{{ deployment_target_summary }}</small>
     </div>
     <div>
       <span>部署目录</span>
@@ -112,6 +112,46 @@
   data-app-auto-queue-release="{{ auto_queue_release }}"
 >
   <div class="app-detail-main side-stack">
+    <section class="panel" aria-labelledby="deployment-targets-title">
+      <div class="panel-header compact">
+        <div>
+          <h2 id="deployment-targets-title">部署节点</h2>
+          <p>当前环境绑定的目标节点；应用版本部署会按这里的节点生成计划。</p>
+        </div>
+        <div class="panel-header-actions">
+          <span class="badge tone-neutral">{{ deployment_targets.len() }} 个节点</span>
+          {% if can_manage %}
+            <button class="ghost-button compact-button" type="button" data-modal-target="app-metadata-modal">编辑节点</button>
+          {% endif %}
+        </div>
+      </div>
+      {% if deployment_targets.len() == 0 %}
+        <div class="empty-state compact-empty-state">
+          <strong>未绑定部署节点</strong>
+          <span>请先选择一个或多个目标节点，否则应用版本无法部署。</span>
+        </div>
+      {% else %}
+        <div class="target-node-grid">
+          {% for node in deployment_targets %}
+            <article class="target-node-card">
+              <div class="target-node-card-header">
+                <div>
+                  <strong><a class="text-link" href="{{ node.node_href }}">{{ node.name }}</a></strong>
+                  <span>{{ node.node_key }} · {{ node.node_type }}</span>
+                </div>
+                <span class="badge tone-{{ node.status_tone }}">{{ node.status }}</span>
+              </div>
+              <div class="target-node-badges">
+                <span class="badge tone-{{ node.docker_tone }}">{{ node.docker_status }}</span>
+                <span class="badge tone-{{ node.compose_tone }}">{{ node.compose_status }}</span>
+              </div>
+              <p>{{ node.capability_message }}</p>
+            </article>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </section>
+
     <section class="panel" aria-labelledby="runtime-states-title">
       <div class="panel-header compact">
         <div>

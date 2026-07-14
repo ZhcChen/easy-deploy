@@ -25,6 +25,19 @@ pub struct ApplicationEnvironmentSummary {
 }
 
 #[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+pub struct DeploymentEnvironmentTargetSummary {
+    pub node_id: i64,
+    pub node_key: String,
+    pub node_name: String,
+    pub node_type: String,
+    pub node_status: String,
+    pub docker_status: String,
+    pub docker_available: i64,
+    pub compose_available: i64,
+    pub capability_message: String,
+}
+
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
 pub struct DeploymentUnitSummary {
     pub unit_id: i64,
     pub unit_key: String,
@@ -143,6 +156,7 @@ pub struct ApplicationDeploymentDetail {
     pub units: Vec<DeploymentUnitSummary>,
     pub releases: Vec<ApplicationReleaseSummary>,
     pub runs: Vec<DeploymentRunSummary>,
+    pub targets: Vec<DeploymentEnvironmentTargetSummary>,
 }
 
 impl DeploymentConsoleService {
@@ -193,6 +207,34 @@ impl DeploymentConsoleService {
             "#,
         )
         .bind(app_id)
+        .fetch_all(&self.db)
+        .await
+    }
+
+    pub async fn environment_targets(
+        &self,
+        environment_id: i64,
+    ) -> Result<Vec<DeploymentEnvironmentTargetSummary>, sqlx::Error> {
+        sqlx::query_as(
+            r#"
+            SELECT nodes.id AS node_id,
+                   nodes.node_key,
+                   nodes.name AS node_name,
+                   nodes.node_type,
+                   nodes.status AS node_status,
+                   nodes.docker_status,
+                   COALESCE(capabilities.docker_available, 0) AS docker_available,
+                   COALESCE(capabilities.compose_available, 0) AS compose_available,
+                   COALESCE(capabilities.message, '') AS capability_message
+            FROM app_environment_targets targets
+            JOIN nodes ON nodes.id = targets.node_id
+            LEFT JOIN node_capabilities capabilities ON capabilities.node_id = nodes.id
+            WHERE targets.environment_id = ?1
+              AND nodes.status != 'disabled'
+            ORDER BY targets.node_id
+            "#,
+        )
+        .bind(environment_id)
         .fetch_all(&self.db)
         .await
     }
@@ -405,11 +447,16 @@ impl DeploymentConsoleService {
             Some(environment_id) => self.environment_units(app_id, environment_id).await?,
             None => Vec::new(),
         };
+        let targets = match environment_id {
+            Some(environment_id) => self.environment_targets(environment_id).await?,
+            None => Vec::new(),
+        };
         Ok(ApplicationDeploymentDetail {
             environments,
             units,
             releases: self.application_releases(app_id, 30).await?,
             runs: self.deployment_runs(app_id, 30).await?,
+            targets,
         })
     }
 }

@@ -927,6 +927,39 @@ a {
   font-weight: 650;
 }
 
+.deploy-target-overview {
+  margin: 0 0 18px;
+  border: 1px solid rgba(217, 226, 238, 0.88);
+  border-radius: 10px;
+  background: #fff;
+}
+
+.deploy-target-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px 16px;
+  border-bottom: 1px solid rgba(217, 226, 238, 0.84);
+}
+
+.deploy-target-header h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.deploy-target-header p {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.deploy-target-overview > .field-hint {
+  display: block;
+  padding: 0 16px 14px;
+}
+
 .deploy-plan-summary {
   display: flex;
   gap: 20px;
@@ -1542,6 +1575,14 @@ td span,
 .panel-actions {
   flex: 0 0 auto;
   justify-content: flex-end;
+}
+
+.panel-header-actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .app-config-transfer-actions {
@@ -2198,7 +2239,15 @@ td span {
   padding: 14px 16px 16px;
 }
 
+.target-node-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+  padding: 14px 16px 16px;
+}
+
 .runtime-node-card,
+.target-node-card,
 .history-row {
   min-width: 0;
   padding: 13px 14px;
@@ -2208,6 +2257,7 @@ td span {
 }
 
 .runtime-node-header,
+.target-node-card-header,
 .history-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -2216,6 +2266,7 @@ td span {
 }
 
 .runtime-node-header > div,
+.target-node-card-header > div,
 .history-row > div {
   min-width: 0;
 }
@@ -2223,15 +2274,31 @@ td span {
 .runtime-node-card strong,
 .runtime-node-card span,
 .runtime-node-card small,
+.target-node-card strong,
+.target-node-card span,
 .history-row strong,
 .history-row span {
   display: block;
+}
+
+.target-node-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
 }
 
 .runtime-node-card p {
   margin: 10px 0;
   font-size: 13px;
   line-height: 1.5;
+}
+
+.target-node-card p {
+  margin: 9px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .runtime-node-card small,

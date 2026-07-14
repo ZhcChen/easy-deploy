@@ -39,7 +39,7 @@ use crate::{
         parse_release_package_name_for_service, release_publish_mode_label,
     },
     auth::{
-        API_TOKENS_MANAGE, API_TOKENS_VIEW, APPS_STATUS, APPS_VIEW, ARTIFACTS_UPLOAD,
+        API_TOKENS_MANAGE, API_TOKENS_VIEW, APPS_STATUS, APPS_UPDATE, APPS_VIEW, ARTIFACTS_UPLOAD,
         ARTIFACTS_VIEW, AUDIT_VIEW, AuditLogFilter, AuthService, CurrentSession, DASHBOARD_VIEW,
         DEPLOYMENTS_CLEANUP, LoginInput, NODES_INSTALL, NODES_MANAGE, NODES_VIEW, PROFILE_VIEW,
         RBAC_ACCOUNTS_VIEW, RBAC_PERMISSIONS_VIEW, RBAC_ROLES_VIEW, RBAC_SESSIONS_VIEW,
@@ -79,18 +79,18 @@ use templates::{
     DeployPlanFileRow, DeployPlanStepRow, DeployPreflightActionRow, DeployPreflightCheckRow,
     DeployPreflightRow, DeploymentAccessTemplate, DeploymentEnvironmentRow,
     DeploymentHistoryLogRow, DeploymentHistoryTemplate, DeploymentHistoryUnitRow,
-    DeploymentTaskControlView, DeploymentUnitRow, EnvironmentDeploymentRunRow, EventLogRow,
-    EventsTemplate, LoginTemplate, NavItem, NavSection, NodeAppRuntimeRow, NodeCapabilityGuideRow,
-    NodeCheckHistoryRow, NodeCredentialOptionRow, NodeCredentialPageRow, NodeCredentialsTemplate,
-    NodeDetailModalRow, NodeDetailTemplate, NodePageRow, NodeRow, NodeTaskRow, NodesTemplate,
-    PermissionGroup, PermissionRow, PermissionsTemplate, ProfileTemplate, RbacFilterOptionRow,
-    RedisConfigRow, RedisConfigView, ReleaseQueueRow, RoleRow, RolesTemplate,
-    ServiceLogTailOptionRow, ServiceLogsTemplate, ServiceNodeLinkRow, ServicePageRow,
-    ServicesTemplate, SessionRow, SessionsTemplate, SettingsRow, SettingsTemplate, SummaryItem,
-    TaskAppFilterRow, TaskDetailTemplate, TaskDetailView, TaskExecutionGuideView,
-    TaskFilterOptionRow, TaskLogRow, TaskNodeResultRow, TaskPageRow, TaskPhaseGroupRow,
-    TaskPhaseStepRow, TaskReturnActionView, TaskRow, TaskStepRow, TasksTemplate, TemplateCardRow,
-    TemplatesTemplate, render_html,
+    DeploymentTargetNodeRow, DeploymentTaskControlView, DeploymentUnitRow,
+    EnvironmentDeploymentRunRow, EventLogRow, EventsTemplate, LoginTemplate, NavItem, NavSection,
+    NodeAppRuntimeRow, NodeCapabilityGuideRow, NodeCheckHistoryRow, NodeCredentialOptionRow,
+    NodeCredentialPageRow, NodeCredentialsTemplate, NodeDetailModalRow, NodeDetailTemplate,
+    NodePageRow, NodeRow, NodeTaskRow, NodesTemplate, PermissionGroup, PermissionRow,
+    PermissionsTemplate, ProfileTemplate, RbacFilterOptionRow, RedisConfigRow, RedisConfigView,
+    ReleaseQueueRow, RoleRow, RolesTemplate, ServiceLogTailOptionRow, ServiceLogsTemplate,
+    ServiceNodeLinkRow, ServicePageRow, ServicesTemplate, SessionRow, SessionsTemplate,
+    SettingsRow, SettingsTemplate, SummaryItem, TaskAppFilterRow, TaskDetailTemplate,
+    TaskDetailView, TaskExecutionGuideView, TaskFilterOptionRow, TaskLogRow, TaskNodeResultRow,
+    TaskPageRow, TaskPhaseGroupRow, TaskPhaseStepRow, TaskReturnActionView, TaskRow, TaskStepRow,
+    TasksTemplate, TemplateCardRow, TemplatesTemplate, render_html,
 };
 
 const LOGO_SVG: &str = include_str!("../../assets/logo.svg");
@@ -1548,6 +1548,8 @@ async fn application_deploy_page(
     if mode == DeploymentMode::Force && !session.can(SERVICES_DEPLOY_FORCE) {
         return forbidden();
     }
+    let target_nodes = deployment_target_rows(&console.targets);
+    let target_summary = deployment_target_summary(&console.targets);
     let plan = match state
         .deployment_orchestrator()
         .preview(query.environment_id, selected_release_id, mode)
@@ -1629,6 +1631,8 @@ async fn application_deploy_page(
         } else {
             "正常部署"
         },
+        target_summary: &target_summary,
+        target_nodes: &target_nodes,
         plan_hash: &plan.plan_hash,
         plan_rows: &plan_rows,
         deploy_count,
@@ -1638,6 +1642,7 @@ async fn application_deploy_page(
         active_run_id: environment.active_run_id.unwrap_or_default(),
         executor_available: state.deployment_executor().is_some(),
         can_force: session.can(SERVICES_DEPLOY_FORCE),
+        can_manage_targets: session.can(APPS_UPDATE),
     })
 }
 
@@ -2265,6 +2270,8 @@ async fn render_app_detail(
             selected: environment.environment_id == selected_environment_id,
         })
         .collect::<Vec<_>>();
+    let deployment_targets = deployment_target_rows(&console.targets);
+    let deployment_target_summary = deployment_target_summary(&console.targets);
     let deployment_units = console
         .units
         .iter()
@@ -2513,7 +2520,6 @@ async fn render_app_detail(
         status: app_enabled_status_label(&detail.app.status),
         status_tone: app_enabled_status_tone(&detail.app.status),
         targets: detail.app.target_names.as_deref().unwrap_or("未绑定节点"),
-        target_count: detail.app.target_count,
         compose_content: &detail.compose_content,
         env_content: &detail.env_content,
         deploy_script_pre_deploy: &detail.deploy_scripts.pre_deploy,
@@ -2538,6 +2544,8 @@ async fn render_app_detail(
         runtime_states: &runtime_states,
         redis_config,
         target_choices: &target_choices,
+        deployment_targets: &deployment_targets,
+        deployment_target_summary: &deployment_target_summary,
         can_manage,
         can_deploy: session.can(SERVICES_DEPLOY) && app_enabled && app_idle,
         can_logs: session.can(SERVICES_LOGS),
@@ -6894,6 +6902,62 @@ fn deploy_confirm_docker_status(status: &str) -> String {
         "unavailable" => "Docker 不可用".to_owned(),
         "unknown" | "" => "Docker 未探测".to_owned(),
         other => other.to_owned(),
+    }
+}
+
+fn deployment_target_rows(
+    targets: &[crate::deployment_console::DeploymentEnvironmentTargetSummary],
+) -> Vec<DeploymentTargetNodeRow> {
+    targets
+        .iter()
+        .map(|node| DeploymentTargetNodeRow {
+            node_href: format!("/nodes/{}", node.node_id),
+            name: node.node_name.clone(),
+            node_key: node.node_key.clone(),
+            node_type: node_type_label(&node.node_type),
+            status: node_status_label(&node.node_status),
+            status_tone: node_status_tone(&node.node_status),
+            docker_status: deploy_confirm_docker_status(&node.docker_status),
+            docker_tone: deployment_docker_tone(&node.docker_status, node.docker_available),
+            compose_status: if node.compose_available == 1 {
+                "Compose 可用"
+            } else {
+                "Compose 未确认"
+            },
+            compose_tone: if node.compose_available == 1 {
+                "success"
+            } else {
+                "neutral"
+            },
+            capability_message: if node.capability_message.trim().is_empty() {
+                "等待节点探测或能力检查".to_owned()
+            } else {
+                node.capability_message.clone()
+            },
+        })
+        .collect()
+}
+
+fn deployment_target_summary(
+    targets: &[crate::deployment_console::DeploymentEnvironmentTargetSummary],
+) -> String {
+    if targets.is_empty() {
+        return "未绑定部署节点".to_owned();
+    }
+    targets
+        .iter()
+        .map(|node| node.node_name.as_str())
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
+fn deployment_docker_tone(status: &str, docker_available: i64) -> &'static str {
+    if docker_available == 1 || status == "available" {
+        "success"
+    } else if status == "unavailable" || status == "failed" {
+        "warning"
+    } else {
+        "neutral"
     }
 }
 

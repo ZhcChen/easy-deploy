@@ -8001,18 +8001,43 @@ impl AppService {
                 n.id,
                 n.name,
                 n.node_key,
-                EXISTS(
-                    SELECT 1
-                    FROM app_targets t
-                    WHERE t.app_id = ?1
-                      AND t.node_id = n.id
-                ) AS checked
+                CASE
+                    WHEN EXISTS(
+                        SELECT 1
+                        FROM app_environment_targets et
+                        JOIN app_environments e ON e.id = et.environment_id
+                        WHERE e.app_id = a.id
+                          AND e.environment_key = a.environment
+                    )
+                    THEN EXISTS(
+                        SELECT 1
+                        FROM app_environment_targets et
+                        JOIN app_environments e ON e.id = et.environment_id
+                        WHERE e.app_id = a.id
+                          AND e.environment_key = a.environment
+                          AND et.node_id = n.id
+                    )
+                    ELSE EXISTS(
+                        SELECT 1
+                        FROM app_targets t
+                        WHERE t.app_id = a.id
+                          AND t.node_id = n.id
+                    )
+                END AS checked
             FROM nodes n
+            JOIN apps a ON a.id = ?1
             WHERE n.status != 'disabled'
                OR EXISTS(
                     SELECT 1
+                    FROM app_environment_targets et
+                    JOIN app_environments e ON e.id = et.environment_id
+                    WHERE e.app_id = a.id
+                      AND et.node_id = n.id
+               )
+               OR EXISTS(
+                    SELECT 1
                     FROM app_targets t
-                    WHERE t.app_id = ?1
+                    WHERE t.app_id = a.id
                       AND t.node_id = n.id
                )
             ORDER BY CASE n.node_key WHEN 'local' THEN 0 ELSE 1 END, n.id DESC
@@ -9148,6 +9173,7 @@ impl AppService {
         let deploy_strategy = normalize_deploy_strategy(&input.deploy_strategy)?;
         let release_source = normalize_release_source(&input.release_source)?;
         let auto_queue_release = input.auto_queue_release;
+        let previous_environment = app.environment.clone();
         if input.target_node_ids.is_empty() {
             return Err(AppError::InvalidInput(
                 "至少需要选择一个目标节点".to_owned(),
@@ -9244,12 +9270,12 @@ impl AppService {
             .bind(app.id)
             .execute(&mut *tx)
             .await?;
-        for node_id in target_node_ids {
+        for node_id in &target_node_ids {
             sqlx::query(
                 "INSERT INTO app_targets(app_id, node_id, target_role) VALUES (?1, ?2, 'primary')",
             )
             .bind(app.id)
-            .bind(node_id)
+            .bind(*node_id)
             .execute(&mut *tx)
             .await?;
             sqlx::query(
@@ -9257,10 +9283,10 @@ impl AppService {
                 INSERT INTO app_runtime_states(app_id, node_id, runtime_status, message)
                 VALUES (?1, ?2, 'unknown', '等待首次部署')
                 ON CONFLICT(app_id, node_id) DO NOTHING
-                "#,
+            "#,
             )
             .bind(app.id)
-            .bind(node_id)
+            .bind(*node_id)
             .execute(&mut *tx)
             .await?;
         }
@@ -9278,6 +9304,85 @@ impl AppService {
         .bind(app.id)
         .execute(&mut *tx)
         .await?;
+        let environment_name = match app.environment.as_str() {
+            "production" => "正式环境",
+            "test" | "testing" => "测试环境",
+            _ => "默认环境",
+        };
+        let environment_id = if let Some(environment_id) = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM app_environments WHERE app_id = ?1 AND environment_key = ?2",
+        )
+        .bind(app.id)
+        .bind(&app.environment)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            sqlx::query(
+                r#"
+                UPDATE app_environments
+                SET name = ?2,
+                    status = 'ready',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                "#,
+            )
+            .bind(environment_id)
+            .bind(environment_name)
+            .execute(&mut *tx)
+            .await?;
+            environment_id
+        } else if let Some(environment_id) = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM app_environments WHERE app_id = ?1 AND environment_key = ?2",
+        )
+        .bind(app.id)
+        .bind(&previous_environment)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            sqlx::query(
+                r#"
+                UPDATE app_environments
+                SET environment_key = ?2,
+                    name = ?3,
+                    status = 'ready',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                "#,
+            )
+            .bind(environment_id)
+            .bind(&app.environment)
+            .bind(environment_name)
+            .execute(&mut *tx)
+            .await?;
+            environment_id
+        } else {
+            sqlx::query(
+                r#"
+                INSERT INTO app_environments(
+                    app_id, environment_key, name, status, max_parallel_units
+                ) VALUES (?1, ?2, ?3, 'ready', 3)
+                "#,
+            )
+            .bind(app.id)
+            .bind(&app.environment)
+            .bind(environment_name)
+            .execute(&mut *tx)
+            .await?
+            .last_insert_rowid()
+        };
+        sqlx::query("DELETE FROM app_environment_targets WHERE environment_id = ?1")
+            .bind(environment_id)
+            .execute(&mut *tx)
+            .await?;
+        for node_id in &target_node_ids {
+            sqlx::query(
+                "INSERT INTO app_environment_targets(environment_id, node_id, target_role) VALUES (?1, ?2, 'primary')",
+            )
+            .bind(environment_id)
+            .bind(*node_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         if let Some(config) = &binary_config_for_metadata {
             upsert_binary_config(&mut tx, app.id, config).await?;
         }
@@ -14154,6 +14259,55 @@ mod tests {
         .await
         .expect("insert ssh node")
         .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn update_app_metadata_syncs_environment_targets_for_application_deploy() {
+        let (apps, db, data_dir) = app_service().await;
+        let ssh_node_id = create_ssh_target_node(&db, &data_dir).await;
+        let app_id = create_manual_compose_app(&apps, "metadata-target-sync").await;
+
+        apps.update_app_metadata(UpdateAppMetadataInput {
+            app_id,
+            name: "节点同步应用".to_owned(),
+            description: "验证应用版本部署目标节点同步".to_owned(),
+            environment: "production".to_owned(),
+            work_dir: "/opt/easy-deploy/apps/metadata-target-sync".to_owned(),
+            deploy_strategy: "rolling_continue".to_owned(),
+            release_source: "package_upload".to_owned(),
+            auto_queue_release: false,
+            target_node_ids: vec![ssh_node_id, 1],
+        })
+        .await
+        .expect("update app metadata");
+
+        let app_target_ids = sqlx::query_scalar::<_, i64>(
+            "SELECT node_id FROM app_targets WHERE app_id = ?1 ORDER BY node_id",
+        )
+        .bind(app_id)
+        .fetch_all(&db)
+        .await
+        .expect("read app targets");
+        assert_eq!(app_target_ids, vec![1, ssh_node_id]);
+
+        let environment = sqlx::query_as::<_, (i64, String, String)>(
+            "SELECT id, environment_key, name FROM app_environments WHERE app_id = ?1",
+        )
+        .bind(app_id)
+        .fetch_one(&db)
+        .await
+        .expect("read app environment");
+        assert_eq!(environment.1, "production");
+        assert_eq!(environment.2, "正式环境");
+
+        let environment_target_ids = sqlx::query_scalar::<_, i64>(
+            "SELECT node_id FROM app_environment_targets WHERE environment_id = ?1 ORDER BY node_id",
+        )
+        .bind(environment.0)
+        .fetch_all(&db)
+        .await
+        .expect("read environment targets");
+        assert_eq!(environment_target_ids, vec![1, ssh_node_id]);
     }
 
     async fn upload_manual_release(

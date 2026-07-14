@@ -89,7 +89,6 @@ pub struct AppDetailTemplate<'a> {
     pub status: &'a str,
     pub status_tone: &'a str,
     pub targets: &'a str,
-    pub target_count: i64,
     pub compose_content: &'a str,
     pub env_content: &'a str,
     pub deploy_script_pre_deploy: &'a str,
@@ -114,6 +113,8 @@ pub struct AppDetailTemplate<'a> {
     pub runtime_states: &'a [AppRuntimeStateRow],
     pub redis_config: Option<RedisConfigView>,
     pub target_choices: &'a [AppTargetChoiceRow],
+    pub deployment_targets: &'a [DeploymentTargetNodeRow],
+    pub deployment_target_summary: &'a str,
     pub can_manage: bool,
     pub can_deploy: bool,
     pub can_logs: bool,
@@ -215,6 +216,20 @@ pub struct DeployConfirmTargetNodeRow {
     pub status_tone: &'static str,
     pub docker_status: String,
     pub preflight_hint: &'static str,
+}
+
+pub struct DeploymentTargetNodeRow {
+    pub node_href: String,
+    pub name: String,
+    pub node_key: String,
+    pub node_type: &'static str,
+    pub status: &'static str,
+    pub status_tone: &'static str,
+    pub docker_status: String,
+    pub docker_tone: &'static str,
+    pub compose_status: &'static str,
+    pub compose_tone: &'static str,
+    pub capability_message: String,
 }
 
 pub struct DeployPlanStepRow {
@@ -685,6 +700,8 @@ pub struct ApplicationDeployTemplate<'a> {
     pub selected_release_id: i64,
     pub mode: &'a str,
     pub mode_label: &'a str,
+    pub target_summary: &'a str,
+    pub target_nodes: &'a [DeploymentTargetNodeRow],
     pub plan_hash: &'a str,
     pub plan_rows: &'a [ApplicationDeployPlanRow],
     pub deploy_count: usize,
@@ -694,6 +711,7 @@ pub struct ApplicationDeployTemplate<'a> {
     pub active_run_id: i64,
     pub executor_available: bool,
     pub can_force: bool,
+    pub can_manage_targets: bool,
 }
 
 pub struct ApplicationDeployPlanRow {
