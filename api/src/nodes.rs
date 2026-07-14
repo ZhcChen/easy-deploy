@@ -509,6 +509,50 @@ ED_PROBE_END=docker_info
     }
 
     #[test]
+    fn public_ip_probe_script_reports_failure_without_exiting_shell() {
+        assert!(!PUBLIC_IP_PROBE_SCRIPT.contains("exit "));
+        assert!(PUBLIC_IP_PROBE_SCRIPT.contains(r#"test "$found" = "1""#));
+    }
+
+    #[test]
+    fn ssh_probe_result_allows_missing_network_probe_sections() {
+        let result = ssh_probe_result_from_output_clean(
+            "\
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=work_dir
+/opt/easy-deploy/apps
+ED_PROBE_END=work_dir
+ED_PROBE_STATUS=missing
+ED_PROBE_FIELD=public_ip
+
+ED_PROBE_END=public_ip
+ED_PROBE_STATUS=missing
+ED_PROBE_FIELD=private_ips
+
+ED_PROBE_END=private_ips
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=docker_version
+Docker version 26.1.0
+ED_PROBE_END=docker_version
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=docker_info
+Server Version: 26.1.0
+ED_PROBE_END=docker_info
+ED_PROBE_STATUS=ok
+ED_PROBE_FIELD=compose_version
+Docker Compose version v2.27.0
+ED_PROBE_END=compose_version
+",
+        );
+
+        assert_eq!(result.status, "passed");
+        assert!(result.public_ip.is_empty());
+        assert!(result.private_ips.is_empty());
+        assert_eq!(result.docker_version, "Docker version 26.1.0");
+        assert_eq!(result.compose_version, "Docker Compose version v2.27.0");
+    }
+
+    #[test]
     fn ssh_probe_result_filters_network_probe_noise() {
         let result = ssh_probe_result_from_output_clean(
             "\
@@ -1561,19 +1605,21 @@ fn is_systemd_available(value: &str) -> bool {
     !value.is_empty() && !value.contains(':')
 }
 
-const PUBLIC_IP_PROBE_SCRIPT: &str = r#"for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+const PUBLIC_IP_PROBE_SCRIPT: &str = r#"found=""
+for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+  value=""
   if command -v curl >/dev/null 2>&1; then
     value="$(curl -fsS --max-time 3 "$url" 2>/dev/null | head -n 1 | tr -d '\r\n')"
   elif command -v wget >/dev/null 2>&1; then
     value="$(wget -qO- -T 3 "$url" 2>/dev/null | head -n 1 | tr -d '\r\n')"
   else
-    exit 1
+    break
   fi
   case "$value" in
-    [0-9]*.[0-9]*.[0-9]*.[0-9]*) printf '%s\n' "$value"; exit 0 ;;
+    [0-9]*.[0-9]*.[0-9]*.[0-9]*) printf '%s\n' "$value"; found="1"; break ;;
   esac
 done
-exit 1"#;
+test "$found" = "1""#;
 
 const PRIVATE_IPS_PROBE_SCRIPT: &str = r#"ips=""
 if command -v ip >/dev/null 2>&1; then
