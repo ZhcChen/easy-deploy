@@ -8153,7 +8153,7 @@ fn redis_config_view(compose_content: &str, env_content: &str) -> Option<RedisCo
         compose_content.contains("REDIS_MAXCLIENTS") || compose_content.contains("--maxclients");
     let (maxclients, maxclients_tone, maxclients_note) = if maxclients_explicit {
         (
-            env_or_compose_default(&env, compose_content, "REDIS_MAXCLIENTS", "10000"),
+            env_or_compose_default(&env, compose_content, "REDIS_MAXCLIENTS", "5000"),
             "neutral",
             None,
         )
@@ -15005,9 +15005,9 @@ mod tests {
             .env_content
             .replace("REDIS_PASSWORD=change-me", "REDIS_PASSWORD=redis-secret")
             .replace("REDIS_MAXMEMORY=1024mb", "REDIS_MAXMEMORY=2048mb")
-            .replace("REDIS_MAXCLIENTS=10000\n", "");
+            .replace("REDIS_MAXCLIENTS=5000\n", "");
         let compose_content = rendered.compose_content.replace(
-            "      - \"--maxclients\"\n      - \"${REDIS_MAXCLIENTS:-10000}\"\n",
+            "      - \"--maxclients\"\n      - \"${REDIS_MAXCLIENTS:-5000}\"\n",
             "",
         );
         let app_id = app

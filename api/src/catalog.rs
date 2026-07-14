@@ -188,7 +188,7 @@ fn render_redis(service_name: &str, port: u16) -> RenderedTemplate {
       - "--maxmemory-policy"
       - "${REDIS_MAXMEMORY_POLICY:-allkeys-lru}"
       - "--maxclients"
-      - "${REDIS_MAXCLIENTS:-10000}"
+      - "${REDIS_MAXCLIENTS:-5000}"
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
       TZ: ${TZ:-Asia/Shanghai}
@@ -206,13 +206,17 @@ fn render_redis(service_name: &str, port: u16) -> RenderedTemplate {
       options:
         max-size: "${DOCKER_LOG_MAX_SIZE:-200m}"
         max-file: "${DOCKER_LOG_MAX_FILE:-5}"
+    ulimits:
+      nofile:
+        soft: ${REDIS_NOFILE_SOFT_LIMIT:-10032}
+        hard: ${REDIS_NOFILE_HARD_LIMIT:-10032}
 "#
     .replace("{service_name}", service_name)
     .replace("{port}", &port.to_string());
     RenderedTemplate {
         compose_content,
         env_content: format!(
-            "REDIS_IMAGE=redis:7-alpine\nREDIS_BIND_IP=127.0.0.1\nREDIS_PORT={port}\nREDIS_PASSWORD=change-me\nREDIS_MAXMEMORY=1024mb\nREDIS_MAXMEMORY_POLICY=allkeys-lru\nREDIS_MAXCLIENTS=10000\nDOCKER_LOG_MAX_SIZE=200m\nDOCKER_LOG_MAX_FILE=5\n"
+            "REDIS_IMAGE=redis:7-alpine\nREDIS_BIND_IP=127.0.0.1\nREDIS_PORT={port}\nREDIS_PASSWORD=change-me\nREDIS_MAXMEMORY=1024mb\nREDIS_MAXMEMORY_POLICY=allkeys-lru\nREDIS_MAXCLIENTS=5000\nREDIS_NOFILE_SOFT_LIMIT=10032\nREDIS_NOFILE_HARD_LIMIT=10032\nDOCKER_LOG_MAX_SIZE=200m\nDOCKER_LOG_MAX_FILE=5\n"
         ),
         deploy_scripts: DeployScriptSet {
             pre_deploy: "set -eu\nmkdir -p data\n".to_owned(),
@@ -616,7 +620,14 @@ mod tests {
         .expect("render redis");
         assert!(redis.compose_content.contains("--requirepass"));
         assert!(redis.compose_content.contains("--maxclients"));
-        assert!(redis.env_content.contains("REDIS_MAXCLIENTS=10000"));
+        assert!(redis.compose_content.contains("REDIS_MAXCLIENTS:-5000"));
+        assert!(
+            redis
+                .compose_content
+                .contains("soft: ${REDIS_NOFILE_SOFT_LIMIT:-10032}")
+        );
+        assert!(redis.env_content.contains("REDIS_MAXCLIENTS=5000"));
+        assert!(redis.env_content.contains("REDIS_NOFILE_SOFT_LIMIT=10032"));
         assert!(
             redis
                 .compose_content
