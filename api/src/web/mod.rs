@@ -2513,6 +2513,7 @@ async fn render_app_detail(
             checked: node.checked,
         })
         .collect::<Vec<_>>();
+    let target_available_count = target_choices.iter().filter(|node| !node.checked).count();
     render_html(AppDetailTemplate {
         product_name: "Easy Deploy",
         css: include_str!("../../assets/app.css"),
@@ -2564,6 +2565,7 @@ async fn render_app_detail(
         runtime_states: &runtime_states,
         redis_config,
         target_choices: &target_choices,
+        target_available_count,
         deployment_targets: &deployment_targets,
         deployment_target_summary: &deployment_target_summary,
         can_manage,

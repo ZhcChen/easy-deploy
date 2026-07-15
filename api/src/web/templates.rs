@@ -113,6 +113,7 @@ pub struct AppDetailTemplate<'a> {
     pub runtime_states: &'a [AppRuntimeStateRow],
     pub redis_config: Option<RedisConfigView>,
     pub target_choices: &'a [AppTargetChoiceRow],
+    pub target_available_count: usize,
     pub deployment_targets: &'a [DeploymentTargetNodeRow],
     pub deployment_target_summary: &'a str,
     pub can_manage: bool,

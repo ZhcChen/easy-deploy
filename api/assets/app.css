@@ -2426,10 +2426,21 @@ td span {
   min-width: 900px;
 }
 
-.target-node-table th:first-child,
-.target-node-table td:first-child {
+.target-node-candidate-table th:first-child,
+.target-node-candidate-table td:first-child {
   width: 64px;
   text-align: center;
+}
+
+.target-node-current-table th:first-child,
+.target-node-current-table td:first-child {
+  width: 260px;
+  text-align: left;
+}
+
+.target-node-current-table th:last-child,
+.target-node-current-table td:last-child {
+  width: 112px;
 }
 
 .target-node-table tbody tr.is-selected td {
@@ -2457,6 +2468,19 @@ td span {
   flex-wrap: wrap;
   gap: 10px;
   padding: 0 16px 16px;
+}
+
+.target-node-action-form {
+  margin: 0;
+}
+
+.target-node-actions-cell {
+  white-space: nowrap;
+}
+
+.target-node-modal-table-wrap {
+  max-height: min(52vh, 520px);
+  overflow: auto;
 }
 
 .runtime-node-card small,
