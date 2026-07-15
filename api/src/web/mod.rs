@@ -2231,7 +2231,6 @@ async fn render_app_detail(
     let deployment_target_summary = deployment_target_summary(&console.targets);
     let latest_unit_config = latest_public_app_config_document(state, detail.app.id).await;
     let unit_config_previews = build_unit_config_preview_map(latest_unit_config.as_ref());
-    let has_unit_config_previews = !unit_config_previews.is_empty();
     let deployment_units = console
         .units
         .iter()
@@ -2268,6 +2267,8 @@ async fn render_app_detail(
                 has_config_preview: preview.has_config_preview,
                 compose_content: preview.compose_content,
                 has_compose_content: preview.has_compose_content,
+                shared_env_content: detail.env_content.clone(),
+                has_shared_env_content: !detail.env_content.trim().is_empty(),
                 health_check_label: preview.health_check_label,
                 health_check_detail: preview.health_check_detail,
                 health_check_json: preview.health_check_json,
@@ -2499,7 +2500,6 @@ async fn render_app_detail(
         health_expected_status: detail.health_check.expected_status,
         deployment_runs: &deployment_runs,
         deployment_units: &deployment_units,
-        has_unit_config_previews,
         application_releases: &application_releases,
         environment_runs: &environment_runs,
         selected_environment_id,
@@ -15378,9 +15378,9 @@ mod tests {
             .await
             .expect("read body");
         let html = String::from_utf8_lossy(&body);
-        assert!(html.contains("运行配置与脚本"));
         assert!(html.contains("部署单元"));
         assert!(html.contains("部署记录"));
+        assert!(!html.contains("运行配置与脚本"));
         assert!(!html.contains("versionCode 1002003"));
         assert!(!html.contains(&format!("/apps/{app_id}/binary/upload")));
         assert!(!html.contains("二进制配置"));
@@ -15430,6 +15430,7 @@ mod tests {
         assert!(!html.contains("部署操作"));
         assert!(!html.contains("部署前差异"));
         assert!(!html.contains("状态、版本与部署操作"));
+        assert!(!html.contains("运行配置与脚本"));
     }
 
     #[tokio::test]
@@ -15519,10 +15520,10 @@ mod tests {
         assert!(html.contains("deployment-unit-config-modal-"));
         assert!(html.contains("来源 config#100"));
         assert!(html.contains("compose.yaml"));
-        assert!(html.contains("应用级公共配置"));
-        assert!(html.contains("应用级钩子（预留）"));
-        assert!(html.contains("公共 .env"));
-        assert!(!html.contains("应用级兼容配置"));
+        assert!(html.contains("共享 .env"));
+        assert!(html.contains("当前所有部署单元共享这份应用级 .env。"));
+        assert!(html.contains("RUST_LOG=info"));
+        assert!(!html.contains("应用级公共配置"));
     }
 
     #[tokio::test]

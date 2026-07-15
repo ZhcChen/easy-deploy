@@ -132,16 +132,6 @@
   id="app-detail-tab-content"
   data-app-detail-tab-content
   data-active-app-detail-tab="basic"
-  data-app-config-transfer
-  data-app-id="{{ id }}"
-  data-app-name="{{ name }}"
-  data-app-key="{{ app_key }}"
-  data-app-type="{{ app_type }}"
-  data-app-environment="{{ environment }}"
-  data-app-work-dir="{{ work_dir }}"
-  data-app-deploy-strategy="{{ deploy_strategy }}"
-  data-app-release-source="{{ release_source }}"
-  data-app-auto-queue-release="{{ auto_queue_release }}"
 >
   <div class="app-detail-main side-stack">
     <section class="panel" id="app-detail-panel-targets" aria-labelledby="deployment-targets-title" role="tabpanel" data-app-detail-group="targets">
@@ -420,97 +410,6 @@
       {% endif %}
     </section>
 
-    <section class="panel panel-large config-workbench-panel" aria-labelledby="config-title" data-app-detail-group="config">
-      <details class="runtime-file-details config-workbench-details">
-        <summary>
-          <span>{% if has_unit_config_previews %}应用级公共配置{% else %}运行配置与脚本{% endif %}</span>
-          <small>{% if has_unit_config_previews %}多部署单元应用只在这里维护公共 .env；单元 compose、健康检查和脚本请到上方部署单元查看{% else %}compose.yaml、.env、部署脚本；低频修改，默认收起{% endif %}</small>
-        </summary>
-        <div>
-          <div class="panel-header compact nested-panel-header">
-            <div>
-              <h2 id="config-title">{% if has_unit_config_previews %}应用级公共配置{% else %}运行配置{% endif %}</h2>
-              <p>{% if has_unit_config_previews %}这里只维护跨单元共享的公共 .env；单元级 compose、脚本和健康检查统一从上方“部署单元”列表进入。{% else %}修改前建议先复制配置；保存后会生成新的配置快照。{% endif %}</p>
-            </div>
-            <div class="panel-actions app-config-transfer-actions">
-              <button class="ghost-button compact-button" type="button" data-app-config-export>复制配置</button>
-              {% if can_manage %}
-                <button class="ghost-button compact-button" type="button" data-app-config-import>导入配置</button>
-              {% endif %}
-              <span class="config-transfer-status" data-config-transfer-status aria-live="polite"></span>
-            </div>
-          </div>
-          <form class="panel-form config-form config-editor-form" method="post" action="/apps/{{ id }}/config">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <input type="hidden" name="health_check_kind" value="{{ health_check_kind }}">
-            <input type="hidden" name="health_endpoint" value="{{ health_endpoint }}">
-            <input type="hidden" name="health_timeout_secs" value="{{ health_timeout_secs }}">
-            <input type="hidden" name="health_expected_status" value="{{ health_expected_status }}">
-            {% if has_unit_config_previews %}
-              <div class="app-compat-note form-span-all">
-                <strong>公共 .env 入口</strong>
-                <span>平台负责单元编排；单元级 compose、脚本和健康检查请从上方部署单元列表进入“查看配置”。</span>
-              </div>
-              <textarea name="compose_content" hidden>{{ compose_content }}</textarea>
-              <textarea name="deploy_script_pre_deploy" hidden>{{ deploy_script_pre_deploy }}</textarea>
-              <textarea name="deploy_script_deploy" hidden>{{ deploy_script_deploy }}</textarea>
-              <textarea name="deploy_script_post_deploy" hidden>{{ deploy_script_post_deploy }}</textarea>
-              <textarea name="deploy_script_switch_traffic" hidden>{{ deploy_script_switch_traffic }}</textarea>
-              <textarea name="deploy_script_cleanup" hidden>{{ deploy_script_cleanup }}</textarea>
-              <label class="form-span-all">
-                公共 .env
-                <textarea name="env_content" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ env_content }}</textarea>
-              </label>
-              <div class="app-compat-note form-span-all">
-                <strong>应用级钩子（预留）</strong>
-                <span>后续这里只放部署前一次、全部单元完成后、失败收尾这类跨单元一次性动作，不负责单元顺序、跳过和状态判断。</span>
-              </div>
-            {% else %}
-              <label>
-                compose.yaml
-                <textarea name="compose_content" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ compose_content }}</textarea>
-              </label>
-              <label>
-                .env
-                <textarea name="env_content" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ env_content }}</textarea>
-              </label>
-              <details class="config-advanced-details deploy-script-details form-span-all">
-                <summary>
-                  <span>部署脚本</span>
-                  <small>pre_deploy / deploy / post_deploy / switch_traffic / cleanup</small>
-                </summary>
-                <div class="advanced-form-grid deploy-script-grid">
-                  <label>
-                    发布前脚本
-                    <textarea name="deploy_script_pre_deploy" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_pre_deploy }}</textarea>
-                  </label>
-                  <label>
-                    部署脚本
-                    <textarea name="deploy_script_deploy" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_deploy }}</textarea>
-                  </label>
-                  <label>
-                    发布后脚本
-                    <textarea name="deploy_script_post_deploy" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_post_deploy }}</textarea>
-                  </label>
-                  <label>
-                    切流脚本
-                    <textarea name="deploy_script_switch_traffic" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_switch_traffic }}</textarea>
-                  </label>
-                  <label class="form-span-all">
-                    清理脚本
-                    <textarea name="deploy_script_cleanup" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_cleanup }}</textarea>
-                  </label>
-                </div>
-              </details>
-            {% endif %}
-            {% if can_manage %}
-              <button class="primary-button compact-button" type="submit">{% if has_unit_config_previews %}保存公共 .env{% else %}保存配置{% endif %}</button>
-            {% endif %}
-          </form>
-        </div>
-      </details>
-    </section>
-
     {% match compose_result %}
       {% when Some with (result) %}
         <section class="panel" aria-labelledby="compose-result-title" data-app-detail-group="config">
@@ -736,6 +635,23 @@
             {% endif %}
           </section>
 
+          <section class="unit-config-section" aria-labelledby="{{ unit.config_modal_id }}-env-title">
+            <div class="unit-config-section-header">
+              <div>
+                <h3 id="{{ unit.config_modal_id }}-env-title">共享 .env</h3>
+                <p>当前所有部署单元共享这份应用级 .env。</p>
+              </div>
+            </div>
+            {% if unit.has_shared_env_content %}
+              <pre class="code-block unit-config-code">{{ unit.shared_env_content }}</pre>
+            {% else %}
+              <div class="modal-empty-state">
+                <strong>当前没有共享 .env</strong>
+                <span>这个应用还没有保存公共环境变量内容。</span>
+              </div>
+            {% endif %}
+          </section>
+
           <section class="unit-config-section" aria-labelledby="{{ unit.config_modal_id }}-scripts-title">
             <div class="unit-config-section-header">
               <div>
@@ -783,8 +699,6 @@
             <span>请先完成一次带配置 revision 的发布，再从这里查看单元级 compose、脚本和健康检查。</span>
           </div>
         {% endif %}
-
-        <p class="unit-config-note">公共 .env 请看下方“应用级公共配置”。</p>
       </div>
     </section>
   </dialog>
