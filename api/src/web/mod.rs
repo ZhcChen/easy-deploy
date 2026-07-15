@@ -23,7 +23,10 @@ use tracing::warn;
 
 use crate::{
     Settings,
-    application_config::{ApplicationConfigDocument, ApplicationConfigService},
+    application_config::{
+        ApplicationConfigDocument, ApplicationConfigService, ConfigEnvironment, ConfigStage,
+        ConfigUnit, SaveConfigDraftInput,
+    },
     application_releases::{
         ApplicationReleaseError, ApplicationReleaseService, CreateApplicationReleaseInput,
         EnvironmentConfigSelection, RegisterUnitReleaseInput, UnitReleaseChange,
@@ -1415,7 +1418,22 @@ async fn create_app_submit(
         target_node_ids: form.target_node_ids,
     };
     match state.apps().create_app(input).await {
-        Ok(app_id) => redirect(&format!("/apps/{app_id}?notice=created")),
+        Ok(app_id) => {
+            let notice = match sync_structured_config_revision(
+                &state,
+                app_id,
+                &session.account.username,
+            )
+            .await
+            {
+                Ok(()) => "created",
+                Err(error) => {
+                    warn!(app_id, error = %error, "sync structured config revision after app create failed");
+                    "created-config-sync-failed"
+                }
+            };
+            redirect(&format!("/apps/{app_id}?notice={notice}"))
+        }
         Err(err) => app_error_response(err),
     }
 }
@@ -2586,7 +2604,25 @@ async fn app_config_submit(
         },
     };
     match state.apps().update_app_config(input).await {
-        Ok(()) => redirect(&format!("/apps/{app_id}")),
+        Ok(()) => {
+            let notice = match sync_structured_config_revision(
+                &state,
+                app_id,
+                &session.account.username,
+            )
+            .await
+            {
+                Ok(()) => None,
+                Err(error) => {
+                    warn!(app_id, error = %error, "sync structured config revision after app config update failed");
+                    Some("config-sync-failed")
+                }
+            };
+            match notice {
+                Some(notice) => redirect(&format!("/apps/{app_id}?notice={notice}")),
+                None => redirect(&format!("/apps/{app_id}")),
+            }
+        }
         Err(err) => app_error_response(err),
     }
 }
@@ -2626,6 +2662,19 @@ async fn app_metadata_submit(
     };
     match state.apps().update_app_metadata(input).await {
         Ok(()) => {
+            let notice = match sync_structured_config_revision(
+                &state,
+                app_id,
+                &session.account.username,
+            )
+            .await
+            {
+                Ok(()) => None,
+                Err(error) => {
+                    warn!(app_id, error = %error, "sync structured config revision after app metadata update failed");
+                    Some("metadata-sync-failed")
+                }
+            };
             record_audit_event(
                 &state,
                 &session,
@@ -2635,10 +2684,173 @@ async fn app_metadata_submit(
                 "更新应用基础信息和目标节点",
             )
             .await;
-            redirect(&format!("/apps/{app_id}"))
+            match notice {
+                Some(notice) => redirect(&format!("/apps/{app_id}?notice={notice}")),
+                None => redirect(&format!("/apps/{app_id}")),
+            }
         }
         Err(err) => app_error_response(err),
     }
+}
+
+async fn sync_structured_config_revision(
+    state: &AppState,
+    app_id: i64,
+    updated_by: &str,
+) -> Result<(), String> {
+    let Some(configs) = state.application_config() else {
+        return Ok(());
+    };
+    let detail = state
+        .apps()
+        .app_detail(app_id)
+        .await
+        .map_err(|error| error.message().to_owned())?;
+    let document = single_unit_config_document(&detail);
+    let secret_values = latest_config_secret_values(state, configs, app_id).await;
+    let draft = configs
+        .save_draft(SaveConfigDraftInput {
+            app_id,
+            document,
+            secret_values,
+            updated_by: updated_by.to_owned(),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    configs
+        .publish_draft(app_id, &draft.draft_hash, updated_by)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn latest_config_secret_values(
+    state: &AppState,
+    configs: &ApplicationConfigService,
+    app_id: i64,
+) -> BTreeMap<String, String> {
+    let latest_revision_id = match sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT id
+        FROM app_config_revisions
+        WHERE app_id = ?1
+        ORDER BY revision_no DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(app_id)
+    .fetch_optional(state.db())
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(app_id, error = %error, "load latest config revision id for sync failed");
+            return BTreeMap::new();
+        }
+    };
+    let Some(revision_id) = latest_revision_id else {
+        return BTreeMap::new();
+    };
+    match configs.load_revision(app_id, revision_id).await {
+        Ok(revision) => revision.secret_values,
+        Err(error) => {
+            warn!(app_id, revision_id, error = %error, "load latest config revision secrets for sync failed");
+            BTreeMap::new()
+        }
+    }
+}
+
+fn single_unit_config_document(detail: &crate::apps::AppConfigDetail) -> ApplicationConfigDocument {
+    let target_node_ids = detail
+        .target_nodes
+        .iter()
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    ApplicationConfigDocument {
+        environments: vec![ConfigEnvironment {
+            key: detail.app.environment.clone(),
+            name: app_environment_label(&detail.app.environment).to_owned(),
+            max_parallel_units: 1,
+            target_node_ids,
+        }],
+        units: vec![ConfigUnit {
+            key: "default".to_owned(),
+            name: detail.app.name.clone(),
+            required: true,
+            status: "active".to_owned(),
+            work_dir: detail.app.work_dir.clone(),
+            compose_content: detail.compose_content.clone(),
+            env_content: detail.env_content.clone(),
+            scripts: deploy_scripts_to_config_unit_scripts(&detail.deploy_scripts),
+            health_check: health_check_config_json(&detail.health_check),
+        }],
+        stages: vec![ConfigStage {
+            number: 1,
+            key: "default".to_owned(),
+            name: "默认阶段".to_owned(),
+            kind: "units".to_owned(),
+            unit_keys: vec!["default".to_owned()],
+            check_config: serde_json::json!({}),
+        }],
+    }
+}
+
+fn deploy_scripts_to_config_unit_scripts(scripts: &DeployScriptSet) -> BTreeMap<String, String> {
+    let mut rows = BTreeMap::new();
+    if !scripts.pre_deploy.trim().is_empty() {
+        rows.insert("pre_deploy".to_owned(), scripts.pre_deploy.clone());
+    }
+    if !scripts.deploy.trim().is_empty() {
+        rows.insert("deploy".to_owned(), scripts.deploy.clone());
+    }
+    if !scripts.post_deploy.trim().is_empty() {
+        rows.insert("post_deploy".to_owned(), scripts.post_deploy.clone());
+    }
+    if !scripts.switch_traffic.trim().is_empty() {
+        rows.insert("switch_traffic".to_owned(), scripts.switch_traffic.clone());
+    }
+    if !scripts.cleanup.trim().is_empty() {
+        rows.insert("cleanup".to_owned(), scripts.cleanup.clone());
+    }
+    rows
+}
+
+fn health_check_config_json(config: &crate::health::HealthCheckConfig) -> serde_json::Value {
+    let mut value = serde_json::Map::new();
+    value.insert(
+        "kind".to_owned(),
+        serde_json::Value::String(config.kind.as_str().to_owned()),
+    );
+    match config.kind {
+        HealthCheckKind::Http => {
+            value.insert(
+                "endpoint".to_owned(),
+                serde_json::Value::String(config.endpoint.clone()),
+            );
+            value.insert(
+                "timeout_secs".to_owned(),
+                serde_json::Value::Number(config.timeout_secs.into()),
+            );
+            value.insert(
+                "expected_status".to_owned(),
+                serde_json::Value::Number((config.expected_status as u64).into()),
+            );
+        }
+        HealthCheckKind::Tcp => {
+            value.insert(
+                "endpoint".to_owned(),
+                serde_json::Value::String(config.endpoint.clone()),
+            );
+            value.insert(
+                "timeout_secs".to_owned(),
+                serde_json::Value::Number(config.timeout_secs.into()),
+            );
+        }
+        HealthCheckKind::ComposeRunning
+        | HealthCheckKind::SystemdActive
+        | HealthCheckKind::None => {}
+    }
+    serde_json::Value::Object(value)
 }
 
 async fn app_snapshot_restore_submit(
@@ -11602,6 +11814,15 @@ fn api_token_notice_message(notice: Option<&str>) -> Option<&'static str> {
 fn app_detail_notice_message(notice: Option<&str>) -> Option<&'static str> {
     match notice {
         Some("created") => Some("应用已创建，按下面的下一步完成首次部署。"),
+        Some("created-config-sync-failed") => Some(
+            "应用已创建，但结构化配置版本没有同步成功；请检查 EASY_DEPLOY_CONFIG_MASTER_KEYS 后重新保存一次配置。",
+        ),
+        Some("config-sync-failed") => {
+            Some("运行配置已经保存，但结构化配置版本没有同步成功；请检查配置加密密钥后重新保存。")
+        }
+        Some("metadata-sync-failed") => {
+            Some("基础信息已经保存，但结构化配置版本没有同步成功；请检查配置加密密钥后重新保存。")
+        }
         Some("deployment-history-deleted") => {
             Some("部署历史已彻底删除，任务基础记录、事件和审计日志仍保留。")
         }
@@ -12114,6 +12335,7 @@ pub fn html_response(html: String) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -12121,11 +12343,13 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use sqlx::sqlite::SqliteConnectOptions;
     use tempfile::TempDir;
     use tower::ServiceExt;
 
     use crate::{
+        application_config::ApplicationConfigService,
         apps::{AppService, CreateAppInput, UploadBinaryArtifactInput},
         artifact_storage::{ArtifactObjectVerifier, ArtifactStorageError, VerifiedArtifactObject},
         auth::{AuthService, MemorySessionStore},
@@ -12135,6 +12359,7 @@ mod tests {
         },
         nodes::NodeService,
         runtimefs::RuntimeFs,
+        secret_config::SecretConfigCipher,
         tasks::TaskService,
     };
 
@@ -12204,6 +12429,16 @@ mod tests {
     }
 
     async fn test_web_app() -> TestWebApp {
+        test_web_app_with_application_config_enabled(false).await
+    }
+
+    async fn test_web_app_with_application_config() -> TestWebApp {
+        test_web_app_with_application_config_enabled(true).await
+    }
+
+    async fn test_web_app_with_application_config_enabled(
+        application_config_enabled: bool,
+    ) -> TestWebApp {
         let db = sqlx::SqlitePool::connect_with(
             "sqlite::memory:"
                 .parse::<SqliteConnectOptions>()
@@ -12230,7 +12465,11 @@ mod tests {
             uploaded_binary_releases_to_keep: 4,
             command_timeout_secs: 120,
             config_active_key_id: "v1".to_owned(),
-            config_master_keys: String::new(),
+            config_master_keys: if application_config_enabled {
+                format!("v1:{}", STANDARD.encode([8_u8; 32]))
+            } else {
+                String::new()
+            },
         };
 
         let tasks = TaskService::new(db.clone());
@@ -12255,6 +12494,18 @@ mod tests {
         let apps_for_test = apps.clone();
         let tasks_for_test = tasks.clone();
         let platform_for_test = platform.clone();
+        let application_config = if application_config_enabled {
+            Some(ApplicationConfigService::new(
+                db.clone(),
+                SecretConfigCipher::from_base64_keys(
+                    "v1",
+                    &BTreeMap::from([("v1".to_owned(), STANDARD.encode([8_u8; 32]))]),
+                )
+                .expect("create config cipher"),
+            ))
+        } else {
+            None
+        };
         TestWebApp {
             router: build_router(AppState::new(
                 settings,
@@ -12267,7 +12518,7 @@ mod tests {
                     tasks,
                     platform,
                     events,
-                    application_config: None,
+                    application_config,
                     application_releases: ApplicationReleaseService::new(db.clone()),
                     deployment_orchestrator: DeploymentOrchestratorService::new(db.clone()),
                     deployment_console: DeploymentConsoleService::new(db.clone()),
@@ -13734,6 +13985,152 @@ mod tests {
                 .contains("docker compose up -d")
         );
         assert!(detail.deploy_scripts.post_deploy.contains("seed core"));
+    }
+
+    #[tokio::test]
+    async fn app_create_route_publishes_single_unit_config_revision_when_enabled() {
+        let app = test_web_app_with_application_config().await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+        let form = format!(
+            "csrf_token={}&app_key=orders-config-sync&name=Orders+Config+Sync&description=&environment=test&deploy_strategy=rolling_stop_on_failure&release_source=package_upload&auto_queue_release=true&work_dir=/opt/easy-deploy/apps/orders-config-sync&compose_content=services%3A%0A++app%3A%0A++++image%3A+orders%3A1.0.0%0A&env_content=APP_ENV%3Dtesting%0A&deploy_script_deploy=docker+compose+up+-d&health_check_kind=http&health_endpoint=http%3A%2F%2F127.0.0.1%3A8080%2Fhealthz&health_timeout_secs=5&health_expected_status=200&target_node_ids=1",
+            login.session.csrf_token
+        );
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apps")
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(location.ends_with("?notice=created"));
+
+        let created = app
+            .apps
+            .list_apps()
+            .await
+            .expect("list apps")
+            .into_iter()
+            .find(|item| item.app_key == "orders-config-sync")
+            .expect("created app");
+        let persisted: (i64, String) = sqlx::query_as(
+            "SELECT revision_no, public_config_json FROM app_config_revisions WHERE app_id = ?1 ORDER BY revision_no DESC, id DESC LIMIT 1",
+        )
+        .bind(created.id)
+        .fetch_one(&app.db)
+        .await
+        .expect("load config revision");
+        let document: serde_json::Value =
+            serde_json::from_str(&persisted.1).expect("parse public config json");
+
+        assert_eq!(persisted.0, 100);
+        assert_eq!(document["environments"][0]["key"], "test");
+        assert_eq!(document["environments"][0]["target_node_ids"][0], 1);
+        assert_eq!(document["units"][0]["key"], "default");
+        assert_eq!(document["units"][0]["env_content"], "APP_ENV=testing\n");
+        assert_eq!(
+            document["units"][0]["scripts"]["deploy"],
+            "docker compose up -d"
+        );
+        assert_eq!(document["units"][0]["health_check"]["kind"], "http");
+    }
+
+    #[tokio::test]
+    async fn app_config_submit_syncs_structured_config_revision_when_enabled() {
+        let app = test_web_app_with_application_config().await;
+        let app_id =
+            create_compose_test_app_with_mode(&app.apps, "orders-config-update", false).await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+        let form = format!(
+            "csrf_token={}&compose_content=services%3A%0A++app%3A%0A++++image%3A+orders%3A2.0.0%0A&env_content=APP_ENV%3Dproduction%0AWORKER_CONCURRENCY%3D4%0A&deploy_script_pre_deploy=echo+pre&deploy_script_deploy=docker+compose+pull+%26%26+docker+compose+up+-d&deploy_script_post_deploy=echo+post&deploy_script_switch_traffic=&deploy_script_cleanup=echo+clean&health_check_kind=http&health_endpoint=http%3A%2F%2F127.0.0.1%3A18080%2Fhealthz&health_timeout_secs=8&health_expected_status=204",
+            login.session.csrf_token
+        );
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/apps/{app_id}/config"))
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let persisted: (i64, String) = sqlx::query_as(
+            "SELECT revision_no, public_config_json FROM app_config_revisions WHERE app_id = ?1 ORDER BY revision_no DESC, id DESC LIMIT 1",
+        )
+        .bind(app_id)
+        .fetch_one(&app.db)
+        .await
+        .expect("load synced revision");
+        let document: serde_json::Value =
+            serde_json::from_str(&persisted.1).expect("parse public config json");
+
+        assert_eq!(persisted.0, 100);
+        assert_eq!(
+            document["units"][0]["compose_content"],
+            "services:\n  app:\n    image: orders:2.0.0\n"
+        );
+        assert_eq!(
+            document["units"][0]["env_content"],
+            "APP_ENV=production\nWORKER_CONCURRENCY=4\n"
+        );
+        assert_eq!(document["units"][0]["scripts"]["pre_deploy"], "echo pre");
+        assert_eq!(
+            document["units"][0]["scripts"]["deploy"],
+            "docker compose pull && docker compose up -d"
+        );
+        assert_eq!(document["units"][0]["scripts"]["post_deploy"], "echo post");
+        assert_eq!(document["units"][0]["scripts"]["cleanup"], "echo clean");
+        assert_eq!(document["units"][0]["health_check"]["kind"], "http");
+        assert_eq!(
+            document["units"][0]["health_check"]["endpoint"],
+            "http://127.0.0.1:18080/healthz"
+        );
+        assert_eq!(document["units"][0]["health_check"]["timeout_secs"], 8);
+        assert_eq!(document["units"][0]["health_check"]["expected_status"], 204);
     }
 
     fn multipart_body(
