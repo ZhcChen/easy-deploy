@@ -2367,6 +2367,18 @@ td span {
   grid-template-columns: minmax(0, 1fr);
 }
 
+.deployment-unit-table-wrap {
+  border-top: 1px solid rgba(217, 226, 238, 0.84);
+}
+
+.deployment-unit-table {
+  min-width: 840px;
+}
+
+.deployment-unit-actions-cell {
+  white-space: nowrap;
+}
+
 .compact-runtime-node-list {
   padding: 0;
 }
@@ -2546,6 +2558,26 @@ td span {
 
 .config-workbench-panel {
   box-shadow: none;
+}
+
+.app-compat-note {
+  display: grid;
+  gap: 4px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.app-compat-note strong {
+  color: #18212f;
+  font-size: 14px;
+}
+
+.app-compat-note span {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .config-workbench-details,
@@ -5228,6 +5260,80 @@ tbody tr:last-child td {
 .modal-empty-state span {
   color: var(--text-muted);
   font-size: 12px;
+}
+
+.unit-config-modal-body {
+  background: #f8fafc;
+}
+
+.unit-config-summary,
+.unit-config-section {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #ffffff;
+}
+
+.unit-config-summary .detail-list > div {
+  padding: 14px 0;
+}
+
+.unit-config-summary .detail-list > div:first-child {
+  padding-top: 0;
+}
+
+.unit-config-summary .detail-list > div:last-child {
+  padding-bottom: 0;
+}
+
+.unit-config-section-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.unit-config-section-header h3 {
+  margin: 0;
+  color: #18212f;
+  font-size: 15px;
+}
+
+.unit-config-section-header p {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.unit-config-script-list {
+  display: grid;
+  gap: 12px;
+}
+
+.unit-config-script-card {
+  display: grid;
+  gap: 8px;
+}
+
+.unit-config-script-card h4 {
+  margin: 0;
+  color: #18212f;
+  font-size: 13px;
+}
+
+.unit-config-code {
+  max-height: 300px;
+  padding: 14px 16px;
+}
+
+.unit-config-note {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .modal-capability-guide-list {

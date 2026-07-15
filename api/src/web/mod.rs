@@ -23,7 +23,7 @@ use tracing::warn;
 
 use crate::{
     Settings,
-    application_config::ApplicationConfigService,
+    application_config::{ApplicationConfigDocument, ApplicationConfigService},
     application_releases::{
         ApplicationReleaseError, ApplicationReleaseService, CreateApplicationReleaseInput,
         EnvironmentConfigSelection, RegisterUnitReleaseInput, UnitReleaseChange,
@@ -80,17 +80,18 @@ use templates::{
     DeployPreflightRow, DeploymentAccessTemplate, DeploymentEnvironmentRow,
     DeploymentHistoryLogRow, DeploymentHistoryTemplate, DeploymentHistoryUnitRow,
     DeploymentTargetNodeRow, DeploymentTaskControlView, DeploymentUnitRow,
-    EnvironmentDeploymentRunRow, EventLogRow, EventsTemplate, LoginTemplate, NavItem, NavSection,
-    NodeAppRuntimeRow, NodeCapabilityGuideRow, NodeCheckHistoryRow, NodeCredentialOptionRow,
-    NodeCredentialPageRow, NodeCredentialsTemplate, NodeDetailModalRow, NodeDetailTemplate,
-    NodePageRow, NodeRow, NodeTaskRow, NodesTemplate, PermissionGroup, PermissionRow,
-    PermissionsTemplate, ProfileTemplate, RbacFilterOptionRow, RedisConfigRow, RedisConfigView,
-    ReleaseQueueRow, RoleRow, RolesTemplate, ServiceLogTailOptionRow, ServiceLogsTemplate,
-    ServiceNodeLinkRow, ServicePageRow, ServicesTemplate, SessionRow, SessionsTemplate,
-    SettingsRow, SettingsTemplate, SummaryItem, TaskAppFilterRow, TaskDetailTemplate,
-    TaskDetailView, TaskExecutionGuideView, TaskFilterOptionRow, TaskLogRow, TaskNodeResultRow,
-    TaskPageRow, TaskPhaseGroupRow, TaskPhaseStepRow, TaskReturnActionView, TaskRow, TaskStepRow,
-    TasksTemplate, TemplateCardRow, TemplatesTemplate, render_html,
+    DeploymentUnitScriptPreviewRow, EnvironmentDeploymentRunRow, EventLogRow, EventsTemplate,
+    LoginTemplate, NavItem, NavSection, NodeAppRuntimeRow, NodeCapabilityGuideRow,
+    NodeCheckHistoryRow, NodeCredentialOptionRow, NodeCredentialPageRow, NodeCredentialsTemplate,
+    NodeDetailModalRow, NodeDetailTemplate, NodePageRow, NodeRow, NodeTaskRow, NodesTemplate,
+    PermissionGroup, PermissionRow, PermissionsTemplate, ProfileTemplate, RbacFilterOptionRow,
+    RedisConfigRow, RedisConfigView, ReleaseQueueRow, RoleRow, RolesTemplate,
+    ServiceLogTailOptionRow, ServiceLogsTemplate, ServiceNodeLinkRow, ServicePageRow,
+    ServicesTemplate, SessionRow, SessionsTemplate, SettingsRow, SettingsTemplate, SummaryItem,
+    TaskAppFilterRow, TaskDetailTemplate, TaskDetailView, TaskExecutionGuideView,
+    TaskFilterOptionRow, TaskLogRow, TaskNodeResultRow, TaskPageRow, TaskPhaseGroupRow,
+    TaskPhaseStepRow, TaskReturnActionView, TaskRow, TaskStepRow, TasksTemplate, TemplateCardRow,
+    TemplatesTemplate, render_html,
 };
 
 const LOGO_SVG: &str = include_str!("../../assets/logo.svg");
@@ -2272,14 +2273,22 @@ async fn render_app_detail(
         .collect::<Vec<_>>();
     let deployment_targets = deployment_target_rows(&console.targets);
     let deployment_target_summary = deployment_target_summary(&console.targets);
+    let latest_unit_config = latest_public_app_config_document(state, detail.app.id).await;
+    let unit_config_previews = build_unit_config_preview_map(latest_unit_config.as_ref());
+    let has_unit_config_previews = !unit_config_previews.is_empty();
     let deployment_units = console
         .units
         .iter()
         .map(|unit| {
             let (runtime_status, runtime_tone) = unit_runtime_summary(unit);
+            let preview = unit_config_previews
+                .get(&unit.unit_key)
+                .cloned()
+                .unwrap_or_else(missing_unit_config_preview);
             DeploymentUnitRow {
                 key: unit.unit_key.clone(),
                 name: unit.unit_name.clone(),
+                description: unit.description.clone(),
                 stage: format!("阶段 {} · {}", unit.stage_no, unit.stage_name),
                 lifecycle_status: if unit.lifecycle_status == "active" {
                     "启用"
@@ -2298,6 +2307,16 @@ async fn render_app_detail(
                 runtime_status,
                 runtime_tone,
                 work_dir: unit.work_dir.clone(),
+                config_modal_id: format!("deployment-unit-config-modal-{}", unit.unit_id),
+                config_source: preview.config_source,
+                has_config_preview: preview.has_config_preview,
+                compose_content: preview.compose_content,
+                has_compose_content: preview.has_compose_content,
+                health_check_label: preview.health_check_label,
+                health_check_detail: preview.health_check_detail,
+                health_check_json: preview.health_check_json,
+                has_health_check_json: preview.has_health_check_json,
+                script_rows: preview.script_rows,
             }
         })
         .collect::<Vec<_>>();
@@ -2557,6 +2576,7 @@ async fn render_app_detail(
         deployment_runs: &deployment_runs,
         deployment_environments: &deployment_environments,
         deployment_units: &deployment_units,
+        has_unit_config_previews,
         application_releases: &application_releases,
         environment_runs: &environment_runs,
         selected_environment_id,
@@ -8739,6 +8759,208 @@ fn unit_runtime_summary(
         return (format!("{} 个节点已停止", unit.stopped_count), "neutral");
     }
     ("尚无可信运行状态".to_owned(), "neutral")
+}
+
+#[derive(Clone, Debug)]
+struct AppConfigDocumentPreview {
+    revision_no: i64,
+    document: ApplicationConfigDocument,
+}
+
+#[derive(Clone, Debug)]
+struct UnitConfigPreviewData {
+    config_source: String,
+    has_config_preview: bool,
+    compose_content: String,
+    has_compose_content: bool,
+    health_check_label: String,
+    health_check_detail: String,
+    health_check_json: String,
+    has_health_check_json: bool,
+    script_rows: Vec<DeploymentUnitScriptPreviewRow>,
+}
+
+async fn latest_public_app_config_document(
+    state: &AppState,
+    app_id: i64,
+) -> Option<AppConfigDocumentPreview> {
+    let row = sqlx::query_as::<_, (i64, String)>(
+        r#"
+        SELECT revision_no, public_config_json
+        FROM app_config_revisions
+        WHERE app_id = ?1
+        ORDER BY revision_no DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(app_id)
+    .fetch_optional(state.db())
+    .await
+    .ok()??;
+    let document = serde_json::from_str::<ApplicationConfigDocument>(&row.1).ok()?;
+    if document.units.is_empty() {
+        return None;
+    }
+    Some(AppConfigDocumentPreview {
+        revision_no: row.0,
+        document,
+    })
+}
+
+fn build_unit_config_preview_map(
+    config: Option<&AppConfigDocumentPreview>,
+) -> HashMap<String, UnitConfigPreviewData> {
+    let Some(config) = config else {
+        return HashMap::new();
+    };
+    config
+        .document
+        .units
+        .iter()
+        .map(|unit| {
+            (
+                unit.key.clone(),
+                UnitConfigPreviewData {
+                    config_source: format!("来源 config#{}", config.revision_no),
+                    has_config_preview: true,
+                    compose_content: unit.compose_content.clone(),
+                    has_compose_content: !unit.compose_content.trim().is_empty(),
+                    health_check_label: unit_health_check_label(&unit.health_check),
+                    health_check_detail: unit_health_check_detail(&unit.health_check),
+                    health_check_json: unit_health_check_json(&unit.health_check),
+                    has_health_check_json: unit_health_check_has_json(&unit.health_check),
+                    script_rows: unit_script_preview_rows(unit),
+                },
+            )
+        })
+        .collect()
+}
+
+fn missing_unit_config_preview() -> UnitConfigPreviewData {
+    UnitConfigPreviewData {
+        config_source: "当前没有可用的已发布单元配置".to_owned(),
+        has_config_preview: false,
+        compose_content: String::new(),
+        has_compose_content: false,
+        health_check_label: "未配置".to_owned(),
+        health_check_detail: "还没有在已发布配置 revision 中找到这个单元的独立配置。".to_owned(),
+        health_check_json: String::new(),
+        has_health_check_json: false,
+        script_rows: Vec::new(),
+    }
+}
+
+fn unit_health_check_label(value: &serde_json::Value) -> String {
+    if !unit_health_check_has_json(value) {
+        return "未配置".to_owned();
+    }
+    match value
+        .get("kind")
+        .and_then(|kind| kind.as_str())
+        .unwrap_or("")
+    {
+        "none" => "不检查".to_owned(),
+        "http" => "HTTP GET".to_owned(),
+        "tcp" => "TCP 连接".to_owned(),
+        "compose_running" => "容器运行状态".to_owned(),
+        _ => "自定义".to_owned(),
+    }
+}
+
+fn unit_health_check_detail(value: &serde_json::Value) -> String {
+    if !unit_health_check_has_json(value) {
+        return "未设置单元级健康检查。".to_owned();
+    }
+    let endpoint = value
+        .get("endpoint")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty());
+    let timeout = value.get("timeout_secs").and_then(|item| item.as_u64());
+    let expected_status = value.get("expected_status").and_then(|item| item.as_u64());
+    match value
+        .get("kind")
+        .and_then(|kind| kind.as_str())
+        .unwrap_or("")
+    {
+        "none" => "该单元已显式关闭健康检查。".to_owned(),
+        "http" => format!(
+            "{} · 超时 {} 秒{}",
+            endpoint.unwrap_or("未配置地址"),
+            timeout.unwrap_or(5),
+            expected_status
+                .map(|status| format!(" · 期望 {}", status))
+                .unwrap_or_default()
+        ),
+        "tcp" => format!(
+            "{} · 超时 {} 秒",
+            endpoint.unwrap_or("未配置地址"),
+            timeout.unwrap_or(5)
+        ),
+        "compose_running" => "以容器运行状态为准。".to_owned(),
+        _ => "查看下方 JSON 原文。".to_owned(),
+    }
+}
+
+fn unit_health_check_json(value: &serde_json::Value) -> String {
+    if !unit_health_check_has_json(value) {
+        return String::new();
+    }
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn unit_health_check_has_json(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Object(map) => !map.is_empty(),
+        _ => true,
+    }
+}
+
+fn unit_script_preview_rows(
+    unit: &crate::application_config::ConfigUnit,
+) -> Vec<DeploymentUnitScriptPreviewRow> {
+    let ordered_slots = [
+        "pre_deploy",
+        "deploy",
+        "post_deploy",
+        "switch_traffic",
+        "cleanup",
+    ];
+    let mut rows = Vec::new();
+    for slot in ordered_slots {
+        if let Some(content) = unit
+            .scripts
+            .get(slot)
+            .filter(|content| !content.trim().is_empty())
+        {
+            rows.push(DeploymentUnitScriptPreviewRow {
+                label: unit_script_slot_label(slot).to_owned(),
+                content: content.clone(),
+            });
+        }
+    }
+    for (slot, content) in &unit.scripts {
+        if ordered_slots.contains(&slot.as_str()) || content.trim().is_empty() {
+            continue;
+        }
+        rows.push(DeploymentUnitScriptPreviewRow {
+            label: format!("{slot} 脚本"),
+            content: content.clone(),
+        });
+    }
+    rows
+}
+
+fn unit_script_slot_label(slot: &str) -> &'static str {
+    match slot {
+        "pre_deploy" => "发布前脚本",
+        "deploy" => "部署脚本",
+        "post_deploy" => "发布后脚本",
+        "switch_traffic" => "切流脚本",
+        "cleanup" => "清理脚本",
+        _ => "脚本",
+    }
 }
 
 fn snapshot_kind_label(kind: &str) -> &'static str {
@@ -15178,14 +15400,105 @@ mod tests {
             .expect("read body");
         let html = String::from_utf8_lossy(&body);
         assert!(html.contains("运行配置与脚本"));
-        assert!(html.contains("部署单元与版本"));
-        assert!(html.contains("部署历史"));
+        assert!(html.contains("部署单元"));
+        assert!(html.contains("部署记录"));
         assert!(!html.contains("versionCode 1002003"));
         assert!(!html.contains(&format!("/apps/{app_id}/binary/upload")));
         assert!(!html.contains("二进制配置"));
         assert!(!html.contains("systemd 操作"));
         assert!(!html.contains("发布时间 2026-06-09T10:00:00Z"));
         assert!(artifact_id > 0);
+    }
+
+    #[tokio::test]
+    async fn app_detail_renders_unit_config_modal_for_multi_unit_preview() {
+        let app = test_web_app().await;
+        let app_id =
+            create_compose_test_app_with_mode(&app.apps, "orders-unit-preview", false).await;
+        let config_document = serde_json::json!({
+            "environments": [
+                {
+                    "key": "test",
+                    "name": "测试环境",
+                    "max_parallel_units": 1,
+                    "target_node_ids": [1]
+                }
+            ],
+            "units": [
+                {
+                    "key": "default",
+                    "name": "默认单元",
+                    "required": true,
+                    "status": "active",
+                    "work_dir": "/opt/easy-deploy/apps/orders-unit-preview",
+                    "compose_content": "services:\n  app:\n    image: nginx:alpine\n",
+                    "scripts": {
+                        "deploy": "docker compose up -d --remove-orphans",
+                        "cleanup": "docker image prune -f"
+                    },
+                    "health_check": {
+                        "kind": "http",
+                        "endpoint": "http://127.0.0.1:8080/healthz",
+                        "timeout_secs": 5,
+                        "expected_status": 200
+                    }
+                }
+            ],
+            "stages": [
+                {
+                    "number": 1,
+                    "key": "default",
+                    "name": "默认阶段",
+                    "kind": "serial",
+                    "unit_keys": ["default"]
+                }
+            ]
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO app_config_revisions(app_id, revision_no, config_json, public_config_json, secret_ciphertext, config_hash) VALUES (?1, 100, ?2, ?2, '{}', 'unit-preview-config')",
+        )
+        .bind(app_id)
+        .bind(&config_document)
+        .execute(&app.db)
+        .await
+        .expect("insert config revision");
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/apps/{app_id}"))
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("查看配置"));
+        assert!(html.contains("deployment-unit-config-modal-"));
+        assert!(html.contains("来源 config#100"));
+        assert!(html.contains("compose.yaml"));
+        assert!(html.contains("应用级兼容配置"));
+        assert!(html.contains("公共 .env"));
     }
 
     #[tokio::test]

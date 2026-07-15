@@ -105,6 +105,7 @@ pub struct AppDetailTemplate<'a> {
     pub deployment_runs: &'a [AppDeploymentRunRow],
     pub deployment_environments: &'a [DeploymentEnvironmentRow],
     pub deployment_units: &'a [DeploymentUnitRow],
+    pub has_unit_config_previews: bool,
     pub application_releases: &'a [ApplicationReleaseRow],
     pub environment_runs: &'a [EnvironmentDeploymentRunRow],
     pub selected_environment_id: i64,
@@ -916,6 +917,7 @@ pub struct DeploymentEnvironmentRow {
 pub struct DeploymentUnitRow {
     pub key: String,
     pub name: String,
+    pub description: String,
     pub stage: String,
     pub lifecycle_status: &'static str,
     pub lifecycle_tone: &'static str,
@@ -923,6 +925,22 @@ pub struct DeploymentUnitRow {
     pub runtime_status: String,
     pub runtime_tone: &'static str,
     pub work_dir: String,
+    pub config_modal_id: String,
+    pub config_source: String,
+    pub has_config_preview: bool,
+    pub compose_content: String,
+    pub has_compose_content: bool,
+    pub health_check_label: String,
+    pub health_check_detail: String,
+    pub health_check_json: String,
+    pub has_health_check_json: bool,
+    pub script_rows: Vec<DeploymentUnitScriptPreviewRow>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeploymentUnitScriptPreviewRow {
+    pub label: String,
+    pub content: String,
 }
 
 pub struct ApplicationReleaseRow {

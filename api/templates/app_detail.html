@@ -293,14 +293,38 @@
                 <span>上传模块发布包或保存部署配置后会生成部署单元。</span>
               </div>
             {% else %}
-              <div class="unit-list">
-                {% for unit in deployment_units %}
-                  <article class="unit-row">
-                    <div><strong>{{ unit.name }}</strong><span>{{ unit.key }} · {{ unit.stage }}</span></div>
-                    <div><strong>{{ unit.latest_version }}</strong><span>{{ unit.work_dir }}</span></div>
-                    <div><span class="badge tone-{{ unit.runtime_tone }}">{{ unit.runtime_status }}</span><span class="badge tone-{{ unit.lifecycle_tone }}">{{ unit.lifecycle_status }}</span></div>
-                  </article>
-                {% endfor %}
+              <div class="table-wrap data-table-wrap deployment-unit-table-wrap">
+                <table class="data-table deployment-unit-table">
+                  <thead>
+                    <tr>
+                      <th>单元</th>
+                      <th>阶段</th>
+                      <th>工作目录</th>
+                      <th>当前版本</th>
+                      <th>运行状态</th>
+                      <th>生命周期</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for unit in deployment_units %}
+                      <tr>
+                        <td class="table-cell-primary">
+                          <strong>{{ unit.name }}</strong>
+                          <span>{% if unit.description == "" %}{{ unit.key }}{% else %}{{ unit.key }} · {{ unit.description }}{% endif %}</span>
+                        </td>
+                        <td>{{ unit.stage }}</td>
+                        <td><code>{{ unit.work_dir }}</code></td>
+                        <td>{{ unit.latest_version }}</td>
+                        <td><span class="badge tone-{{ unit.runtime_tone }}">{{ unit.runtime_status }}</span></td>
+                        <td><span class="badge tone-{{ unit.lifecycle_tone }}">{{ unit.lifecycle_status }}</span></td>
+                        <td class="deployment-unit-actions-cell">
+                          <button class="ghost-button compact-button" type="button" data-modal-target="{{ unit.config_modal_id }}">查看配置</button>
+                        </td>
+                      </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
               </div>
             {% endif %}
           </section>
@@ -500,14 +524,14 @@
     <section class="panel panel-large config-workbench-panel" aria-labelledby="config-title" data-app-detail-group="config">
       <details class="runtime-file-details config-workbench-details">
         <summary>
-          <span>运行配置与脚本</span>
-          <small>compose.yaml、.env、部署脚本；低频修改，默认收起</small>
+          <span>{% if has_unit_config_previews %}应用级兼容配置{% else %}运行配置与脚本{% endif %}</span>
+          <small>{% if has_unit_config_previews %}多部署单元应用请优先查看上方单元配置；这里保留公共 .env 和兼容提交入口{% else %}compose.yaml、.env、部署脚本；低频修改，默认收起{% endif %}</small>
         </summary>
         <div>
           <div class="panel-header compact nested-panel-header">
             <div>
-              <h2 id="config-title">运行配置</h2>
-              <p>修改前建议先复制配置；保存后会生成新的配置快照。</p>
+              <h2 id="config-title">{% if has_unit_config_previews %}应用级兼容配置{% else %}运行配置{% endif %}</h2>
+              <p>{% if has_unit_config_previews %}多部署单元应用请优先从上方“部署单元”列表查看 compose、脚本和健康检查；这里保留公共 .env 和兼容保存入口。{% else %}修改前建议先复制配置；保存后会生成新的配置快照。{% endif %}</p>
             </div>
             <div class="panel-actions app-config-transfer-actions">
               <button class="ghost-button compact-button" type="button" data-app-config-export>复制配置</button>
@@ -523,44 +547,61 @@
             <input type="hidden" name="health_endpoint" value="{{ health_endpoint }}">
             <input type="hidden" name="health_timeout_secs" value="{{ health_timeout_secs }}">
             <input type="hidden" name="health_expected_status" value="{{ health_expected_status }}">
-            <label>
-              compose.yaml
-              <textarea name="compose_content" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ compose_content }}</textarea>
-            </label>
-            <label>
-              .env
-              <textarea name="env_content" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ env_content }}</textarea>
-            </label>
-            <details class="config-advanced-details deploy-script-details form-span-all">
-              <summary>
-                <span>部署脚本</span>
-                <small>pre_deploy / deploy / post_deploy / switch_traffic / cleanup</small>
-              </summary>
-              <div class="advanced-form-grid deploy-script-grid">
-                <label>
-                  发布前脚本
-                  <textarea name="deploy_script_pre_deploy" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_pre_deploy }}</textarea>
-                </label>
-                <label>
-                  部署脚本
-                  <textarea name="deploy_script_deploy" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_deploy }}</textarea>
-                </label>
-                <label>
-                  发布后脚本
-                  <textarea name="deploy_script_post_deploy" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_post_deploy }}</textarea>
-                </label>
-                <label>
-                  切流脚本
-                  <textarea name="deploy_script_switch_traffic" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_switch_traffic }}</textarea>
-                </label>
-                <label class="form-span-all">
-                  清理脚本
-                  <textarea name="deploy_script_cleanup" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_cleanup }}</textarea>
-                </label>
+            {% if has_unit_config_previews %}
+              <div class="app-compat-note form-span-all">
+                <strong>公共配置入口</strong>
+                <span>单元级 compose、脚本和健康检查请从上方部署单元列表进入“查看配置”；这里仅保留公共 .env 展示与兼容保存入口。</span>
               </div>
-            </details>
+              <textarea name="compose_content" hidden>{{ compose_content }}</textarea>
+              <textarea name="deploy_script_pre_deploy" hidden>{{ deploy_script_pre_deploy }}</textarea>
+              <textarea name="deploy_script_deploy" hidden>{{ deploy_script_deploy }}</textarea>
+              <textarea name="deploy_script_post_deploy" hidden>{{ deploy_script_post_deploy }}</textarea>
+              <textarea name="deploy_script_switch_traffic" hidden>{{ deploy_script_switch_traffic }}</textarea>
+              <textarea name="deploy_script_cleanup" hidden>{{ deploy_script_cleanup }}</textarea>
+              <label class="form-span-all">
+                公共 .env
+                <textarea name="env_content" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ env_content }}</textarea>
+              </label>
+            {% else %}
+              <label>
+                compose.yaml
+                <textarea name="compose_content" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ compose_content }}</textarea>
+              </label>
+              <label>
+                .env
+                <textarea name="env_content" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ env_content }}</textarea>
+              </label>
+              <details class="config-advanced-details deploy-script-details form-span-all">
+                <summary>
+                  <span>部署脚本</span>
+                  <small>pre_deploy / deploy / post_deploy / switch_traffic / cleanup</small>
+                </summary>
+                <div class="advanced-form-grid deploy-script-grid">
+                  <label>
+                    发布前脚本
+                    <textarea name="deploy_script_pre_deploy" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_pre_deploy }}</textarea>
+                  </label>
+                  <label>
+                    部署脚本
+                    <textarea name="deploy_script_deploy" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_deploy }}</textarea>
+                  </label>
+                  <label>
+                    发布后脚本
+                    <textarea name="deploy_script_post_deploy" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_post_deploy }}</textarea>
+                  </label>
+                  <label>
+                    切流脚本
+                    <textarea name="deploy_script_switch_traffic" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_switch_traffic }}</textarea>
+                  </label>
+                  <label class="form-span-all">
+                    清理脚本
+                    <textarea name="deploy_script_cleanup" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ deploy_script_cleanup }}</textarea>
+                  </label>
+                </div>
+              </details>
+            {% endif %}
             {% if can_manage %}
-              <button class="primary-button compact-button" type="submit">保存配置</button>
+              <button class="primary-button compact-button" type="submit">{% if has_unit_config_previews %}保存公共 .env{% else %}保存配置{% endif %}</button>
             {% endif %}
           </form>
         </div>
@@ -733,6 +774,118 @@
   </aside>
 </section>
 </div>
+
+{% for unit in deployment_units %}
+  <dialog class="modal-dialog xwide-modal" id="{{ unit.config_modal_id }}" aria-labelledby="{{ unit.config_modal_id }}-title">
+    <section class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2 id="{{ unit.config_modal_id }}-title">{{ unit.name }}</h2>
+          <p>{{ unit.key }} · {{ unit.stage }} · {{ unit.config_source }}</p>
+        </div>
+        <button class="modal-close" type="button" data-modal-close aria-label="关闭">×</button>
+      </div>
+      <div class="modal-detail-body unit-config-modal-body">
+        <section class="unit-config-summary">
+          <div class="detail-list compact-detail-list">
+            <div>
+              <span>单元 Key</span>
+              <strong>{{ unit.key }}</strong>
+            </div>
+            <div>
+              <span>阶段</span>
+              <strong>{{ unit.stage }}</strong>
+            </div>
+            <div>
+              <span>工作目录</span>
+              <strong><code>{{ unit.work_dir }}</code></strong>
+            </div>
+            <div>
+              <span>当前版本</span>
+              <strong>{{ unit.latest_version }}</strong>
+            </div>
+            <div>
+              <span>运行状态</span>
+              <strong><span class="badge tone-{{ unit.runtime_tone }}">{{ unit.runtime_status }}</span></strong>
+            </div>
+            <div>
+              <span>健康检查</span>
+              <strong>{{ unit.health_check_label }}</strong>
+            </div>
+          </div>
+        </section>
+
+        {% if unit.has_config_preview %}
+          <section class="unit-config-section" aria-labelledby="{{ unit.config_modal_id }}-compose-title">
+            <div class="unit-config-section-header">
+              <div>
+                <h3 id="{{ unit.config_modal_id }}-compose-title">compose.yaml</h3>
+                <p>当前单元随已发布配置记录下来的 compose 片段。</p>
+              </div>
+            </div>
+            {% if unit.has_compose_content %}
+              <pre class="code-block unit-config-code">{{ unit.compose_content }}</pre>
+            {% else %}
+              <div class="modal-empty-state">
+                <strong>当前没有 compose.yaml 片段</strong>
+                <span>这个单元在最近一次已发布配置中没有单独记录 compose 内容。</span>
+              </div>
+            {% endif %}
+          </section>
+
+          <section class="unit-config-section" aria-labelledby="{{ unit.config_modal_id }}-scripts-title">
+            <div class="unit-config-section-header">
+              <div>
+                <h3 id="{{ unit.config_modal_id }}-scripts-title">部署脚本</h3>
+                <p>按执行时机拆分展示当前单元脚本。</p>
+              </div>
+            </div>
+            {% if unit.script_rows.len() == 0 %}
+              <div class="modal-empty-state">
+                <strong>当前没有单元脚本</strong>
+                <span>这个单元没有保存 pre_deploy、deploy、post_deploy、switch_traffic 或 cleanup 脚本。</span>
+              </div>
+            {% else %}
+              <div class="unit-config-script-list">
+                {% for script in unit.script_rows %}
+                  <article class="unit-config-script-card">
+                    <h4>{{ script.label }}</h4>
+                    <pre class="code-block unit-config-code">{{ script.content }}</pre>
+                  </article>
+                {% endfor %}
+              </div>
+            {% endif %}
+          </section>
+
+          <section class="unit-config-section" aria-labelledby="{{ unit.config_modal_id }}-health-title">
+            <div class="unit-config-section-header">
+              <div>
+                <h3 id="{{ unit.config_modal_id }}-health-title">健康检查</h3>
+                <p>{{ unit.health_check_detail }}</p>
+              </div>
+              <span class="badge tone-neutral">{{ unit.health_check_label }}</span>
+            </div>
+            {% if unit.has_health_check_json %}
+              <pre class="code-block unit-config-code">{{ unit.health_check_json }}</pre>
+            {% else %}
+              <div class="modal-empty-state">
+                <strong>当前没有健康检查 JSON</strong>
+                <span>这个单元使用默认或空的健康检查配置。</span>
+              </div>
+            {% endif %}
+          </section>
+        {% else %}
+          <div class="modal-empty-state">
+            <strong>当前没有可用的已发布单元配置</strong>
+            <span>请先完成一次带配置 revision 的发布，再从这里查看单元级 compose、脚本和健康检查。</span>
+          </div>
+        {% endif %}
+
+        <p class="unit-config-note">公共 .env 请看下方“应用级兼容配置”。</p>
+      </div>
+    </section>
+  </dialog>
+{% endfor %}
 
 {% if can_manage %}
   <dialog class="modal-dialog wide-modal" id="add-target-node-modal" aria-labelledby="add-target-node-modal-title">
