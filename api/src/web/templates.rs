@@ -57,7 +57,6 @@ pub struct AppsTemplate<'a> {
     pub default_app_work_dir: &'a str,
     pub default_app_work_dir_template: &'a str,
     pub can_manage: bool,
-    pub can_toggle_status: bool,
 }
 
 #[derive(Template)]
@@ -118,6 +117,9 @@ pub struct AppDetailTemplate<'a> {
     pub deployment_targets: &'a [DeploymentTargetNodeRow],
     pub deployment_target_summary: &'a str,
     pub can_manage: bool,
+    pub can_toggle_status: bool,
+    pub toggle_status: &'static str,
+    pub toggle_label: &'static str,
     pub can_deploy: bool,
     pub can_logs: bool,
     pub compose_result: Option<ComposeResultView>,
@@ -891,11 +893,7 @@ pub struct AppPageRow<'a> {
     pub deployment_status_tone: &'static str,
     pub active_run_id: Option<i64>,
     pub active_task_id: Option<i64>,
-    pub environment_id: Option<i64>,
     pub unit_count: i64,
-    pub can_deploy: bool,
-    pub toggle_status: &'static str,
-    pub toggle_label: &'static str,
 }
 
 pub struct DeploymentEnvironmentRow {

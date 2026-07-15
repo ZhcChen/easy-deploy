@@ -40,19 +40,28 @@
           <button class="ghost-button compact-button" type="submit">最近日志</button>
         </form>
       {% endif %}
-      {% if can_deploy %}
+      {% if can_deploy || can_manage || can_toggle_status %}
         <details class="app-more-actions">
           <summary>更多</summary>
           <div>
-            <form method="post" action="/apps/{{ id }}/compose/config">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-              <button class="text-button" type="submit">校验 Compose 配置</button>
-            </form>
-            {% if release_source == "manual" %}
-              <a class="text-link danger-link" href="/apps/{{ id }}/compose/down/confirm">停止 Compose</a>
+            {% if can_deploy %}
+              <form method="post" action="/apps/{{ id }}/compose/config">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button class="text-button" type="submit">校验 Compose 配置</button>
+              </form>
+              {% if release_source == "manual" %}
+                <a class="text-link danger-link" href="/apps/{{ id }}/compose/down/confirm">停止 Compose</a>
+              {% endif %}
             {% endif %}
             {% if can_manage %}
               <button class="text-button" type="button" data-modal-target="app-metadata-modal">编辑基础信息</button>
+            {% endif %}
+            {% if can_toggle_status %}
+              <form method="post" action="/apps/{{ id }}/status">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="status" value="{{ toggle_status }}">
+                <button class="text-button{% if toggle_status == "disabled" %} danger{% endif %}" type="submit">{{ toggle_label }}</button>
+              </form>
             {% endif %}
           </div>
         </details>

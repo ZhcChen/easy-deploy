@@ -1279,22 +1279,10 @@ async fn apps_page(
             active_task_id: deployment_environment
                 .as_ref()
                 .and_then(|environment| environment.active_task_id),
-            environment_id: deployment_environment
-                .as_ref()
-                .map(|environment| environment.environment_id),
             unit_count: deployment_environment
                 .as_ref()
                 .map(|environment| environment.unit_count)
                 .unwrap_or(0),
-            can_deploy: session.can(SERVICES_DEPLOY)
-                && app.status != "disabled"
-                && active.is_none()
-                && deployment_environment
-                    .as_ref()
-                    .and_then(|environment| environment.latest_release_id)
-                    .is_some(),
-            toggle_status: app_status_toggle_value(&app.status),
-            toggle_label: app_status_toggle_label(&app.status),
         });
     }
     let node_choices = node_options
@@ -1347,7 +1335,6 @@ async fn apps_page(
         default_app_work_dir: &platform_config.default_app_work_dir_for("orders-api"),
         default_app_work_dir_template: &platform_config.default_app_work_dir,
         can_manage: session.can("apps.create"),
-        can_toggle_status: session.can(APPS_STATUS),
     })
 }
 
@@ -1462,7 +1449,7 @@ async fn app_status_submit(
                 ),
             )
             .await;
-            redirect("/apps")
+            redirect(&format!("/apps/{app_id}"))
         }
         Err(err) => app_error_response(err),
     }
@@ -2589,6 +2576,9 @@ async fn render_app_detail(
         deployment_targets: &deployment_targets,
         deployment_target_summary: &deployment_target_summary,
         can_manage,
+        can_toggle_status: session.can(APPS_STATUS) && app_idle,
+        toggle_status: app_status_toggle_value(&detail.app.status),
+        toggle_label: app_status_toggle_label(&detail.app.status),
         can_deploy: session.can(SERVICES_DEPLOY) && app_enabled && app_idle,
         can_logs: session.can(SERVICES_LOGS),
         compose_result,
@@ -12710,6 +12700,113 @@ mod tests {
         assert!(!html.contains("qfy-sc worker"));
         assert!(!html.contains("二进制直部署"));
         assert!(!html.contains("systemd 管理"));
+    }
+
+    #[tokio::test]
+    async fn apps_page_actions_only_link_to_detail() {
+        let app = test_web_app().await;
+        let app_id =
+            create_compose_test_app_with_mode(&app.apps, "orders-list-actions", false).await;
+        seed_deployable_application_release(&app.db, app_id).await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/apps")
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains(&format!("href=\"/apps/{app_id}\">查看</a>")));
+        assert!(!html.contains(&format!("/apps/{app_id}/status")));
+        assert!(!html.contains(&format!("/apps/{app_id}/deploy?")));
+    }
+
+    #[tokio::test]
+    async fn app_detail_exposes_status_toggle_and_status_submit_redirects_back() {
+        let app = test_web_app().await;
+        let app_id =
+            create_compose_test_app_with_mode(&app.apps, "orders-detail-status", false).await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+
+        let detail_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/apps/{app_id}"))
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let detail_body = to_bytes(detail_response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let detail_html = String::from_utf8_lossy(&detail_body);
+        assert!(detail_html.contains(&format!("action=\"/apps/{app_id}/status\"")));
+        assert!(detail_html.contains("停用"));
+
+        let status_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/apps/{app_id}/status"))
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={}&status=disabled",
+                        login.session.csrf_token
+                    )))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(status_response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            status_response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+            Some(format!("/apps/{app_id}"))
+        );
     }
 
     #[tokio::test]

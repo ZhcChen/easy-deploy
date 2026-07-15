@@ -59,15 +59,13 @@
             <th>部署状态</th>
             <th>启用状态</th>
             <th>最近更新</th>
-            {% if can_toggle_status %}
-              <th class="app-actions-col sticky-col sticky-col-end">操作</th>
-            {% endif %}
+            <th class="app-actions-col sticky-col sticky-col-end">操作</th>
           </tr>
         </thead>
         <tbody>
           {% if apps.len() == 0 %}
             <tr>
-              <td colspan="{% if can_toggle_status %}8{% else %}7{% endif %}">
+              <td colspan="8">
                 <div class="empty-state">
                   <strong>没有匹配的应用</strong>
                   <span>调整筛选条件，或创建 Compose 应用后再查看。</span>
@@ -104,26 +102,9 @@
               </td>
               <td><span class="badge tone-{{ app.enabled_status_tone }}">{{ app.enabled_status }}</span></td>
               <td><strong>{{ app.updated_at }}</strong></td>
-              {% if can_toggle_status %}
-                <td class="app-actions-col sticky-col sticky-col-end">
-                  <div class="inline-actions row-actions">
-                    {% if app.can_deploy %}
-                      {% match app.environment_id %}
-                        {% when Some with (environment_id) %}
-                          <a class="primary-button compact-button" href="/apps/{{ app.id }}/deploy?environment_id={{ environment_id }}">部署</a>
-                        {% when None %}
-                      {% endmatch %}
-                    {% else %}
-                      <span class="ghost-button compact-button is-disabled" aria-disabled="true">部署</span>
-                    {% endif %}
-                    <form method="post" action="/apps/{{ app.id }}/status">
-                      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                      <input type="hidden" name="status" value="{{ app.toggle_status }}">
-                      <button class="text-button" type="submit">{{ app.toggle_label }}</button>
-                    </form>
-                  </div>
-                </td>
-              {% endif %}
+              <td class="app-actions-col sticky-col sticky-col-end">
+                <a class="ghost-button compact-button" href="/apps/{{ app.id }}">查看</a>
+              </td>
             </tr>
           {% endfor %}
           {% endif %}
