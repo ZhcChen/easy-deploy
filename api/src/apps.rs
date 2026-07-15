@@ -12188,7 +12188,7 @@ fn normalize_deploy_work_dir(value: &str) -> Result<String, AppError> {
     Ok(value)
 }
 
-fn normalize_compose_content(value: &str, app_key: &str) -> Result<String, AppError> {
+pub(crate) fn normalize_compose_content(value: &str, app_key: &str) -> Result<String, AppError> {
     let value = value.trim();
     if value.is_empty() {
         return Ok(default_compose_content(app_key));
@@ -13439,7 +13439,7 @@ fn default_compose_content(app_key: &str) -> String {
     format!("services:\n  {app_key}:\n    image: nginx:alpine\n    restart: unless-stopped\n")
 }
 
-fn normalize_env_content(value: &str) -> String {
+pub(crate) fn normalize_env_content(value: &str) -> String {
     ensure_trailing_newline(value.trim())
 }
 

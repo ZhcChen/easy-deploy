@@ -351,6 +351,9 @@
                       <td><span class="badge tone-{{ unit.lifecycle_tone }}">{{ unit.lifecycle_status }}</span></td>
                       <td class="deployment-unit-actions-cell">
                         <button class="ghost-button compact-button" type="button" data-modal-target="{{ unit.config_modal_id }}">查看配置</button>
+                        {% if can_edit_unit_config %}
+                          <button class="primary-button compact-button" type="button" data-modal-target="{{ unit.edit_modal_id }}">编辑配置</button>
+                        {% endif %}
                       </td>
                     </tr>
                   {% endfor %}
@@ -450,7 +453,12 @@
           <strong>{{ health_timeout_secs }} 秒</strong>
         </div>
       </div>
-      {% if can_manage %}
+      {% if can_edit_unit_config %}
+        <div class="app-compat-note">
+          <strong>健康检查从部署单元维护</strong>
+          <span>当前已启用单元级配置编辑。请到“部署单元”Tab 里打开对应模块的“编辑配置”，在那里维护健康检查、脚本、compose.yaml 和 .env。</span>
+        </div>
+      {% elif can_manage %}
         <details class="config-advanced-details compact-advanced-details">
           <summary>
             <span>编辑健康检查</span>
@@ -828,6 +836,340 @@
       </div>
     </section>
   </dialog>
+
+  {% if can_edit_unit_config %}
+    <dialog class="modal-dialog xwide-modal" id="{{ unit.edit_modal_id }}" aria-labelledby="{{ unit.edit_modal_id }}-title">
+      <section class="modal-card">
+        <div class="modal-header">
+          <div>
+            <h2 id="{{ unit.edit_modal_id }}-title">编辑 {{ unit.name }}</h2>
+            <p>{{ unit.key }} · {{ unit.stage }} · 直接保存到结构化配置版本</p>
+          </div>
+          <div class="modal-header-actions">
+            <button
+              class="ghost-button compact-button"
+              type="button"
+              data-template-code-copy
+              data-copy-target="{{ unit.edit_modal_id }}-compose-editor"
+              data-copy-done="已复制"
+            >复制当前页</button>
+            <button class="modal-close" type="button" data-modal-close aria-label="关闭">×</button>
+          </div>
+        </div>
+        <form class="unit-config-edit-form" method="post" action="/apps/{{ id }}/units/{{ unit.key }}/config">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+          <section class="template-code-panel unit-config-panel" aria-labelledby="{{ unit.edit_modal_id }}-config-title" data-template-code-copy-scope>
+            <div class="template-code-panel-header unit-config-panel-header">
+              <div>
+                <h3 id="{{ unit.edit_modal_id }}-config-title">部署单元配置</h3>
+                <p>保存后会生成新的结构化配置版本；单元之间互不覆盖。</p>
+              </div>
+              <div class="template-code-tabs" role="tablist" aria-label="编辑部署单元配置">
+                <button
+                  class="template-code-tab is-active"
+                  type="button"
+                  role="tab"
+                  id="{{ unit.edit_modal_id }}-compose-tab"
+                  aria-selected="true"
+                  aria-controls="{{ unit.edit_modal_id }}-compose-panel"
+                  data-template-code-tab
+                  data-template-code-target="{{ unit.edit_modal_id }}-compose-panel"
+                  data-copy-target-id="{{ unit.edit_modal_id }}-compose-editor"
+                >compose.yaml</button>
+                <button
+                  class="template-code-tab"
+                  type="button"
+                  role="tab"
+                  id="{{ unit.edit_modal_id }}-env-tab"
+                  aria-selected="false"
+                  aria-controls="{{ unit.edit_modal_id }}-env-panel"
+                  tabindex="-1"
+                  data-template-code-tab
+                  data-template-code-target="{{ unit.edit_modal_id }}-env-panel"
+                  data-copy-target-id="{{ unit.edit_modal_id }}-env-editor"
+                >.env</button>
+                <button
+                  class="template-code-tab"
+                  type="button"
+                  role="tab"
+                  id="{{ unit.edit_modal_id }}-scripts-tab"
+                  aria-selected="false"
+                  aria-controls="{{ unit.edit_modal_id }}-scripts-panel"
+                  tabindex="-1"
+                  data-template-code-tab
+                  data-template-code-target="{{ unit.edit_modal_id }}-scripts-panel"
+                  data-copy-target-id="{{ unit.edit_modal_id }}-script-pre-deploy-editor"
+                >脚本</button>
+                <button
+                  class="template-code-tab"
+                  type="button"
+                  role="tab"
+                  id="{{ unit.edit_modal_id }}-health-tab"
+                  aria-selected="false"
+                  aria-controls="{{ unit.edit_modal_id }}-health-panel"
+                  tabindex="-1"
+                  data-template-code-tab
+                  data-template-code-target="{{ unit.edit_modal_id }}-health-panel"
+                  data-copy-target-id="{{ unit.edit_modal_id }}-health-endpoint"
+                >健康检查</button>
+              </div>
+            </div>
+
+            <div
+              class="template-code-tab-panel unit-config-tab-panel"
+              id="{{ unit.edit_modal_id }}-compose-panel"
+              role="tabpanel"
+              aria-labelledby="{{ unit.edit_modal_id }}-compose-tab"
+              data-template-code-panel
+            >
+              <div class="unit-config-editor-surface">
+                <div class="unit-config-code-header">
+                  <strong>compose.yaml</strong>
+                  <span>部署单元的 Docker Compose 配置</span>
+                </div>
+                <textarea
+                  class="unit-config-editor-textarea"
+                  id="{{ unit.edit_modal_id }}-compose-editor"
+                  name="compose_content"
+                  spellcheck="false"
+                >{{ unit.edit_compose_content }}</textarea>
+              </div>
+            </div>
+
+            <div
+              class="template-code-tab-panel unit-config-tab-panel"
+              id="{{ unit.edit_modal_id }}-env-panel"
+              role="tabpanel"
+              aria-labelledby="{{ unit.edit_modal_id }}-env-tab"
+              data-template-code-panel
+              hidden
+            >
+              <div class="unit-config-editor-surface">
+                <div class="unit-config-code-header">
+                  <strong>.env</strong>
+                  <span>部署单元自己的环境变量文件</span>
+                </div>
+                <textarea
+                  class="unit-config-editor-textarea"
+                  id="{{ unit.edit_modal_id }}-env-editor"
+                  name="env_content"
+                  spellcheck="false"
+                >{{ unit.edit_env_content }}</textarea>
+              </div>
+            </div>
+
+            <div
+              class="template-code-tab-panel unit-config-tab-panel"
+              id="{{ unit.edit_modal_id }}-scripts-panel"
+              role="tabpanel"
+              aria-labelledby="{{ unit.edit_modal_id }}-scripts-tab"
+              data-template-code-panel
+              hidden
+            >
+              <section class="template-code-panel unit-config-script-panel" aria-labelledby="{{ unit.edit_modal_id }}-script-panel-title">
+                <div class="template-code-panel-header unit-config-script-panel-header">
+                  <div>
+                    <h4 id="{{ unit.edit_modal_id }}-script-panel-title">部署脚本</h4>
+                    <p>按执行时机维护；留空表示该阶段不执行自定义脚本。</p>
+                  </div>
+                  <div class="template-code-tabs" role="tablist" aria-label="编辑部署脚本">
+                    <button
+                      class="template-code-tab is-active"
+                      type="button"
+                      role="tab"
+                      id="{{ unit.edit_modal_id }}-script-tab-pre-deploy"
+                      aria-selected="true"
+                      aria-controls="{{ unit.edit_modal_id }}-script-panel-pre-deploy"
+                      data-template-code-tab
+                      data-template-code-target="{{ unit.edit_modal_id }}-script-panel-pre-deploy"
+                      data-copy-target-id="{{ unit.edit_modal_id }}-script-pre-deploy-editor"
+                    >pre_deploy</button>
+                    <button
+                      class="template-code-tab"
+                      type="button"
+                      role="tab"
+                      id="{{ unit.edit_modal_id }}-script-tab-deploy"
+                      aria-selected="false"
+                      aria-controls="{{ unit.edit_modal_id }}-script-panel-deploy"
+                      tabindex="-1"
+                      data-template-code-tab
+                      data-template-code-target="{{ unit.edit_modal_id }}-script-panel-deploy"
+                      data-copy-target-id="{{ unit.edit_modal_id }}-script-deploy-editor"
+                    >deploy</button>
+                    <button
+                      class="template-code-tab"
+                      type="button"
+                      role="tab"
+                      id="{{ unit.edit_modal_id }}-script-tab-post-deploy"
+                      aria-selected="false"
+                      aria-controls="{{ unit.edit_modal_id }}-script-panel-post-deploy"
+                      tabindex="-1"
+                      data-template-code-tab
+                      data-template-code-target="{{ unit.edit_modal_id }}-script-panel-post-deploy"
+                      data-copy-target-id="{{ unit.edit_modal_id }}-script-post-deploy-editor"
+                    >post_deploy</button>
+                    <button
+                      class="template-code-tab"
+                      type="button"
+                      role="tab"
+                      id="{{ unit.edit_modal_id }}-script-tab-switch-traffic"
+                      aria-selected="false"
+                      aria-controls="{{ unit.edit_modal_id }}-script-panel-switch-traffic"
+                      tabindex="-1"
+                      data-template-code-tab
+                      data-template-code-target="{{ unit.edit_modal_id }}-script-panel-switch-traffic"
+                      data-copy-target-id="{{ unit.edit_modal_id }}-script-switch-traffic-editor"
+                    >switch_traffic</button>
+                    <button
+                      class="template-code-tab"
+                      type="button"
+                      role="tab"
+                      id="{{ unit.edit_modal_id }}-script-tab-cleanup"
+                      aria-selected="false"
+                      aria-controls="{{ unit.edit_modal_id }}-script-panel-cleanup"
+                      tabindex="-1"
+                      data-template-code-tab
+                      data-template-code-target="{{ unit.edit_modal_id }}-script-panel-cleanup"
+                      data-copy-target-id="{{ unit.edit_modal_id }}-script-cleanup-editor"
+                    >cleanup</button>
+                  </div>
+                </div>
+
+                <div
+                  class="template-code-tab-panel unit-config-script-tab-panel"
+                  id="{{ unit.edit_modal_id }}-script-panel-pre-deploy"
+                  role="tabpanel"
+                  aria-labelledby="{{ unit.edit_modal_id }}-script-tab-pre-deploy"
+                  data-template-code-panel
+                >
+                  <div class="unit-config-editor-surface">
+                    <div class="unit-config-code-header">
+                      <strong>pre_deploy</strong>
+                      <span>部署前</span>
+                    </div>
+                    <textarea class="unit-config-editor-textarea" id="{{ unit.edit_modal_id }}-script-pre-deploy-editor" name="deploy_script_pre_deploy" spellcheck="false">{{ unit.script_pre_deploy }}</textarea>
+                  </div>
+                </div>
+
+                <div
+                  class="template-code-tab-panel unit-config-script-tab-panel"
+                  id="{{ unit.edit_modal_id }}-script-panel-deploy"
+                  role="tabpanel"
+                  aria-labelledby="{{ unit.edit_modal_id }}-script-tab-deploy"
+                  data-template-code-panel
+                  hidden
+                >
+                  <div class="unit-config-editor-surface">
+                    <div class="unit-config-code-header">
+                      <strong>deploy</strong>
+                      <span>部署执行</span>
+                    </div>
+                    <textarea class="unit-config-editor-textarea" id="{{ unit.edit_modal_id }}-script-deploy-editor" name="deploy_script_deploy" spellcheck="false">{{ unit.script_deploy }}</textarea>
+                  </div>
+                </div>
+
+                <div
+                  class="template-code-tab-panel unit-config-script-tab-panel"
+                  id="{{ unit.edit_modal_id }}-script-panel-post-deploy"
+                  role="tabpanel"
+                  aria-labelledby="{{ unit.edit_modal_id }}-script-tab-post-deploy"
+                  data-template-code-panel
+                  hidden
+                >
+                  <div class="unit-config-editor-surface">
+                    <div class="unit-config-code-header">
+                      <strong>post_deploy</strong>
+                      <span>部署后</span>
+                    </div>
+                    <textarea class="unit-config-editor-textarea" id="{{ unit.edit_modal_id }}-script-post-deploy-editor" name="deploy_script_post_deploy" spellcheck="false">{{ unit.script_post_deploy }}</textarea>
+                  </div>
+                </div>
+
+                <div
+                  class="template-code-tab-panel unit-config-script-tab-panel"
+                  id="{{ unit.edit_modal_id }}-script-panel-switch-traffic"
+                  role="tabpanel"
+                  aria-labelledby="{{ unit.edit_modal_id }}-script-tab-switch-traffic"
+                  data-template-code-panel
+                  hidden
+                >
+                  <div class="unit-config-editor-surface">
+                    <div class="unit-config-code-header">
+                      <strong>switch_traffic</strong>
+                      <span>切流</span>
+                    </div>
+                    <textarea class="unit-config-editor-textarea" id="{{ unit.edit_modal_id }}-script-switch-traffic-editor" name="deploy_script_switch_traffic" spellcheck="false">{{ unit.script_switch_traffic }}</textarea>
+                  </div>
+                </div>
+
+                <div
+                  class="template-code-tab-panel unit-config-script-tab-panel"
+                  id="{{ unit.edit_modal_id }}-script-panel-cleanup"
+                  role="tabpanel"
+                  aria-labelledby="{{ unit.edit_modal_id }}-script-tab-cleanup"
+                  data-template-code-panel
+                  hidden
+                >
+                  <div class="unit-config-editor-surface">
+                    <div class="unit-config-code-header">
+                      <strong>cleanup</strong>
+                      <span>清理</span>
+                    </div>
+                    <textarea class="unit-config-editor-textarea" id="{{ unit.edit_modal_id }}-script-cleanup-editor" name="deploy_script_cleanup" spellcheck="false">{{ unit.script_cleanup }}</textarea>
+                  </div>
+                </div>
+              </section>
+            </div>
+
+            <div
+              class="template-code-tab-panel unit-config-tab-panel"
+              id="{{ unit.edit_modal_id }}-health-panel"
+              role="tabpanel"
+              aria-labelledby="{{ unit.edit_modal_id }}-health-tab"
+              data-template-code-panel
+              hidden
+            >
+              <div class="unit-config-editor-surface unit-config-health-surface">
+                <div class="unit-config-code-header">
+                  <strong>health-check</strong>
+                  <span>部署后健康检查</span>
+                </div>
+                <div class="unit-config-health-grid">
+                  <label class="unit-config-editor-field">
+                    <span>检查方式</span>
+                    <select name="health_check_kind">
+                      <option value="none"{% if unit.health_check_kind == "none" %} selected{% endif %}>不检查</option>
+                      <option value="http"{% if unit.health_check_kind == "http" %} selected{% endif %}>HTTP GET</option>
+                      <option value="tcp"{% if unit.health_check_kind == "tcp" %} selected{% endif %}>TCP 连接</option>
+                      <option value="compose_running"{% if unit.health_check_kind == "compose_running" %} selected{% endif %}>容器运行状态</option>
+                    </select>
+                  </label>
+                  <label class="unit-config-editor-field unit-config-editor-field-wide">
+                    <span>检查地址</span>
+                    <input id="{{ unit.edit_modal_id }}-health-endpoint" name="health_endpoint" value="{{ unit.health_endpoint }}" placeholder="http://127.0.0.1:8080/healthz 或 127.0.0.1:8080">
+                  </label>
+                  <label class="unit-config-editor-field">
+                    <span>超时（秒）</span>
+                    <input name="health_timeout_secs" type="number" min="1" max="60" value="{{ unit.health_timeout_secs }}">
+                  </label>
+                  <label class="unit-config-editor-field">
+                    <span>HTTP 期望状态码</span>
+                    <input name="health_expected_status" type="number" min="100" max="599" value="{{ unit.health_expected_status }}">
+                  </label>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <div class="unit-config-edit-footer">
+            <button class="primary-button compact-button" type="submit">保存单元配置</button>
+            <button class="ghost-button compact-button" type="button" data-modal-close>取消</button>
+          </div>
+        </form>
+      </section>
+    </dialog>
+  {% endif %}
 {% endfor %}
 
 {% if can_manage %}

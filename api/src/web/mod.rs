@@ -38,8 +38,9 @@ use crate::{
         CreateAppInput, CreateReleasePackageUploadInput, RELEASE_PACKAGE_EXAMPLE,
         RELEASE_PACKAGE_PATTERN, ServiceTargetNodeItem, UpdateAppConfigInput,
         UpdateAppMetadataInput, UploadReleasePackageInput, artifact_metadata_value,
-        normalize_deploy_strategy, normalize_release_source,
-        parse_release_package_name_for_service, release_publish_mode_label,
+        normalize_compose_content, normalize_deploy_strategy, normalize_env_content,
+        normalize_release_source, parse_release_package_name_for_service,
+        release_publish_mode_label,
     },
     auth::{
         API_TOKENS_MANAGE, API_TOKENS_VIEW, APPS_STATUS, APPS_UPDATE, APPS_VIEW, ARTIFACTS_UPLOAD,
@@ -290,6 +291,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/apps/{app_id}/status", post(app_status_submit))
         .route("/apps/{app_id}/metadata", post(app_metadata_submit))
         .route("/apps/{app_id}/config", post(app_config_submit))
+        .route(
+            "/apps/{app_id}/units/{unit_key}/config",
+            post(unit_config_submit),
+        )
         .route(
             "/apps/{app_id}/snapshots/{snapshot_id}/restore",
             post(app_snapshot_restore_submit),
@@ -647,6 +652,33 @@ struct UpdateAppConfigForm {
     health_check_kind: String,
     health_endpoint: String,
     health_timeout_secs: i64,
+    health_expected_status: i64,
+}
+
+#[derive(Deserialize)]
+struct UpdateUnitConfigForm {
+    csrf_token: String,
+    #[serde(default)]
+    compose_content: String,
+    #[serde(default)]
+    env_content: String,
+    #[serde(default)]
+    deploy_script_pre_deploy: String,
+    #[serde(default)]
+    deploy_script_deploy: String,
+    #[serde(default)]
+    deploy_script_post_deploy: String,
+    #[serde(default)]
+    deploy_script_switch_traffic: String,
+    #[serde(default)]
+    deploy_script_cleanup: String,
+    #[serde(default)]
+    health_check_kind: String,
+    #[serde(default)]
+    health_endpoint: String,
+    #[serde(default)]
+    health_timeout_secs: i64,
+    #[serde(default)]
     health_expected_status: i64,
 }
 
@@ -2249,6 +2281,7 @@ async fn render_app_detail(
     let deployment_target_summary = deployment_target_summary(&console.targets);
     let latest_unit_config = latest_public_app_config_document(state, detail.app.id).await;
     let unit_config_previews = build_unit_config_preview_map(latest_unit_config.as_ref());
+    let single_unit_app = console.units.len() == 1;
     let deployment_units = console
         .units
         .iter()
@@ -2258,6 +2291,8 @@ async fn render_app_detail(
                 .get(&unit.unit_key)
                 .cloned()
                 .unwrap_or_else(missing_unit_config_preview);
+            let uses_shared_env_fallback = single_unit_app && !preview.has_env_content;
+            let uses_shared_editor_fallback = single_unit_app && !preview.has_config_preview;
             DeploymentUnitRow {
                 key: unit.unit_key.clone(),
                 name: unit.unit_name.clone(),
@@ -2281,26 +2316,30 @@ async fn render_app_detail(
                 runtime_tone,
                 work_dir: unit.work_dir.clone(),
                 config_modal_id: format!("deployment-unit-config-modal-{}", unit.unit_id),
+                edit_modal_id: format!("deployment-unit-edit-modal-{}", unit.unit_id),
                 config_source: preview.config_source,
                 has_config_preview: preview.has_config_preview,
                 compose_content: preview.compose_content,
                 has_compose_content: preview.has_compose_content,
                 env_content: if preview.has_env_content {
                     preview.env_content
-                } else {
+                } else if uses_shared_env_fallback {
                     detail.env_content.clone()
+                } else {
+                    String::new()
                 },
-                has_env_content: preview.has_env_content || !detail.env_content.trim().is_empty(),
+                has_env_content: preview.has_env_content
+                    || (uses_shared_env_fallback && !detail.env_content.trim().is_empty()),
                 env_source_label: if preview.has_env_content {
                     "单元 .env".to_owned()
-                } else if !detail.env_content.trim().is_empty() {
+                } else if uses_shared_env_fallback && !detail.env_content.trim().is_empty() {
                     "应用共享 .env（兼容旧配置）".to_owned()
                 } else {
                     "单元 .env".to_owned()
                 },
                 env_hint: if preview.has_env_content {
                     "当前单元独立保存的环境变量文件。".to_owned()
-                } else if !detail.env_content.trim().is_empty() {
+                } else if uses_shared_env_fallback && !detail.env_content.trim().is_empty() {
                     "当前 revision 还没有单元级 .env，先兼容展示应用共享 .env。".to_owned()
                 } else {
                     "当前单元还没有保存独立的环境变量内容。".to_owned()
@@ -2310,6 +2349,75 @@ async fn render_app_detail(
                 health_check_json: preview.health_check_json,
                 has_health_check_json: preview.has_health_check_json,
                 script_rows: preview.script_rows,
+                edit_compose_content: if preview.has_compose_content {
+                    preview.edit_compose_content
+                } else if uses_shared_editor_fallback {
+                    detail.compose_content.clone()
+                } else {
+                    String::new()
+                },
+                edit_env_content: if preview.has_env_content {
+                    preview.edit_env_content
+                } else if uses_shared_editor_fallback {
+                    detail.env_content.clone()
+                } else {
+                    String::new()
+                },
+                script_pre_deploy: if preview.has_config_preview {
+                    preview.script_pre_deploy
+                } else if uses_shared_editor_fallback {
+                    detail.deploy_scripts.pre_deploy.clone()
+                } else {
+                    String::new()
+                },
+                script_deploy: if preview.has_config_preview {
+                    preview.script_deploy
+                } else if uses_shared_editor_fallback {
+                    detail.deploy_scripts.deploy.clone()
+                } else {
+                    String::new()
+                },
+                script_post_deploy: if preview.has_config_preview {
+                    preview.script_post_deploy
+                } else if uses_shared_editor_fallback {
+                    detail.deploy_scripts.post_deploy.clone()
+                } else {
+                    String::new()
+                },
+                script_switch_traffic: if preview.has_config_preview {
+                    preview.script_switch_traffic
+                } else if uses_shared_editor_fallback {
+                    detail.deploy_scripts.switch_traffic.clone()
+                } else {
+                    String::new()
+                },
+                script_cleanup: if preview.has_config_preview {
+                    preview.script_cleanup
+                } else if uses_shared_editor_fallback {
+                    detail.deploy_scripts.cleanup.clone()
+                } else {
+                    String::new()
+                },
+                health_check_kind: if preview.has_config_preview {
+                    preview.health_check_kind
+                } else {
+                    detail.health_check.kind.as_str().to_owned()
+                },
+                health_endpoint: if preview.has_config_preview {
+                    preview.health_endpoint
+                } else {
+                    detail.health_check.endpoint.clone()
+                },
+                health_timeout_secs: if preview.has_config_preview {
+                    preview.health_timeout_secs
+                } else {
+                    detail.health_check.timeout_secs as i64
+                },
+                health_expected_status: if preview.has_config_preview {
+                    preview.health_expected_status
+                } else {
+                    i64::from(detail.health_check.expected_status)
+                },
             }
         })
         .collect::<Vec<_>>();
@@ -2385,6 +2493,7 @@ async fn render_app_detail(
         .collect::<Vec<_>>();
     let redis_config = redis_config_view(&detail.compose_content, &detail.env_content);
     let can_manage = session.can("apps.update") && app_enabled && app_idle;
+    let can_edit_unit_config = can_manage && state.application_config().is_some();
     let config_snapshots = detail
         .config_snapshots
         .iter()
@@ -2547,6 +2656,7 @@ async fn render_app_detail(
         deployment_targets: &deployment_targets,
         deployment_target_summary: &deployment_target_summary,
         can_manage,
+        can_edit_unit_config,
         can_toggle_status: session.can(APPS_STATUS) && app_idle,
         toggle_status: app_status_toggle_value(&detail.app.status),
         toggle_label: app_status_toggle_label(&detail.app.status),
@@ -2693,6 +2803,176 @@ async fn app_metadata_submit(
     }
 }
 
+async fn unit_config_submit(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Path((app_id, unit_key)): Path<(i64, String)>,
+    Form(form): Form<UpdateUnitConfigForm>,
+) -> Response {
+    if !valid_csrf(&session, &form.csrf_token) {
+        return forbidden();
+    }
+    if !session.can("apps.update") {
+        return forbidden();
+    }
+    let Some(configs) = state.application_config() else {
+        return (
+            StatusCode::CONFLICT,
+            "当前平台未启用结构化配置编辑，请先配置 EASY_DEPLOY_CONFIG_MASTER_KEYS".to_owned(),
+        )
+            .into_response();
+    };
+    let detail = match state.apps().app_detail(app_id).await {
+        Ok(detail) => detail,
+        Err(err) => return app_error_response(err),
+    };
+    let health_check = match normalize_health_config(
+        &form.health_check_kind,
+        &form.health_endpoint,
+        form.health_timeout_secs,
+        form.health_expected_status,
+    ) {
+        Ok(config) => config,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.message().to_owned()).into_response(),
+    };
+    let mut document = match load_editable_config_document(&state, app_id).await {
+        Ok(Some(document)) => document,
+        Ok(None) => single_unit_config_document(&detail),
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    merge_app_detail_into_config_document(&detail, &mut document);
+
+    let sync_legacy_runtime =
+        document.units.len() == 1 && document.units.iter().any(|unit| unit.key == unit_key);
+    if sync_legacy_runtime {
+        let input = UpdateAppConfigInput {
+            app_id,
+            compose_content: form.compose_content,
+            env_content: form.env_content,
+            deploy_scripts: DeployScriptSet {
+                pre_deploy: form.deploy_script_pre_deploy,
+                deploy: form.deploy_script_deploy,
+                post_deploy: form.deploy_script_post_deploy,
+                switch_traffic: form.deploy_script_switch_traffic,
+                cleanup: form.deploy_script_cleanup,
+            },
+            binary_artifact_version: String::new(),
+            binary_artifact_path: String::new(),
+            binary_exec_args: String::new(),
+            binary_service_user: String::new(),
+            binary_unit_name: String::new(),
+            binary_release_strategy: String::new(),
+            binary_active_slot: String::new(),
+            binary_base_port: 0,
+            binary_standby_port: 0,
+            binary_proxy_enabled: false,
+            binary_proxy_kind: String::new(),
+            binary_proxy_domain: String::new(),
+            binary_proxy_config_path: String::new(),
+            health_check,
+        };
+        match state.apps().update_app_config(input).await {
+            Ok(()) => {
+                if let Err(error) =
+                    sync_structured_config_revision(&state, app_id, &session.account.username).await
+                {
+                    warn!(
+                        app_id,
+                        unit_key = %unit_key,
+                        error = %error,
+                        "sync structured config revision after legacy unit config update failed"
+                    );
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("单元配置已保存，但结构化配置发布失败：{error}"),
+                    )
+                        .into_response();
+                }
+                record_audit_event(
+                    &state,
+                    &session,
+                    "apps.unit_config.update",
+                    "app_unit",
+                    &format!("{app_id}:{unit_key}"),
+                    "更新部署单元配置",
+                )
+                .await;
+                return redirect(&format!("/apps/{app_id}#config"));
+            }
+            Err(err) => return app_error_response(err),
+        }
+    }
+
+    let compose_content =
+        match normalize_compose_content(&form.compose_content, &detail.app.app_key) {
+            Ok(content) => content,
+            Err(err) => return app_error_response(err),
+        };
+    let env_content = normalize_env_content(&form.env_content);
+    let scripts = deploy_scripts_to_config_unit_scripts(&DeployScriptSet {
+        pre_deploy: form.deploy_script_pre_deploy,
+        deploy: form.deploy_script_deploy,
+        post_deploy: form.deploy_script_post_deploy,
+        switch_traffic: form.deploy_script_switch_traffic,
+        cleanup: form.deploy_script_cleanup,
+    });
+    let unit_summary = match state
+        .deployment_console()
+        .application_detail(app_id, None)
+        .await
+    {
+        Ok(console) => console
+            .units
+            .into_iter()
+            .find(|unit| unit.unit_key == unit_key),
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    if let Err(error) = upsert_unit_config_document(
+        &mut document,
+        &detail,
+        unit_summary.as_ref(),
+        &unit_key,
+        compose_content,
+        env_content,
+        scripts,
+        health_check_config_json(&health_check),
+    ) {
+        return (StatusCode::NOT_FOUND, error).into_response();
+    }
+
+    let secret_values = latest_config_secret_values(&state, configs, app_id).await;
+    let draft = match configs
+        .save_draft(SaveConfigDraftInput {
+            app_id,
+            document,
+            secret_values,
+            updated_by: session.account.username.clone(),
+        })
+        .await
+    {
+        Ok(draft) => draft,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    if let Err(error) = configs
+        .publish_draft(app_id, &draft.draft_hash, &session.account.username)
+        .await
+    {
+        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+    }
+    record_audit_event(
+        &state,
+        &session,
+        "apps.unit_config.update",
+        "app_unit",
+        &format!("{app_id}:{unit_key}"),
+        "更新部署单元配置",
+    )
+    .await;
+    redirect(&format!("/apps/{app_id}#config"))
+}
+
 async fn sync_structured_config_revision(
     state: &AppState,
     app_id: i64,
@@ -2706,7 +2986,10 @@ async fn sync_structured_config_revision(
         .app_detail(app_id)
         .await
         .map_err(|error| error.message().to_owned())?;
-    let document = single_unit_config_document(&detail);
+    let mut document = load_editable_config_document(state, app_id)
+        .await?
+        .unwrap_or_else(|| single_unit_config_document(&detail));
+    merge_app_detail_into_config_document(&detail, &mut document);
     let secret_values = latest_config_secret_values(state, configs, app_id).await;
     let draft = configs
         .save_draft(SaveConfigDraftInput {
@@ -2724,12 +3007,11 @@ async fn sync_structured_config_revision(
     Ok(())
 }
 
-async fn latest_config_secret_values(
+async fn latest_config_revision_id(
     state: &AppState,
-    configs: &ApplicationConfigService,
     app_id: i64,
-) -> BTreeMap<String, String> {
-    let latest_revision_id = match sqlx::query_scalar::<_, i64>(
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
         r#"
         SELECT id
         FROM app_config_revisions
@@ -2741,7 +3023,40 @@ async fn latest_config_secret_values(
     .bind(app_id)
     .fetch_optional(state.db())
     .await
-    {
+}
+
+async fn load_editable_config_document(
+    state: &AppState,
+    app_id: i64,
+) -> Result<Option<ApplicationConfigDocument>, String> {
+    let row = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT public_config_json
+        FROM app_config_revisions
+        WHERE app_id = ?1
+        ORDER BY revision_no DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(app_id)
+    .fetch_optional(state.db())
+    .await
+    .map_err(|error| error.to_string())?;
+    let Some(config_json) = row else {
+        return Ok(None);
+    };
+    let mut document = serde_json::from_str::<ApplicationConfigDocument>(&config_json)
+        .map_err(|error| format!("加载当前结构化配置失败：{error}"))?;
+    normalize_config_document_for_editing(&mut document);
+    Ok(Some(document))
+}
+
+async fn latest_config_secret_values(
+    state: &AppState,
+    configs: &ApplicationConfigService,
+    app_id: i64,
+) -> BTreeMap<String, String> {
+    let latest_revision_id = match latest_config_revision_id(state, app_id).await {
         Ok(value) => value,
         Err(error) => {
             warn!(app_id, error = %error, "load latest config revision id for sync failed");
@@ -2756,6 +3071,122 @@ async fn latest_config_secret_values(
         Err(error) => {
             warn!(app_id, revision_id, error = %error, "load latest config revision secrets for sync failed");
             BTreeMap::new()
+        }
+    }
+}
+
+fn normalize_config_document_for_editing(document: &mut ApplicationConfigDocument) {
+    for environment in &mut document.environments {
+        if environment.max_parallel_units == 0 {
+            environment.max_parallel_units = 1;
+        }
+    }
+    for unit in &mut document.units {
+        if unit.status.trim().is_empty() {
+            unit.status = "active".to_owned();
+        }
+    }
+    for stage in &mut document.stages {
+        if stage.key.trim().is_empty() {
+            stage.key = format!("stage-{}", stage.number.max(1));
+        }
+        if stage.name.trim().is_empty() {
+            stage.name = format!("阶段 {}", stage.number.max(1));
+        }
+        if !matches!(stage.kind.as_str(), "units" | "application_check") {
+            stage.kind = if stage.unit_keys.is_empty() {
+                "application_check".to_owned()
+            } else {
+                "units".to_owned()
+            };
+        }
+        if !stage.check_config.is_object() {
+            stage.check_config = serde_json::json!({});
+        }
+    }
+    if document.stages.is_empty() && !document.units.is_empty() {
+        document.stages.push(ConfigStage {
+            number: 1,
+            key: "default".to_owned(),
+            name: "默认阶段".to_owned(),
+            kind: "units".to_owned(),
+            unit_keys: document.units.iter().map(|unit| unit.key.clone()).collect(),
+            check_config: serde_json::json!({}),
+        });
+    }
+}
+
+fn merge_app_detail_into_config_document(
+    detail: &crate::apps::AppConfigDetail,
+    document: &mut ApplicationConfigDocument,
+) {
+    let target_node_ids = detail
+        .target_nodes
+        .iter()
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    if let Some(environment) = document
+        .environments
+        .iter_mut()
+        .find(|environment| environment.key == detail.app.environment)
+    {
+        environment.name = app_environment_label(&detail.app.environment).to_owned();
+        environment.target_node_ids = target_node_ids.clone();
+        if environment.max_parallel_units == 0 {
+            environment.max_parallel_units = 1;
+        }
+    } else if let Some(environment) = document.environments.first_mut() {
+        environment.key = detail.app.environment.clone();
+        environment.name = app_environment_label(&detail.app.environment).to_owned();
+        environment.target_node_ids = target_node_ids.clone();
+        if environment.max_parallel_units == 0 {
+            environment.max_parallel_units = 1;
+        }
+    } else {
+        document.environments.push(ConfigEnvironment {
+            key: detail.app.environment.clone(),
+            name: app_environment_label(&detail.app.environment).to_owned(),
+            max_parallel_units: 1,
+            target_node_ids: target_node_ids.clone(),
+        });
+    }
+
+    if document.units.is_empty() {
+        *document = single_unit_config_document(detail);
+        return;
+    }
+
+    if document.units.len() != 1 {
+        return;
+    }
+
+    let unit_key = {
+        let unit = &mut document.units[0];
+        unit.name = detail.app.name.clone();
+        unit.work_dir = detail.app.work_dir.clone();
+        unit.compose_content = detail.compose_content.clone();
+        unit.env_content = detail.env_content.clone();
+        unit.scripts = deploy_scripts_to_config_unit_scripts(&detail.deploy_scripts);
+        unit.health_check = health_check_config_json(&detail.health_check);
+        unit.key.clone()
+    };
+
+    if document.stages.is_empty() {
+        document.stages.push(ConfigStage {
+            number: 1,
+            key: unit_key.clone(),
+            name: "默认阶段".to_owned(),
+            kind: "units".to_owned(),
+            unit_keys: vec![unit_key.clone()],
+            check_config: serde_json::json!({}),
+        });
+    } else if let Some(stage) = document
+        .stages
+        .iter_mut()
+        .find(|stage| stage.kind == "units")
+    {
+        if !stage.unit_keys.iter().any(|key| key == &unit_key) {
+            stage.unit_keys = vec![unit_key];
         }
     }
 }
@@ -2793,6 +3224,110 @@ fn single_unit_config_document(detail: &crate::apps::AppConfigDetail) -> Applica
             check_config: serde_json::json!({}),
         }],
     }
+}
+
+fn upsert_unit_config_document(
+    document: &mut ApplicationConfigDocument,
+    detail: &crate::apps::AppConfigDetail,
+    unit_summary: Option<&crate::deployment_console::DeploymentUnitSummary>,
+    unit_key: &str,
+    compose_content: String,
+    env_content: String,
+    scripts: BTreeMap<String, String>,
+    health_check: serde_json::Value,
+) -> Result<(), String> {
+    if let Some(unit) = document.units.iter_mut().find(|unit| unit.key == unit_key) {
+        if let Some(summary) = unit_summary {
+            if !summary.unit_name.trim().is_empty() {
+                unit.name = summary.unit_name.clone();
+            }
+            if !summary.work_dir.trim().is_empty() {
+                unit.work_dir = summary.work_dir.clone();
+            }
+        }
+        unit.compose_content = compose_content;
+        unit.env_content = env_content;
+        unit.scripts = scripts;
+        unit.health_check = health_check;
+        return Ok(());
+    }
+
+    let Some(summary) = unit_summary else {
+        return Err(format!(
+            "未找到部署单元 {unit_key}，请先检查该单元是否已创建"
+        ));
+    };
+    let work_dir = if summary.work_dir.trim().is_empty() {
+        detail.app.work_dir.clone()
+    } else {
+        summary.work_dir.clone()
+    };
+    let name = if summary.unit_name.trim().is_empty() {
+        unit_key.to_owned()
+    } else {
+        summary.unit_name.clone()
+    };
+    document.units.push(ConfigUnit {
+        key: unit_key.to_owned(),
+        name,
+        required: true,
+        status: if summary.lifecycle_status == "disabled" {
+            "disabled".to_owned()
+        } else {
+            "active".to_owned()
+        },
+        work_dir,
+        compose_content,
+        env_content,
+        scripts,
+        health_check,
+    });
+    ensure_stage_contains_unit(
+        document,
+        summary.stage_no as u16,
+        &summary.stage_name,
+        unit_key,
+    );
+    Ok(())
+}
+
+fn ensure_stage_contains_unit(
+    document: &mut ApplicationConfigDocument,
+    stage_no: u16,
+    stage_name: &str,
+    unit_key: &str,
+) {
+    if let Some(stage) = document
+        .stages
+        .iter_mut()
+        .find(|stage| stage.number == stage_no.max(1) && stage.kind == "units")
+    {
+        if stage.name.trim().is_empty() {
+            stage.name = if stage_name.trim().is_empty() {
+                format!("阶段 {}", stage_no.max(1))
+            } else {
+                stage_name.to_owned()
+            };
+        }
+        if !stage.unit_keys.iter().any(|key| key == unit_key) {
+            stage.unit_keys.push(unit_key.to_owned());
+        }
+        return;
+    }
+
+    document.stages.push(ConfigStage {
+        number: stage_no.max(1),
+        key: format!("stage-{}", stage_no.max(1)),
+        name: if stage_name.trim().is_empty() {
+            format!("阶段 {}", stage_no.max(1))
+        } else {
+            stage_name.to_owned()
+        },
+        kind: "units".to_owned(),
+        unit_keys: vec![unit_key.to_owned()],
+        check_config: serde_json::json!({}),
+    });
+    document.stages.sort_by_key(|stage| stage.number);
 }
 
 fn deploy_scripts_to_config_unit_scripts(scripts: &DeployScriptSet) -> BTreeMap<String, String> {
@@ -8882,6 +9417,17 @@ struct UnitConfigPreviewData {
     health_check_json: String,
     has_health_check_json: bool,
     script_rows: Vec<DeploymentUnitScriptPreviewRow>,
+    edit_compose_content: String,
+    edit_env_content: String,
+    script_pre_deploy: String,
+    script_deploy: String,
+    script_post_deploy: String,
+    script_switch_traffic: String,
+    script_cleanup: String,
+    health_check_kind: String,
+    health_endpoint: String,
+    health_timeout_secs: i64,
+    health_expected_status: i64,
 }
 
 async fn latest_public_app_config_document(
@@ -8901,7 +9447,8 @@ async fn latest_public_app_config_document(
     .fetch_optional(state.db())
     .await
     .ok()??;
-    let document = serde_json::from_str::<ApplicationConfigDocument>(&row.1).ok()?;
+    let mut document = serde_json::from_str::<ApplicationConfigDocument>(&row.1).ok()?;
+    normalize_config_document_for_editing(&mut document);
     if document.units.is_empty() {
         return None;
     }
@@ -8936,6 +9483,17 @@ fn build_unit_config_preview_map(
                     health_check_json: unit_health_check_json(&unit.health_check),
                     has_health_check_json: unit_health_check_has_json(&unit.health_check),
                     script_rows: unit_script_preview_rows(unit),
+                    edit_compose_content: unit.compose_content.clone(),
+                    edit_env_content: unit.env_content.clone(),
+                    script_pre_deploy: unit_script_slot_content(unit, "pre_deploy"),
+                    script_deploy: unit_script_slot_content(unit, "deploy"),
+                    script_post_deploy: unit_script_slot_content(unit, "post_deploy"),
+                    script_switch_traffic: unit_script_slot_content(unit, "switch_traffic"),
+                    script_cleanup: unit_script_slot_content(unit, "cleanup"),
+                    health_check_kind: unit_health_check_kind(&unit.health_check),
+                    health_endpoint: unit_health_check_endpoint(&unit.health_check),
+                    health_timeout_secs: unit_health_check_timeout_secs(&unit.health_check),
+                    health_expected_status: unit_health_check_expected_status(&unit.health_check),
                 },
             )
         })
@@ -8955,6 +9513,17 @@ fn missing_unit_config_preview() -> UnitConfigPreviewData {
         health_check_json: String::new(),
         has_health_check_json: false,
         script_rows: Vec::new(),
+        edit_compose_content: String::new(),
+        edit_env_content: String::new(),
+        script_pre_deploy: String::new(),
+        script_deploy: String::new(),
+        script_post_deploy: String::new(),
+        script_switch_traffic: String::new(),
+        script_cleanup: String::new(),
+        health_check_kind: "none".to_owned(),
+        health_endpoint: String::new(),
+        health_timeout_secs: 5,
+        health_expected_status: 200,
     }
 }
 
@@ -9023,6 +9592,40 @@ fn unit_health_check_has_json(value: &serde_json::Value) -> bool {
         serde_json::Value::Object(map) => !map.is_empty(),
         _ => true,
     }
+}
+
+fn unit_health_check_kind(value: &serde_json::Value) -> String {
+    value
+        .get("kind")
+        .and_then(|kind| kind.as_str())
+        .unwrap_or("none")
+        .to_owned()
+}
+
+fn unit_health_check_endpoint(value: &serde_json::Value) -> String {
+    value
+        .get("endpoint")
+        .and_then(|item| item.as_str())
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn unit_health_check_timeout_secs(value: &serde_json::Value) -> i64 {
+    value
+        .get("timeout_secs")
+        .and_then(|item| item.as_i64())
+        .unwrap_or(5)
+}
+
+fn unit_health_check_expected_status(value: &serde_json::Value) -> i64 {
+    value
+        .get("expected_status")
+        .and_then(|item| item.as_i64())
+        .unwrap_or(200)
+}
+
+fn unit_script_slot_content(unit: &crate::application_config::ConfigUnit, slot: &str) -> String {
+    unit.scripts.get(slot).cloned().unwrap_or_default()
 }
 
 fn unit_script_preview_rows(
@@ -14133,6 +14736,282 @@ mod tests {
         assert_eq!(document["units"][0]["health_check"]["expected_status"], 204);
     }
 
+    #[tokio::test]
+    async fn app_metadata_submit_preserves_multi_unit_structured_revision_when_enabled() {
+        let app = test_web_app_with_application_config().await;
+        let app_id =
+            create_compose_test_app_with_mode(&app.apps, "orders-metadata-sync", false).await;
+        let config_document = serde_json::json!({
+            "environments": [
+                {
+                    "key": "test",
+                    "name": "测试环境",
+                    "max_parallel_units": 1,
+                    "target_node_ids": [1]
+                }
+            ],
+            "units": [
+                {
+                    "key": "default",
+                    "name": "API",
+                    "required": true,
+                    "status": "active",
+                    "work_dir": "/srv/app/api",
+                    "compose_content": "services:\n  api:\n    image: orders-api:1.0.0\n",
+                    "env_content": "APP_ENV=production\n",
+                    "scripts": {
+                        "deploy": "docker compose up -d"
+                    },
+                    "health_check": {
+                        "kind": "http",
+                        "endpoint": "http://127.0.0.1:8080/healthz",
+                        "timeout_secs": 5,
+                        "expected_status": 200
+                    }
+                },
+                {
+                    "key": "worker",
+                    "name": "Worker",
+                    "required": true,
+                    "status": "active",
+                    "work_dir": "/srv/app/worker",
+                    "compose_content": "services:\n  worker:\n    image: orders-worker:1.0.0\n",
+                    "env_content": "QUEUE=critical\n",
+                    "scripts": {
+                        "deploy": "./deploy-worker.sh"
+                    },
+                    "health_check": {
+                        "kind": "tcp",
+                        "endpoint": "127.0.0.1:19090",
+                        "timeout_secs": 5
+                    }
+                }
+            ],
+            "stages": [
+                {
+                    "number": 1,
+                    "key": "backend",
+                    "name": "后端",
+                    "kind": "units",
+                    "unit_keys": ["default", "worker"],
+                    "check_config": {}
+                }
+            ]
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO app_config_revisions(app_id, revision_no, config_json, public_config_json, secret_ciphertext, config_hash) VALUES (?1, 100, ?2, ?2, '{}', 'orders-metadata-sync-config')",
+        )
+        .bind(app_id)
+        .bind(&config_document)
+        .execute(&app.db)
+        .await
+        .expect("insert config revision");
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+        let form = format!(
+            "csrf_token={}&name=Orders+Metadata+Sync&description=metadata+only&environment=test&work_dir=%2Fopt%2Feasy-deploy%2Fapps%2Forders-metadata-sync&deploy_strategy=rolling_stop_on_failure&release_source=package_upload&target_node_ids=1",
+            login.session.csrf_token
+        );
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/apps/{app_id}/metadata"))
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let persisted: (i64, String) = sqlx::query_as(
+            "SELECT revision_no, public_config_json FROM app_config_revisions WHERE app_id = ?1 ORDER BY revision_no DESC, id DESC LIMIT 1",
+        )
+        .bind(app_id)
+        .fetch_one(&app.db)
+        .await
+        .expect("load synced revision");
+        let document: serde_json::Value =
+            serde_json::from_str(&persisted.1).expect("parse public config json");
+
+        assert_eq!(persisted.0, 100);
+        assert_eq!(document["units"].as_array().map(Vec::len), Some(2));
+        assert_eq!(document["units"][0]["key"], "default");
+        assert_eq!(document["units"][1]["key"], "worker");
+        assert_eq!(document["units"][1]["env_content"], "QUEUE=critical\n");
+        assert_eq!(
+            document["units"][1]["compose_content"],
+            "services:\n  worker:\n    image: orders-worker:1.0.0\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_config_submit_updates_only_target_unit_in_structured_revision() {
+        let app = test_web_app_with_application_config().await;
+        let app_id =
+            create_compose_test_app_with_mode(&app.apps, "orders-unit-config-save", false).await;
+        let config_document = serde_json::json!({
+            "environments": [
+                {
+                    "key": "test",
+                    "name": "测试环境",
+                    "max_parallel_units": 1,
+                    "target_node_ids": [1]
+                }
+            ],
+            "units": [
+                {
+                    "key": "default",
+                    "name": "API",
+                    "required": true,
+                    "status": "active",
+                    "work_dir": "/srv/app/api",
+                    "compose_content": "services:\n  api:\n    image: orders-api:1.0.0\n",
+                    "env_content": "APP_ENV=production\n",
+                    "scripts": {
+                        "deploy": "docker compose up -d"
+                    },
+                    "health_check": {
+                        "kind": "http",
+                        "endpoint": "http://127.0.0.1:8080/healthz",
+                        "timeout_secs": 5,
+                        "expected_status": 200
+                    }
+                },
+                {
+                    "key": "worker",
+                    "name": "Worker",
+                    "required": true,
+                    "status": "active",
+                    "work_dir": "/srv/app/worker",
+                    "compose_content": "services:\n  worker:\n    image: orders-worker:1.0.0\n",
+                    "env_content": "QUEUE=critical\n",
+                    "scripts": {
+                        "deploy": "./deploy-worker.sh"
+                    },
+                    "health_check": {
+                        "kind": "tcp",
+                        "endpoint": "127.0.0.1:19090",
+                        "timeout_secs": 5
+                    }
+                }
+            ],
+            "stages": [
+                {
+                    "number": 1,
+                    "key": "backend",
+                    "name": "后端",
+                    "kind": "units",
+                    "unit_keys": ["default", "worker"],
+                    "check_config": {}
+                }
+            ]
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO app_config_revisions(app_id, revision_no, config_json, public_config_json, secret_ciphertext, config_hash) VALUES (?1, 100, ?2, ?2, '{}', 'orders-unit-save-config')",
+        )
+        .bind(app_id)
+        .bind(&config_document)
+        .execute(&app.db)
+        .await
+        .expect("insert config revision");
+        sqlx::query(
+            "INSERT INTO version_counters(scope_kind, scope_id, next_value) VALUES ('config_revision', ?1, 101)",
+        )
+        .bind(app_id)
+        .execute(&app.db)
+        .await
+        .expect("seed version counter");
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+        let form = format!(
+            "csrf_token={}&compose_content=services%3A%0A++worker%3A%0A++++image%3A+orders-worker%3A2.0.0%0A&env_content=QUEUE%3Dcritical%0AWORKER_THREADS%3D8%0A&deploy_script_pre_deploy=echo+pre&deploy_script_deploy=.%2Fdeploy-worker-v2.sh&deploy_script_post_deploy=echo+post&deploy_script_switch_traffic=&deploy_script_cleanup=echo+clean&health_check_kind=http&health_endpoint=http%3A%2F%2F127.0.0.1%3A19090%2Fhealthz&health_timeout_secs=9&health_expected_status=204",
+            login.session.csrf_token
+        );
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/apps/{app_id}/units/worker/config"))
+                    .header(header::COOKIE, &cookie_value)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let persisted: (i64, String) = sqlx::query_as(
+            "SELECT revision_no, public_config_json FROM app_config_revisions WHERE app_id = ?1 ORDER BY revision_no DESC, id DESC LIMIT 1",
+        )
+        .bind(app_id)
+        .fetch_one(&app.db)
+        .await
+        .expect("load updated revision");
+        let document: serde_json::Value =
+            serde_json::from_str(&persisted.1).expect("parse public config json");
+
+        assert_eq!(persisted.0, 101);
+        assert_eq!(
+            document["units"][0]["compose_content"],
+            "services:\n  api:\n    image: orders-api:1.0.0\n"
+        );
+        assert_eq!(document["units"][0]["env_content"], "APP_ENV=production\n");
+        assert_eq!(
+            document["units"][1]["compose_content"],
+            "services:\n  worker:\n    image: orders-worker:2.0.0\n"
+        );
+        assert_eq!(
+            document["units"][1]["env_content"],
+            "QUEUE=critical\nWORKER_THREADS=8\n"
+        );
+        assert_eq!(document["units"][1]["scripts"]["pre_deploy"], "echo pre");
+        assert_eq!(
+            document["units"][1]["scripts"]["deploy"],
+            "./deploy-worker-v2.sh"
+        );
+        assert_eq!(document["units"][1]["scripts"]["post_deploy"], "echo post");
+        assert_eq!(document["units"][1]["scripts"]["cleanup"], "echo clean");
+        assert_eq!(document["units"][1]["health_check"]["kind"], "http");
+        assert_eq!(
+            document["units"][1]["health_check"]["endpoint"],
+            "http://127.0.0.1:19090/healthz"
+        );
+        assert_eq!(document["units"][1]["health_check"]["timeout_secs"], 9);
+        assert_eq!(document["units"][1]["health_check"]["expected_status"], 204);
+    }
+
     fn multipart_body(
         boundary: &str,
         file_field: &str,
@@ -15854,6 +16733,46 @@ mod tests {
         assert!(!html.contains("部署前差异"));
         assert!(!html.contains("状态、版本与部署操作"));
         assert!(!html.contains("运行配置与脚本"));
+    }
+
+    #[tokio::test]
+    async fn app_detail_renders_unit_config_edit_button_when_config_enabled() {
+        let app = test_web_app_with_application_config().await;
+        let app_id =
+            create_compose_test_app_with_mode(&app.apps, "orders-unit-edit-ui", false).await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/apps/{app_id}"))
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("编辑配置"));
+        assert!(html.contains("deployment-unit-edit-modal-"));
+        assert!(html.contains("保存单元配置"));
     }
 
     #[tokio::test]

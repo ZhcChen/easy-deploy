@@ -114,6 +114,7 @@ pub struct AppDetailTemplate<'a> {
     pub deployment_targets: &'a [DeploymentTargetNodeRow],
     pub deployment_target_summary: &'a str,
     pub can_manage: bool,
+    pub can_edit_unit_config: bool,
     pub can_toggle_status: bool,
     pub toggle_status: &'static str,
     pub toggle_label: &'static str,
@@ -905,6 +906,7 @@ pub struct DeploymentUnitRow {
     pub runtime_tone: &'static str,
     pub work_dir: String,
     pub config_modal_id: String,
+    pub edit_modal_id: String,
     pub config_source: String,
     pub has_config_preview: bool,
     pub compose_content: String,
@@ -918,6 +920,17 @@ pub struct DeploymentUnitRow {
     pub health_check_json: String,
     pub has_health_check_json: bool,
     pub script_rows: Vec<DeploymentUnitScriptPreviewRow>,
+    pub edit_compose_content: String,
+    pub edit_env_content: String,
+    pub script_pre_deploy: String,
+    pub script_deploy: String,
+    pub script_post_deploy: String,
+    pub script_switch_traffic: String,
+    pub script_cleanup: String,
+    pub health_check_kind: String,
+    pub health_endpoint: String,
+    pub health_timeout_secs: i64,
+    pub health_expected_status: i64,
 }
 
 #[derive(Clone, Debug)]
