@@ -102,14 +102,12 @@ pub struct AppDetailTemplate<'a> {
     pub health_timeout_secs: u64,
     pub health_expected_status: u16,
     pub deployment_runs: &'a [AppDeploymentRunRow],
-    pub deployment_environments: &'a [DeploymentEnvironmentRow],
     pub deployment_units: &'a [DeploymentUnitRow],
     pub has_unit_config_previews: bool,
     pub application_releases: &'a [ApplicationReleaseRow],
     pub environment_runs: &'a [EnvironmentDeploymentRunRow],
     pub selected_environment_id: i64,
     pub config_snapshots: &'a [AppConfigSnapshotRow],
-    pub deploy_diff: &'a AppDeployDiffView,
     pub runtime_states: &'a [AppRuntimeStateRow],
     pub redis_config: Option<RedisConfigView>,
     pub target_choices: &'a [AppTargetChoiceRow],
@@ -896,22 +894,6 @@ pub struct AppPageRow<'a> {
     pub unit_count: i64,
 }
 
-pub struct DeploymentEnvironmentRow {
-    pub id: i64,
-    pub name: String,
-    pub key: String,
-    pub status: &'static str,
-    pub status_tone: &'static str,
-    pub runtime_status: &'static str,
-    pub runtime_tone: &'static str,
-    pub latest_version: String,
-    pub target_count: i64,
-    pub active_run_id: Option<i64>,
-    pub active_task_id: Option<i64>,
-    pub active_run_status: String,
-    pub selected: bool,
-}
-
 pub struct DeploymentUnitRow {
     pub key: String,
     pub name: String,
@@ -945,14 +927,6 @@ pub struct ApplicationReleaseRow {
     pub id: i64,
     pub version: String,
     pub version_code: i64,
-    pub unit_count: i64,
-    pub created_at: String,
-    pub status: &'static str,
-    pub status_tone: &'static str,
-    pub estimated_size: String,
-    pub blockers: String,
-    pub can_archive: bool,
-    pub can_delete: bool,
 }
 
 pub struct EnvironmentDeploymentRunRow {

@@ -77,21 +77,20 @@ use templates::{
     ArtifactPageRow, ArtifactsTemplate, AuditFilterOptionRow, AuditLogRow, AuditTemplate,
     ComposeResultView, DashboardTemplate, DeployConfirmTargetNodeRow, DeployConfirmTemplate,
     DeployPlanFileRow, DeployPlanStepRow, DeployPreflightActionRow, DeployPreflightCheckRow,
-    DeployPreflightRow, DeploymentAccessTemplate, DeploymentEnvironmentRow,
-    DeploymentHistoryLogRow, DeploymentHistoryTemplate, DeploymentHistoryUnitRow,
-    DeploymentTargetNodeRow, DeploymentTaskControlView, DeploymentUnitRow,
-    DeploymentUnitScriptPreviewRow, EnvironmentDeploymentRunRow, EventLogRow, EventsTemplate,
-    LoginTemplate, NavItem, NavSection, NodeAppRuntimeRow, NodeCapabilityGuideRow,
-    NodeCheckHistoryRow, NodeCredentialOptionRow, NodeCredentialPageRow, NodeCredentialsTemplate,
-    NodeDetailModalRow, NodeDetailTemplate, NodePageRow, NodeRow, NodeTaskRow, NodesTemplate,
-    PermissionGroup, PermissionRow, PermissionsTemplate, ProfileTemplate, RbacFilterOptionRow,
-    RedisConfigRow, RedisConfigView, ReleaseQueueRow, RoleRow, RolesTemplate,
-    ServiceLogTailOptionRow, ServiceLogsTemplate, ServiceNodeLinkRow, ServicePageRow,
-    ServicesTemplate, SessionRow, SessionsTemplate, SettingsRow, SettingsTemplate, SummaryItem,
-    TaskAppFilterRow, TaskDetailTemplate, TaskDetailView, TaskExecutionGuideView,
-    TaskFilterOptionRow, TaskLogRow, TaskNodeResultRow, TaskPageRow, TaskPhaseGroupRow,
-    TaskPhaseStepRow, TaskReturnActionView, TaskRow, TaskStepRow, TasksTemplate, TemplateCardRow,
-    TemplatesTemplate, render_html,
+    DeployPreflightRow, DeploymentAccessTemplate, DeploymentHistoryLogRow,
+    DeploymentHistoryTemplate, DeploymentHistoryUnitRow, DeploymentTargetNodeRow,
+    DeploymentTaskControlView, DeploymentUnitRow, DeploymentUnitScriptPreviewRow,
+    EnvironmentDeploymentRunRow, EventLogRow, EventsTemplate, LoginTemplate, NavItem, NavSection,
+    NodeAppRuntimeRow, NodeCapabilityGuideRow, NodeCheckHistoryRow, NodeCredentialOptionRow,
+    NodeCredentialPageRow, NodeCredentialsTemplate, NodeDetailModalRow, NodeDetailTemplate,
+    NodePageRow, NodeRow, NodeTaskRow, NodesTemplate, PermissionGroup, PermissionRow,
+    PermissionsTemplate, ProfileTemplate, RbacFilterOptionRow, RedisConfigRow, RedisConfigView,
+    ReleaseQueueRow, RoleRow, RolesTemplate, ServiceLogTailOptionRow, ServiceLogsTemplate,
+    ServiceNodeLinkRow, ServicePageRow, ServicesTemplate, SessionRow, SessionsTemplate,
+    SettingsRow, SettingsTemplate, SummaryItem, TaskAppFilterRow, TaskDetailTemplate,
+    TaskDetailView, TaskExecutionGuideView, TaskFilterOptionRow, TaskLogRow, TaskNodeResultRow,
+    TaskPageRow, TaskPhaseGroupRow, TaskPhaseStepRow, TaskReturnActionView, TaskRow, TaskStepRow,
+    TasksTemplate, TemplateCardRow, TemplatesTemplate, render_html,
 };
 
 const LOGO_SVG: &str = include_str!("../../assets/logo.svg");
@@ -1584,14 +1583,6 @@ async fn application_deploy_page(
             id: release.release_id,
             version: release.version.clone(),
             version_code: release.version_code,
-            unit_count: release.unit_count,
-            created_at: release.created_at.clone(),
-            status: "可部署",
-            status_tone: "success",
-            estimated_size: String::new(),
-            blockers: String::new(),
-            can_archive: false,
-            can_delete: false,
         })
         .collect::<Vec<_>>();
     let nav_sections = nav_sections("/apps", &session);
@@ -2236,28 +2227,6 @@ async fn render_app_detail(
                 .map(|environment| environment.environment_id)
         })
         .unwrap_or_default();
-    let deployment_environments = console
-        .environments
-        .iter()
-        .map(|environment| DeploymentEnvironmentRow {
-            id: environment.environment_id,
-            name: environment.environment_name.clone(),
-            key: environment.environment_key.clone(),
-            status: environment_status_label(&environment.environment_status),
-            status_tone: environment_status_tone(&environment.environment_status),
-            runtime_status: environment_runtime_status_label(&environment.runtime_status),
-            runtime_tone: environment_runtime_status_tone(&environment.runtime_status),
-            latest_version: environment
-                .latest_version
-                .clone()
-                .unwrap_or_else(|| "尚无应用版本".to_owned()),
-            target_count: environment.target_count,
-            active_run_id: environment.active_run_id,
-            active_task_id: environment.active_task_id,
-            active_run_status: environment.active_run_status.clone().unwrap_or_default(),
-            selected: environment.environment_id == selected_environment_id,
-        })
-        .collect::<Vec<_>>();
     let deployment_targets = deployment_target_rows(&console.targets);
     let deployment_target_summary = deployment_target_summary(&console.targets);
     let latest_unit_config = latest_public_app_config_document(state, detail.app.id).await;
@@ -2307,43 +2276,12 @@ async fn render_app_detail(
             }
         })
         .collect::<Vec<_>>();
-    let can_cleanup_releases =
-        session.can(DEPLOYMENTS_CLEANUP) && !app_detail_is_deploying(&detail);
     let mut application_releases = Vec::with_capacity(console.releases.len());
     for release in &console.releases {
-        let preview = match state
-            .deployment_retention()
-            .preview_application_release_cleanup(detail.app.id, release.release_id)
-            .await
-        {
-            Ok(preview) => preview,
-            Err(error) => return deployment_retention_error_response(error),
-        };
-        let blockers = if preview.immutable_status == "ready" {
-            &preview.archive_blockers
-        } else {
-            &preview.blockers
-        };
         application_releases.push(ApplicationReleaseRow {
             id: release.release_id,
             version: release.version.clone(),
             version_code: release.version_code,
-            unit_count: release.unit_count,
-            created_at: release.created_at.clone(),
-            status: application_release_status_label(&preview.immutable_status),
-            status_tone: application_release_status_tone(&preview.immutable_status),
-            estimated_size: format_size(&preview.estimated_bytes.to_string()),
-            blockers: if blockers.is_empty() {
-                if preview.immutable_status == "ready" {
-                    "可归档；归档后不再出现在部署版本选择中".to_owned()
-                } else {
-                    "没有引用阻止彻底删除".to_owned()
-                }
-            } else {
-                blockers.join("；")
-            },
-            can_archive: can_cleanup_releases && preview.can_archive(),
-            can_delete: can_cleanup_releases && preview.can_delete(),
         });
     }
     let environment_runs = console
@@ -2425,7 +2363,6 @@ async fn render_app_detail(
             can_restore: can_manage,
         })
         .collect::<Vec<_>>();
-    let deploy_diff = deploy_diff_view(&detail.deploy_diff);
     let latest_task_href = deployment_runs
         .iter()
         .find_map(|run| run.task_id.map(|task_id| format!("/tasks/{task_id}")))
@@ -2561,14 +2498,12 @@ async fn render_app_detail(
         health_timeout_secs: detail.health_check.timeout_secs,
         health_expected_status: detail.health_check.expected_status,
         deployment_runs: &deployment_runs,
-        deployment_environments: &deployment_environments,
         deployment_units: &deployment_units,
         has_unit_config_previews,
         application_releases: &application_releases,
         environment_runs: &environment_runs,
         selected_environment_id,
         config_snapshots: &config_snapshots,
-        deploy_diff: &deploy_diff,
         runtime_states: &runtime_states,
         redis_config,
         target_choices: &target_choices,
@@ -8534,15 +8469,6 @@ fn deployment_status_tone(status: &str) -> &'static str {
     }
 }
 
-fn environment_status_label(status: &str) -> &'static str {
-    match status {
-        "configuring" => "配置中",
-        "ready" => "可部署",
-        "disabled" => "已停用",
-        _ => "未知",
-    }
-}
-
 fn deployment_action_label(action: DeploymentAction) -> &'static str {
     match action {
         DeploymentAction::Deploy => "部署",
@@ -8630,25 +8556,6 @@ fn artifact_status_tone(status: &str) -> &'static str {
     }
 }
 
-fn application_release_status_label(status: &str) -> &'static str {
-    match status {
-        "ready" => "可部署",
-        "archived" => "已归档",
-        "deleting" => "清理中",
-        "deleted" => "已清理",
-        _ => "未知",
-    }
-}
-
-fn application_release_status_tone(status: &str) -> &'static str {
-    match status {
-        "ready" => "success",
-        "deleting" => "active",
-        "archived" | "deleted" => "neutral",
-        _ => "warning",
-    }
-}
-
 fn console_deployment_status_label(status: &str) -> &'static str {
     match status {
         "waiting" => "等待部署",
@@ -8705,31 +8612,6 @@ fn deployment_history_notice(notice: Option<&str>) -> Option<&'static str> {
         Some("artifact-cleaned") => Some("未被引用的部署单元制品已清理。"),
         Some("artifact-failed") => Some("制品清理失败，引用和错误信息已保留，可排查后重试。"),
         _ => None,
-    }
-}
-
-fn environment_status_tone(status: &str) -> &'static str {
-    match status {
-        "ready" => "success",
-        "configuring" => "warning",
-        _ => "neutral",
-    }
-}
-
-fn environment_runtime_status_label(status: &str) -> &'static str {
-    match status {
-        "running" => "运行中",
-        "partial_unhealthy" => "部分异常",
-        "stopped" => "已停止",
-        _ => "未部署",
-    }
-}
-
-fn environment_runtime_status_tone(status: &str) -> &'static str {
-    match status {
-        "running" => "success",
-        "partial_unhealthy" => "warning",
-        _ => "neutral",
     }
 }
 
@@ -15543,7 +15425,11 @@ mod tests {
         let html = String::from_utf8_lossy(&body);
         assert!(html.contains("节点运行状态"));
         assert!(html.contains("这里只展示部署单元本身的版本、配置入口和运行状态。"));
+        assert!(html.contains("状态、版本与配置入口"));
         assert!(!html.contains("先看单元状态，再看目标节点"));
+        assert!(!html.contains("部署操作"));
+        assert!(!html.contains("部署前差异"));
+        assert!(!html.contains("状态、版本与部署操作"));
     }
 
     #[tokio::test]
