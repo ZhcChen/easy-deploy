@@ -909,8 +909,10 @@ pub struct DeploymentUnitRow {
     pub has_config_preview: bool,
     pub compose_content: String,
     pub has_compose_content: bool,
-    pub shared_env_content: String,
-    pub has_shared_env_content: bool,
+    pub env_content: String,
+    pub has_env_content: bool,
+    pub env_source_label: String,
+    pub env_hint: String,
     pub health_check_label: String,
     pub health_check_detail: String,
     pub health_check_json: String,
@@ -920,6 +922,7 @@ pub struct DeploymentUnitRow {
 
 #[derive(Clone, Debug)]
 pub struct DeploymentUnitScriptPreviewRow {
+    pub key: String,
     pub label: String,
     pub content: String,
 }

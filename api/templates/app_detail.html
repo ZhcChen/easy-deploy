@@ -585,7 +585,18 @@
           <h2 id="{{ unit.config_modal_id }}-title">{{ unit.name }}</h2>
           <p>{{ unit.key }} · {{ unit.stage }} · {{ unit.config_source }}</p>
         </div>
-        <button class="modal-close" type="button" data-modal-close aria-label="关闭">×</button>
+        <div class="modal-header-actions">
+          {% if unit.has_config_preview %}
+            <button
+              class="ghost-button compact-button"
+              type="button"
+              data-template-code-copy
+              data-copy-target="{{ unit.config_modal_id }}-compose-code"
+              data-copy-done="已复制"
+            >复制当前页</button>
+          {% endif %}
+          <button class="modal-close" type="button" data-modal-close aria-label="关闭">×</button>
+        </div>
       </div>
       <div class="modal-detail-body unit-config-modal-body">
         <section class="unit-config-summary">
@@ -618,80 +629,195 @@
         </section>
 
         {% if unit.has_config_preview %}
-          <section class="unit-config-section" aria-labelledby="{{ unit.config_modal_id }}-compose-title">
-            <div class="unit-config-section-header">
+          <section class="template-code-panel unit-config-panel" aria-labelledby="{{ unit.config_modal_id }}-config-title">
+            <div class="template-code-panel-header unit-config-panel-header">
               <div>
-                <h3 id="{{ unit.config_modal_id }}-compose-title">compose.yaml</h3>
-                <p>当前单元随已发布配置记录下来的 compose 片段。</p>
+                <h3 id="{{ unit.config_modal_id }}-config-title">部署单元配置</h3>
+                <p>按单元维度查看 compose、环境变量、脚本和健康检查配置。</p>
+              </div>
+              <div class="template-code-tabs" role="tablist" aria-label="部署单元配置">
+                <button
+                  class="template-code-tab is-active"
+                  type="button"
+                  role="tab"
+                  id="{{ unit.config_modal_id }}-compose-tab"
+                  aria-selected="true"
+                  aria-controls="{{ unit.config_modal_id }}-compose-panel"
+                  data-template-code-tab
+                  data-template-code-target="{{ unit.config_modal_id }}-compose-panel"
+                  data-copy-target-id="{{ unit.config_modal_id }}-compose-code"
+                >compose.yaml</button>
+                <button
+                  class="template-code-tab"
+                  type="button"
+                  role="tab"
+                  id="{{ unit.config_modal_id }}-env-tab"
+                  aria-selected="false"
+                  aria-controls="{{ unit.config_modal_id }}-env-panel"
+                  tabindex="-1"
+                  data-template-code-tab
+                  data-template-code-target="{{ unit.config_modal_id }}-env-panel"
+                  data-copy-target-id="{{ unit.config_modal_id }}-env-code"
+                >.env</button>
+                <button
+                  class="template-code-tab"
+                  type="button"
+                  role="tab"
+                  id="{{ unit.config_modal_id }}-scripts-tab"
+                  aria-selected="false"
+                  aria-controls="{{ unit.config_modal_id }}-scripts-panel"
+                  tabindex="-1"
+                  data-template-code-tab
+                  data-template-code-target="{{ unit.config_modal_id }}-scripts-panel"
+                  data-copy-target-id="{% if unit.script_rows.len() > 0 %}{{ unit.config_modal_id }}-script-code-{{ unit.script_rows[0].key }}{% else %}{{ unit.config_modal_id }}-scripts-empty{% endif %}"
+                >脚本</button>
+                <button
+                  class="template-code-tab"
+                  type="button"
+                  role="tab"
+                  id="{{ unit.config_modal_id }}-health-tab"
+                  aria-selected="false"
+                  aria-controls="{{ unit.config_modal_id }}-health-panel"
+                  tabindex="-1"
+                  data-template-code-tab
+                  data-template-code-target="{{ unit.config_modal_id }}-health-panel"
+                  data-copy-target-id="{{ unit.config_modal_id }}-health-code"
+                >健康检查</button>
               </div>
             </div>
-            {% if unit.has_compose_content %}
-              <pre class="code-block unit-config-code">{{ unit.compose_content }}</pre>
-            {% else %}
-              <div class="modal-empty-state">
-                <strong>当前没有 compose.yaml 片段</strong>
-                <span>这个单元在最近一次已发布配置中没有单独记录 compose 内容。</span>
-              </div>
-            {% endif %}
-          </section>
 
-          <section class="unit-config-section" aria-labelledby="{{ unit.config_modal_id }}-env-title">
-            <div class="unit-config-section-header">
-              <div>
-                <h3 id="{{ unit.config_modal_id }}-env-title">共享 .env</h3>
-                <p>当前所有部署单元共享这份应用级 .env。</p>
-              </div>
+            <div
+              class="template-code-tab-panel unit-config-tab-panel"
+              id="{{ unit.config_modal_id }}-compose-panel"
+              role="tabpanel"
+              aria-labelledby="{{ unit.config_modal_id }}-compose-tab"
+              data-template-code-panel
+            >
+              {% if unit.has_compose_content %}
+                <div class="unit-config-code-surface">
+                  <div class="unit-config-code-header">
+                    <strong>compose.yaml</strong>
+                    <span>单元级 Docker Compose 配置</span>
+                  </div>
+                  <pre class="template-code-preview unit-config-code-preview" tabindex="0"><code id="{{ unit.config_modal_id }}-compose-code">{{ unit.compose_content }}</code></pre>
+                </div>
+              {% else %}
+                <div class="modal-empty-state">
+                  <strong>当前没有 compose.yaml 片段</strong>
+                  <span>这个单元在最近一次已发布配置中没有单独记录 compose 内容。</span>
+                </div>
+              {% endif %}
             </div>
-            {% if unit.has_shared_env_content %}
-              <pre class="code-block unit-config-code">{{ unit.shared_env_content }}</pre>
-            {% else %}
-              <div class="modal-empty-state">
-                <strong>当前没有共享 .env</strong>
-                <span>这个应用还没有保存公共环境变量内容。</span>
-              </div>
-            {% endif %}
-          </section>
 
-          <section class="unit-config-section" aria-labelledby="{{ unit.config_modal_id }}-scripts-title">
-            <div class="unit-config-section-header">
-              <div>
-                <h3 id="{{ unit.config_modal_id }}-scripts-title">部署脚本</h3>
-                <p>按执行时机拆分展示当前单元脚本。</p>
-              </div>
+            <div
+              class="template-code-tab-panel unit-config-tab-panel"
+              id="{{ unit.config_modal_id }}-env-panel"
+              role="tabpanel"
+              aria-labelledby="{{ unit.config_modal_id }}-env-tab"
+              data-template-code-panel
+              hidden
+            >
+              {% if unit.has_env_content %}
+                <div class="unit-config-code-surface">
+                  <div class="unit-config-code-header">
+                    <strong>.env</strong>
+                    <span>{{ unit.env_source_label }}</span>
+                  </div>
+                  <p class="unit-config-note">{{ unit.env_hint }}</p>
+                  <pre class="template-code-preview unit-config-code-preview" tabindex="0"><code id="{{ unit.config_modal_id }}-env-code">{{ unit.env_content }}</code></pre>
+                </div>
+              {% else %}
+                <div class="modal-empty-state">
+                  <strong>当前没有 .env 内容</strong>
+                  <span>{{ unit.env_hint }}</span>
+                </div>
+              {% endif %}
             </div>
-            {% if unit.script_rows.len() == 0 %}
-              <div class="modal-empty-state">
-                <strong>当前没有单元脚本</strong>
-                <span>这个单元没有保存 pre_deploy、deploy、post_deploy、switch_traffic 或 cleanup 脚本。</span>
-              </div>
-            {% else %}
-              <div class="unit-config-script-list">
-                {% for script in unit.script_rows %}
-                  <article class="unit-config-script-card">
-                    <h4>{{ script.label }}</h4>
-                    <pre class="code-block unit-config-code">{{ script.content }}</pre>
-                  </article>
-                {% endfor %}
-              </div>
-            {% endif %}
-          </section>
 
-          <section class="unit-config-section" aria-labelledby="{{ unit.config_modal_id }}-health-title">
-            <div class="unit-config-section-header">
-              <div>
-                <h3 id="{{ unit.config_modal_id }}-health-title">健康检查</h3>
-                <p>{{ unit.health_check_detail }}</p>
-              </div>
-              <span class="badge tone-neutral">{{ unit.health_check_label }}</span>
+            <div
+              class="template-code-tab-panel unit-config-tab-panel"
+              id="{{ unit.config_modal_id }}-scripts-panel"
+              role="tabpanel"
+              aria-labelledby="{{ unit.config_modal_id }}-scripts-tab"
+              data-template-code-panel
+              hidden
+            >
+              {% if unit.script_rows.len() == 0 %}
+                <div class="modal-empty-state" id="{{ unit.config_modal_id }}-scripts-empty">
+                  <strong>当前没有单元脚本</strong>
+                  <span>这个单元没有保存 pre_deploy、deploy、post_deploy、switch_traffic 或 cleanup 脚本。</span>
+                </div>
+              {% else %}
+                <section class="template-code-panel unit-config-script-panel" aria-labelledby="{{ unit.config_modal_id }}-script-panel-title">
+                  <div class="template-code-panel-header unit-config-script-panel-header">
+                    <div>
+                      <h4 id="{{ unit.config_modal_id }}-script-panel-title">部署脚本</h4>
+                      <p>按执行时机切换查看当前单元脚本。</p>
+                    </div>
+                    <div class="template-code-tabs" role="tablist" aria-label="部署脚本">
+                      {% for script in unit.script_rows %}
+                        <button
+                          class="template-code-tab{% if loop.first %} is-active{% endif %}"
+                          type="button"
+                          role="tab"
+                          id="{{ unit.config_modal_id }}-script-tab-{{ script.key }}"
+                          aria-selected="{% if loop.first %}true{% else %}false{% endif %}"
+                          aria-controls="{{ unit.config_modal_id }}-script-panel-{{ script.key }}"
+                          {% if !loop.first %}tabindex="-1"{% endif %}
+                          data-template-code-tab
+                          data-template-code-target="{{ unit.config_modal_id }}-script-panel-{{ script.key }}"
+                          data-copy-target-id="{{ unit.config_modal_id }}-script-code-{{ script.key }}"
+                        >{{ script.label }}</button>
+                      {% endfor %}
+                    </div>
+                  </div>
+
+                  {% for script in unit.script_rows %}
+                    <div
+                      class="template-code-tab-panel unit-config-script-tab-panel"
+                      id="{{ unit.config_modal_id }}-script-panel-{{ script.key }}"
+                      role="tabpanel"
+                      aria-labelledby="{{ unit.config_modal_id }}-script-tab-{{ script.key }}"
+                      data-template-code-panel
+                      {% if !loop.first %}hidden{% endif %}
+                    >
+                      <div class="unit-config-code-surface">
+                        <div class="unit-config-code-header">
+                          <strong>{{ script.label }}</strong>
+                          <span>scripts/{{ script.key }}.sh</span>
+                        </div>
+                        <pre class="template-code-preview unit-config-code-preview" tabindex="0"><code id="{{ unit.config_modal_id }}-script-code-{{ script.key }}">{{ script.content }}</code></pre>
+                      </div>
+                    </div>
+                  {% endfor %}
+                </section>
+              {% endif %}
             </div>
-            {% if unit.has_health_check_json %}
-              <pre class="code-block unit-config-code">{{ unit.health_check_json }}</pre>
-            {% else %}
-              <div class="modal-empty-state">
-                <strong>当前没有健康检查 JSON</strong>
-                <span>这个单元使用默认或空的健康检查配置。</span>
-              </div>
-            {% endif %}
+
+            <div
+              class="template-code-tab-panel unit-config-tab-panel"
+              id="{{ unit.config_modal_id }}-health-panel"
+              role="tabpanel"
+              aria-labelledby="{{ unit.config_modal_id }}-health-tab"
+              data-template-code-panel
+              hidden
+            >
+              {% if unit.has_health_check_json %}
+                <div class="unit-config-code-surface">
+                  <div class="unit-config-code-header">
+                    <strong>health-check.json</strong>
+                    <span>{{ unit.health_check_label }}</span>
+                  </div>
+                  <p class="unit-config-note">{{ unit.health_check_detail }}</p>
+                  <pre class="template-code-preview unit-config-code-preview" tabindex="0"><code id="{{ unit.config_modal_id }}-health-code">{{ unit.health_check_json }}</code></pre>
+                </div>
+              {% else %}
+                <div class="modal-empty-state">
+                  <strong>当前没有健康检查 JSON</strong>
+                  <span>这个单元使用默认或空的健康检查配置。</span>
+                </div>
+              {% endif %}
+            </div>
           </section>
         {% else %}
           <div class="modal-empty-state">

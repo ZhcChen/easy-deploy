@@ -77,6 +77,8 @@ pub struct ConfigUnit {
     #[serde(default)]
     pub compose_content: String,
     #[serde(default)]
+    pub env_content: String,
+    #[serde(default)]
     pub scripts: BTreeMap<String, String>,
     #[serde(default)]
     pub health_check: JsonValue,
@@ -526,6 +528,7 @@ mod tests {
                 status: "active".to_owned(),
                 work_dir: "/srv/example/api".to_owned(),
                 compose_content: "services: {}".to_owned(),
+                env_content: "APP_ENV=testing\n".to_owned(),
                 scripts: BTreeMap::from([("deploy".to_owned(), "docker compose up -d".to_owned())]),
                 health_check: serde_json::json!({"kind": "http", "endpoint": "http://127.0.0.1/healthz"}),
             }],

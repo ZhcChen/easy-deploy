@@ -1802,6 +1802,7 @@ mod tests {
                 status: "active".to_owned(),
                 work_dir: target_work_dir.to_string_lossy().to_string(),
                 compose_content: "services:\n  api:\n    image: example/api".to_owned(),
+                env_content: "APP_ENV=production\n".to_owned(),
                 scripts: BTreeMap::from([
                     ("pre_deploy".to_owned(), "echo pre".to_owned()),
                     ("deploy".to_owned(), "docker compose up -d".to_owned()),
@@ -1955,6 +1956,7 @@ mod tests {
                 status: "active".to_owned(),
                 work_dir: "/srv/orders/api".to_owned(),
                 compose_content: "services: {}".to_owned(),
+                env_content: "APP_ENV=production\n".to_owned(),
                 scripts: BTreeMap::new(),
                 health_check: serde_json::json!({}),
             },

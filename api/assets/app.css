@@ -5267,13 +5267,18 @@ tbody tr:last-child td {
 }
 
 .unit-config-summary,
-.unit-config-section {
+.unit-config-panel {
   display: grid;
-  gap: 12px;
+  gap: 14px;
   padding: 16px;
   border: 1px solid var(--line);
   border-radius: 10px;
   background: #ffffff;
+}
+
+.unit-config-panel {
+  padding: 0;
+  overflow: hidden;
 }
 
 .unit-config-summary .detail-list > div {
@@ -5288,50 +5293,95 @@ tbody tr:last-child td {
   padding-bottom: 0;
 }
 
-.unit-config-section-header {
+.unit-config-panel-header,
+.unit-config-script-panel-header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
+  gap: 14px;
+  padding: 16px 16px 0;
 }
 
-.unit-config-section-header h3 {
+.unit-config-panel-header h3,
+.unit-config-script-panel-header h4 {
   margin: 0;
   color: #18212f;
   font-size: 15px;
 }
 
-.unit-config-section-header p {
+.unit-config-panel-header p,
+.unit-config-script-panel-header p {
   margin: 4px 0 0;
   color: var(--text-muted);
   font-size: 12px;
   line-height: 1.5;
 }
 
-.unit-config-script-list {
-  display: grid;
+.unit-config-tab-panel {
+  padding: 0 16px 16px;
+}
+
+.unit-config-script-panel {
   gap: 12px;
+  padding: 0;
+  border: 0;
+  background: transparent;
 }
 
-.unit-config-script-card {
+.unit-config-script-panel .template-code-tabs,
+.unit-config-panel .template-code-tabs {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.unit-config-code-surface {
   display: grid;
-  gap: 8px;
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid #213246;
+  border-radius: 10px;
+  background: #19283a;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
-.unit-config-script-card h4 {
-  margin: 0;
-  color: #18212f;
+.unit-config-code-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.22);
+  background: #223246;
+}
+
+.unit-config-code-header strong,
+.unit-config-code-header span {
+  display: block;
+}
+
+.unit-config-code-header strong {
+  color: #f8fbff;
   font-size: 13px;
+  font-weight: 650;
 }
 
-.unit-config-code {
-  max-height: 300px;
-  padding: 14px 16px;
+.unit-config-code-header span {
+  color: #9fb3c8;
+  font-size: 12px;
+  text-align: right;
+}
+
+.unit-config-code-preview {
+  max-height: 420px;
+  margin: 0;
+  padding: 14px 16px 18px;
+  background: transparent;
 }
 
 .unit-config-note {
   margin: 0;
-  color: var(--text-muted);
+  padding: 10px 14px 0;
+  color: #a9bad0;
   font-size: 12px;
   line-height: 1.5;
 }

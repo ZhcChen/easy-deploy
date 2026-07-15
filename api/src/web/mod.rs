@@ -2267,8 +2267,26 @@ async fn render_app_detail(
                 has_config_preview: preview.has_config_preview,
                 compose_content: preview.compose_content,
                 has_compose_content: preview.has_compose_content,
-                shared_env_content: detail.env_content.clone(),
-                has_shared_env_content: !detail.env_content.trim().is_empty(),
+                env_content: if preview.has_env_content {
+                    preview.env_content
+                } else {
+                    detail.env_content.clone()
+                },
+                has_env_content: preview.has_env_content || !detail.env_content.trim().is_empty(),
+                env_source_label: if preview.has_env_content {
+                    "单元 .env".to_owned()
+                } else if !detail.env_content.trim().is_empty() {
+                    "应用共享 .env（兼容旧配置）".to_owned()
+                } else {
+                    "单元 .env".to_owned()
+                },
+                env_hint: if preview.has_env_content {
+                    "当前单元独立保存的环境变量文件。".to_owned()
+                } else if !detail.env_content.trim().is_empty() {
+                    "当前 revision 还没有单元级 .env，先兼容展示应用共享 .env。".to_owned()
+                } else {
+                    "当前单元还没有保存独立的环境变量内容。".to_owned()
+                },
                 health_check_label: preview.health_check_label,
                 health_check_detail: preview.health_check_detail,
                 health_check_json: preview.health_check_json,
@@ -8645,6 +8663,8 @@ struct UnitConfigPreviewData {
     has_config_preview: bool,
     compose_content: String,
     has_compose_content: bool,
+    env_content: String,
+    has_env_content: bool,
     health_check_label: String,
     health_check_detail: String,
     health_check_json: String,
@@ -8697,6 +8717,8 @@ fn build_unit_config_preview_map(
                     has_config_preview: true,
                     compose_content: unit.compose_content.clone(),
                     has_compose_content: !unit.compose_content.trim().is_empty(),
+                    env_content: unit.env_content.clone(),
+                    has_env_content: !unit.env_content.trim().is_empty(),
                     health_check_label: unit_health_check_label(&unit.health_check),
                     health_check_detail: unit_health_check_detail(&unit.health_check),
                     health_check_json: unit_health_check_json(&unit.health_check),
@@ -8714,6 +8736,8 @@ fn missing_unit_config_preview() -> UnitConfigPreviewData {
         has_config_preview: false,
         compose_content: String::new(),
         has_compose_content: false,
+        env_content: String::new(),
+        has_env_content: false,
         health_check_label: "未配置".to_owned(),
         health_check_detail: "还没有在已发布配置 revision 中找到这个单元的独立配置。".to_owned(),
         health_check_json: String::new(),
@@ -8807,6 +8831,7 @@ fn unit_script_preview_rows(
             .filter(|content| !content.trim().is_empty())
         {
             rows.push(DeploymentUnitScriptPreviewRow {
+                key: slot.to_owned(),
                 label: unit_script_slot_label(slot).to_owned(),
                 content: content.clone(),
             });
@@ -8817,6 +8842,7 @@ fn unit_script_preview_rows(
             continue;
         }
         rows.push(DeploymentUnitScriptPreviewRow {
+            key: slot.clone(),
             label: format!("{slot} 脚本"),
             content: content.clone(),
         });
@@ -15455,6 +15481,7 @@ mod tests {
                     "status": "active",
                     "work_dir": "/opt/easy-deploy/apps/orders-unit-preview",
                     "compose_content": "services:\n  app:\n    image: nginx:alpine\n",
+                    "env_content": "APP_ENV=staging\nWORKER_CONCURRENCY=8\n",
                     "scripts": {
                         "deploy": "docker compose up -d --remove-orphans",
                         "cleanup": "docker image prune -f"
@@ -15520,10 +15547,97 @@ mod tests {
         assert!(html.contains("deployment-unit-config-modal-"));
         assert!(html.contains("来源 config#100"));
         assert!(html.contains("compose.yaml"));
-        assert!(html.contains("共享 .env"));
-        assert!(html.contains("当前所有部署单元共享这份应用级 .env。"));
-        assert!(html.contains("RUST_LOG=info"));
+        assert!(html.contains(">.env</button>"));
+        assert!(html.contains("APP_ENV=staging"));
+        assert!(html.contains("WORKER_CONCURRENCY=8"));
+        assert!(html.contains("复制当前页"));
         assert!(!html.contains("应用级公共配置"));
+    }
+
+    #[tokio::test]
+    async fn app_detail_unit_config_modal_falls_back_to_shared_env_for_legacy_revision() {
+        let app = test_web_app().await;
+        let app_id =
+            create_compose_test_app_with_mode(&app.apps, "orders-unit-preview-legacy", false).await;
+        let legacy_config_document = serde_json::json!({
+            "environments": [
+                {
+                    "key": "test",
+                    "name": "测试环境",
+                    "max_parallel_units": 1,
+                    "target_node_ids": [1]
+                }
+            ],
+            "units": [
+                {
+                    "key": "default",
+                    "name": "默认单元",
+                    "required": true,
+                    "status": "active",
+                    "work_dir": "/opt/easy-deploy/apps/orders-unit-preview-legacy",
+                    "compose_content": "services:\n  app:\n    image: nginx:alpine\n",
+                    "scripts": {
+                        "deploy": "docker compose up -d --remove-orphans"
+                    },
+                    "health_check": {
+                        "kind": "http",
+                        "endpoint": "http://127.0.0.1:8080/healthz",
+                        "timeout_secs": 5,
+                        "expected_status": 200
+                    }
+                }
+            ],
+            "stages": [
+                {
+                    "number": 1,
+                    "key": "default",
+                    "name": "默认阶段",
+                    "kind": "serial",
+                    "unit_keys": ["default"]
+                }
+            ]
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO app_config_revisions(app_id, revision_no, config_json, public_config_json, secret_ciphertext, config_hash) VALUES (?1, 100, ?2, ?2, '{}', 'unit-preview-legacy-config')",
+        )
+        .bind(app_id)
+        .bind(&legacy_config_document)
+        .execute(&app.db)
+        .await
+        .expect("insert legacy config revision");
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/apps/{app_id}"))
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("应用共享 .env（兼容旧配置）"));
+        assert!(html.contains("RUST_LOG=info"));
     }
 
     #[tokio::test]

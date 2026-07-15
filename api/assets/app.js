@@ -296,8 +296,12 @@
     });
 
     const copyTargetId = button.getAttribute("data-copy-target-id");
-    const modal = button.closest(".template-preview-modal");
-    const copyButton = modal?.querySelector("[data-template-code-copy]");
+    const copyScope =
+      button.closest("[data-template-code-copy-scope]") ||
+      button.closest("dialog") ||
+      button.closest(".template-code-panel") ||
+      panel;
+    const copyButton = copyScope?.querySelector("[data-template-code-copy]");
     if (copyTargetId && copyButton) {
       copyButton.setAttribute("data-copy-target", copyTargetId);
     }
