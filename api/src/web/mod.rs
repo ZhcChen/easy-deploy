@@ -15508,6 +15508,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_detail_separates_unit_and_node_runtime_sections() {
+        let app = test_web_app().await;
+        let app_id = create_compose_test_app(&app.apps, "orders-runtime-split").await;
+        let login = app
+            .auth
+            .bootstrap_init(LoginInput {
+                username: "admin".to_owned(),
+                password: "password123".to_owned(),
+                display_name: None,
+                client_ip: "127.0.0.1".to_owned(),
+                user_agent: "test".to_owned(),
+            })
+            .await
+            .expect("bootstrap admin");
+        let cookie_value = format!("ed_access={}", login.tokens.access_token);
+
+        let detail_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/apps/{app_id}"))
+                    .header(header::COOKIE, &cookie_value)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("send request");
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let body = to_bytes(detail_response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("节点运行状态"));
+        assert!(html.contains("这里只展示部署单元本身的版本、配置入口和运行状态。"));
+        assert!(!html.contains("先看单元状态，再看目标节点"));
+    }
+
+    #[tokio::test]
     async fn app_detail_renders_unit_config_modal_for_multi_unit_preview() {
         let app = test_web_app().await;
         let app_id =

@@ -148,7 +148,7 @@
       <div class="panel-header compact">
         <div>
           <h2 id="deployment-targets-title">部署节点</h2>
-          <p>当前环境绑定的目标节点；应用版本部署会按这里的节点生成计划。</p>
+          <p>当前环境绑定的目标节点；应用版本部署会按这里的节点生成计划，节点运行态也统一在这里查看。</p>
         </div>
         <div class="panel-header-actions">
           <span class="badge tone-neutral">{{ deployment_targets.len() }} 个节点</span>
@@ -226,13 +226,51 @@
           </table>
         </div>
       {% endif %}
+      <div class="compact-deployment-grid">
+        <section aria-labelledby="runtime-nodes-title">
+          <div class="section-heading"><h3 id="runtime-nodes-title">节点运行状态</h3><span>{{ runtime_states.len() }} 个节点</span></div>
+          {% if runtime_states.len() == 0 %}
+            <div class="empty-state compact-empty-state">
+              <strong>暂无节点运行态</strong>
+              <span>应用绑定目标节点并执行部署后，这里会显示最近任务、运行状态和日志入口。</span>
+            </div>
+          {% else %}
+            <div class="runtime-node-list compact-runtime-node-list">
+              {% for runtime in runtime_states %}
+                <article class="runtime-node-card">
+                  <div class="runtime-node-header">
+                    <div>
+                      <strong><a class="text-link" href="{{ runtime.node_detail_href }}">{{ runtime.node_name }}</a></strong>
+                      <span>{{ runtime.node_key }} · {{ runtime.service_count }} 个运行项 · {{ runtime.active_version }}</span>
+                    </div>
+                    <span class="badge tone-{{ runtime.status_tone }}">{{ runtime.status }}</span>
+                  </div>
+                  <p>{{ runtime.message }}</p>
+                  <div class="runtime-link-row">
+                    <a class="text-link" href="{{ runtime.node_detail_href }}">节点详情</a>
+                    {% if runtime.has_task_href %}
+                      <a class="text-link" href="{{ runtime.task_href }}">最近任务</a>
+                    {% endif %}
+                    {% if can_logs && runtime.has_log_links %}
+                      {% for log_link in runtime.log_links %}
+                        <a class="text-link" href="{{ log_link.href }}">{{ log_link.name }} 日志</a>
+                      {% endfor %}
+                    {% endif %}
+                  </div>
+                  <small>最后部署 {{ runtime.last_deploy_at }} · 更新 {{ runtime.updated_at }}</small>
+                </article>
+              {% endfor %}
+            </div>
+          {% endif %}
+        </section>
+      </div>
     </section>
 
     <section class="panel" id="app-detail-panel-basic" aria-labelledby="app-basic-title" role="tabpanel" data-app-detail-group="basic">
       <div class="panel-header compact">
         <div>
           <h2 id="app-basic-title">应用档案</h2>
-          <p>这里只放应用静态信息；运行态和部署入口统一放到“部署单元”。</p>
+          <p>这里只放应用静态信息；部署单元看模块状态，部署节点看机器状态。</p>
         </div>
         {% if can_manage %}
           <div class="panel-actions">
@@ -284,95 +322,52 @@
       <div class="panel-header compact">
         <div>
           <h2 id="runtime-states-title">部署运行状态</h2>
-          <p>先看单元状态，再看目标节点；部署过程和日志入口仍保留在对应节点与任务记录里。</p>
+          <p>这里只展示部署单元本身的版本、配置入口和运行状态。</p>
         </div>
       </div>
-      {% if deployment_units.len() == 0 && runtime_states.len() == 0 %}
+      {% if deployment_units.len() == 0 %}
         <div class="empty-state">
           <strong>暂无运行状态</strong>
-          <span>配置部署单元并绑定目标节点后，这里会显示单元和节点运行态。</span>
+          <span>上传模块发布包或保存部署配置后，这里会显示部署单元及其运行状态。</span>
         </div>
       {% else %}
-        <div class="deployment-status-grid compact-deployment-grid">
+        <div class="compact-deployment-grid">
           <section aria-labelledby="deployment-units-status-title">
             <div class="section-heading"><h3 id="deployment-units-status-title">单元状态</h3><span>{{ deployment_units.len() }} 个</span></div>
-            {% if deployment_units.len() == 0 %}
-              <div class="empty-state compact-empty-state">
-                <strong>暂无部署单元</strong>
-                <span>上传模块发布包或保存部署配置后会生成部署单元。</span>
-              </div>
-            {% else %}
-              <div class="table-wrap data-table-wrap deployment-unit-table-wrap">
-                <table class="data-table deployment-unit-table">
-                  <thead>
+            <div class="table-wrap data-table-wrap deployment-unit-table-wrap">
+              <table class="data-table deployment-unit-table">
+                <thead>
+                  <tr>
+                    <th>单元</th>
+                    <th>阶段</th>
+                    <th>工作目录</th>
+                    <th>当前版本</th>
+                    <th>运行状态</th>
+                    <th>生命周期</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for unit in deployment_units %}
                     <tr>
-                      <th>单元</th>
-                      <th>阶段</th>
-                      <th>工作目录</th>
-                      <th>当前版本</th>
-                      <th>运行状态</th>
-                      <th>生命周期</th>
-                      <th>操作</th>
+                      <td class="table-cell-primary">
+                        <strong>{{ unit.name }}</strong>
+                        <span>{% if unit.description == "" %}{{ unit.key }}{% else %}{{ unit.key }} · {{ unit.description }}{% endif %}</span>
+                      </td>
+                      <td>{{ unit.stage }}</td>
+                      <td><code>{{ unit.work_dir }}</code></td>
+                      <td>{{ unit.latest_version }}</td>
+                      <td><span class="badge tone-{{ unit.runtime_tone }}">{{ unit.runtime_status }}</span></td>
+                      <td><span class="badge tone-{{ unit.lifecycle_tone }}">{{ unit.lifecycle_status }}</span></td>
+                      <td class="deployment-unit-actions-cell">
+                        <button class="ghost-button compact-button" type="button" data-modal-target="{{ unit.config_modal_id }}">查看配置</button>
+                      </td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {% for unit in deployment_units %}
-                      <tr>
-                        <td class="table-cell-primary">
-                          <strong>{{ unit.name }}</strong>
-                          <span>{% if unit.description == "" %}{{ unit.key }}{% else %}{{ unit.key }} · {{ unit.description }}{% endif %}</span>
-                        </td>
-                        <td>{{ unit.stage }}</td>
-                        <td><code>{{ unit.work_dir }}</code></td>
-                        <td>{{ unit.latest_version }}</td>
-                        <td><span class="badge tone-{{ unit.runtime_tone }}">{{ unit.runtime_status }}</span></td>
-                        <td><span class="badge tone-{{ unit.lifecycle_tone }}">{{ unit.lifecycle_status }}</span></td>
-                        <td class="deployment-unit-actions-cell">
-                          <button class="ghost-button compact-button" type="button" data-modal-target="{{ unit.config_modal_id }}">查看配置</button>
-                        </td>
-                      </tr>
-                    {% endfor %}
-                  </tbody>
-                </table>
-              </div>
-            {% endif %}
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
           </section>
-          <aside aria-labelledby="runtime-nodes-title">
-            <div class="section-heading"><h3 id="runtime-nodes-title">节点状态</h3><span>{{ runtime_states.len() }} 个节点</span></div>
-            {% if runtime_states.len() == 0 %}
-              <div class="empty-state compact-empty-state">
-                <strong>暂无节点运行态</strong>
-                <span>应用绑定目标节点并执行部署后会显示最近任务和日志入口。</span>
-              </div>
-            {% else %}
-              <div class="runtime-node-list compact-runtime-node-list">
-                {% for runtime in runtime_states %}
-                  <article class="runtime-node-card">
-                    <div class="runtime-node-header">
-                      <div>
-                        <strong><a class="text-link" href="{{ runtime.node_detail_href }}">{{ runtime.node_name }}</a></strong>
-                        <span>{{ runtime.node_key }} · {{ runtime.service_count }} 个运行项 · {{ runtime.active_version }}</span>
-                      </div>
-                      <span class="badge tone-{{ runtime.status_tone }}">{{ runtime.status }}</span>
-                    </div>
-                    <p>{{ runtime.message }}</p>
-                    <div class="runtime-link-row">
-                      <a class="text-link" href="{{ runtime.node_detail_href }}">节点详情</a>
-                      {% if runtime.has_task_href %}
-                        <a class="text-link" href="{{ runtime.task_href }}">最近任务</a>
-                      {% endif %}
-                      {% if can_logs && runtime.has_log_links %}
-                        {% for log_link in runtime.log_links %}
-                          <a class="text-link" href="{{ log_link.href }}">{{ log_link.name }} 日志</a>
-                        {% endfor %}
-                      {% endif %}
-                    </div>
-                    <small>最后部署 {{ runtime.last_deploy_at }} · 更新 {{ runtime.updated_at }}</small>
-                  </article>
-                {% endfor %}
-              </div>
-            {% endif %}
-          </aside>
         </div>
       {% endif %}
     </section>
