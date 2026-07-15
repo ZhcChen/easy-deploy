@@ -15519,8 +15519,10 @@ mod tests {
         assert!(html.contains("deployment-unit-config-modal-"));
         assert!(html.contains("来源 config#100"));
         assert!(html.contains("compose.yaml"));
-        assert!(html.contains("应用级兼容配置"));
+        assert!(html.contains("应用级公共配置"));
+        assert!(html.contains("应用级钩子（预留）"));
         assert!(html.contains("公共 .env"));
+        assert!(!html.contains("应用级兼容配置"));
     }
 
     #[tokio::test]

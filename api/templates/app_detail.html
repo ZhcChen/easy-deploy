@@ -423,14 +423,14 @@
     <section class="panel panel-large config-workbench-panel" aria-labelledby="config-title" data-app-detail-group="config">
       <details class="runtime-file-details config-workbench-details">
         <summary>
-          <span>{% if has_unit_config_previews %}应用级兼容配置{% else %}运行配置与脚本{% endif %}</span>
-          <small>{% if has_unit_config_previews %}多部署单元应用请优先查看上方单元配置；这里保留公共 .env 和兼容提交入口{% else %}compose.yaml、.env、部署脚本；低频修改，默认收起{% endif %}</small>
+          <span>{% if has_unit_config_previews %}应用级公共配置{% else %}运行配置与脚本{% endif %}</span>
+          <small>{% if has_unit_config_previews %}多部署单元应用只在这里维护公共 .env；单元 compose、健康检查和脚本请到上方部署单元查看{% else %}compose.yaml、.env、部署脚本；低频修改，默认收起{% endif %}</small>
         </summary>
         <div>
           <div class="panel-header compact nested-panel-header">
             <div>
-              <h2 id="config-title">{% if has_unit_config_previews %}应用级兼容配置{% else %}运行配置{% endif %}</h2>
-              <p>{% if has_unit_config_previews %}多部署单元应用请优先从上方“部署单元”列表查看 compose、脚本和健康检查；这里保留公共 .env 和兼容保存入口。{% else %}修改前建议先复制配置；保存后会生成新的配置快照。{% endif %}</p>
+              <h2 id="config-title">{% if has_unit_config_previews %}应用级公共配置{% else %}运行配置{% endif %}</h2>
+              <p>{% if has_unit_config_previews %}这里只维护跨单元共享的公共 .env；单元级 compose、脚本和健康检查统一从上方“部署单元”列表进入。{% else %}修改前建议先复制配置；保存后会生成新的配置快照。{% endif %}</p>
             </div>
             <div class="panel-actions app-config-transfer-actions">
               <button class="ghost-button compact-button" type="button" data-app-config-export>复制配置</button>
@@ -448,8 +448,8 @@
             <input type="hidden" name="health_expected_status" value="{{ health_expected_status }}">
             {% if has_unit_config_previews %}
               <div class="app-compat-note form-span-all">
-                <strong>公共配置入口</strong>
-                <span>单元级 compose、脚本和健康检查请从上方部署单元列表进入“查看配置”；这里仅保留公共 .env 展示与兼容保存入口。</span>
+                <strong>公共 .env 入口</strong>
+                <span>平台负责单元编排；单元级 compose、脚本和健康检查请从上方部署单元列表进入“查看配置”。</span>
               </div>
               <textarea name="compose_content" hidden>{{ compose_content }}</textarea>
               <textarea name="deploy_script_pre_deploy" hidden>{{ deploy_script_pre_deploy }}</textarea>
@@ -461,6 +461,10 @@
                 公共 .env
                 <textarea name="env_content" spellcheck="false"{% if !can_manage %} readonly{% endif %}>{{ env_content }}</textarea>
               </label>
+              <div class="app-compat-note form-span-all">
+                <strong>应用级钩子（预留）</strong>
+                <span>后续这里只放部署前一次、全部单元完成后、失败收尾这类跨单元一次性动作，不负责单元顺序、跳过和状态判断。</span>
+              </div>
             {% else %}
               <label>
                 compose.yaml
@@ -780,7 +784,7 @@
           </div>
         {% endif %}
 
-        <p class="unit-config-note">公共 .env 请看下方“应用级兼容配置”。</p>
+        <p class="unit-config-note">公共 .env 请看下方“应用级公共配置”。</p>
       </div>
     </section>
   </dialog>
